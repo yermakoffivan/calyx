@@ -16,7 +16,7 @@
 //       and Python concurrently runs `brew install node` twice instead
 //       of dedup'ing the shared `npm` prerequisite.
 //    4. `LSPSettings.resolve(...).disabled` round-trips through the
-//       deprecated `confirmationMode(...)` bridge, surfacing a
+//       `confirmationMode(...)` mapping, surfacing a
 //       misleading `"user declined: ..."` failure when no user ever
 //       saw a prompt — the installer should report
 //       `"auto-install disabled"` instead.
@@ -263,7 +263,7 @@ final class LSPInstallerBugSpecTests: XCTestCase {
     // MARK: - Bug 4. `.disabled` resolution surfaces a clear error
     // ====================================================================
     //
-    // The legacy `LSPSettings.confirmationMode(...)` collapses
+    // `LSPSettings.confirmationMode(...)` collapses
     // `autoInstallEnabled == false` onto `.prompt(handler: { _ in false })`.
     // Routing that through `LSPInstaller.install(...)` produces
     // `failed(reason: "user declined: <step>")` — misleading because no
@@ -273,7 +273,6 @@ final class LSPInstallerBugSpecTests: XCTestCase {
     // routing path) reports `"auto-install disabled"` as the failure reason
     // so MCP callers and the UI can route on a meaningful message.
 
-    @available(*, deprecated, message: "intentional: exercises the legacy confirmationMode(...) bridge")
     func test_install_whenAutoInstallDisabled_failsWithExplicitDisabledReason() async {
         // Isolate UserDefaults state.
         LSPSettings.resetToDefaults()

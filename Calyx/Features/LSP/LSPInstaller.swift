@@ -29,12 +29,11 @@
 //      helper for consistency.
 //    - When `LSPSettings.autoInstallEnabled` is `false`, `install(...)`
 //      short-circuits with an explicit "auto-install disabled in
-//      Settings" failure before any task is dispatched. This avoids
-//      the legacy behaviour where the deprecated
-//      `LSPSettings.confirmationMode(...)` bridge mapped the disabled
-//      state onto a rejecting handler and surfaced the misleading
-//      `"user declined: ..."` reason even though no user ever saw a
-//      prompt.
+//      Settings" failure before any task is dispatched, and records
+//      it for `currentStatus(forLanguageId:)`. Without this guard,
+//      `LSPSettings.confirmationMode(...)`'s rejecting handler for the
+//      disabled state would surface the misleading `"user declined:
+//      ..."` reason even though no user ever saw a prompt.
 //    - When the registry entry's `installation.safeToAutoRun` is
 //      `false` and the caller requested `.silent`, both the main
 //      install and any prerequisite install refuse to run and surface
@@ -252,6 +251,12 @@ enum ConfirmationMode: Sendable {
 /// the install command runs exactly once.
 actor LSPInstaller {
 
+    /// The failure reason `install(...)` reports when
+    /// `LSPSettings.autoInstallEnabled` is `false`. Callers that resolve
+    /// the settings themselves report the same reason on `.disabled`.
+    static let autoInstallDisabledReason =
+        "auto-install disabled in Settings (LSP Proxy → Auto-install language servers)"
+
     // MARK: State
 
     private let registry: LSPServerRegistry
@@ -418,19 +423,16 @@ actor LSPInstaller {
     /// When `LSPSettings.autoInstallEnabled` is `false`, the install
     /// short-circuits with an explicit "auto-install disabled in
     /// Settings" failure *before* any task is dispatched. This avoids
-    /// the misleading `"user declined: ..."` reason the deprecated
-    /// `LSPSettings.confirmationMode(...)` bridge used to produce when
-    /// the master switch was off.
+    /// the misleading `"user declined: ..."` reason that
+    /// `LSPSettings.confirmationMode(...)`'s rejecting handler would
+    /// otherwise produce when the master switch is off.
     func install(
         languageId: String,
         approvePrerequisites: Bool,
         confirmationMode: ConfirmationMode
     ) async -> LSPInstallStatus {
         if !LSPSettings.autoInstallEnabled {
-            let status = LSPInstallStatus.failed(
-                reason: "auto-install disabled in Settings "
-                    + "(LSP Proxy → Auto-install language servers)"
-            )
+            let status = LSPInstallStatus.failed(reason: Self.autoInstallDisabledReason)
             statuses[languageId] = status
             return status
         }
