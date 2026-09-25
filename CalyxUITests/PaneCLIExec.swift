@@ -164,7 +164,7 @@ extension CalyxUITestCase {
     func paneExec(_ command: String, counter: inout Int, timeoutAttempts: Int = 20) -> String {
         counter += 1
         let pid = ProcessInfo.processInfo.processIdentifier
-        let outFile = "/tmp/calyx-e2e-\(pid)-\(counter).txt"
+        let outFile = paneWrittenFilePath("\(counter)")
         let scriptFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("calyx-e2e-\(pid)-\(counter).sh").path
         try? FileManager.default.removeItem(atPath: outFile)
@@ -215,5 +215,102 @@ extension CalyxUITestCase {
 
         Thread.sleep(forTimeInterval: 1)
         typePaneScript(scriptFile)
+    }
+
+    /// Path of a file the PANE's shell writes and this RUNNER reads back:
+    /// `/tmp/calyx-e2e-<runner pid>-<suffix>.txt`. The single source of
+    /// truth for that write direction -- `paneExec`'s output file and
+    /// `paneTagFilePath`'s marker file are both built here so the two
+    /// cannot drift apart. `/tmp` (not the runner's
+    /// `FileManager.default.temporaryDirectory`) because the writer is
+    /// the pane's unsandboxed shell and the reader only needs read
+    /// access; the runner-writes/pane-reads direction (script files)
+    /// uses the runner's container tmp instead (see this file's header).
+    private func paneWrittenFilePath(_ suffix: String) -> String {
+        "/tmp/calyx-e2e-\(ProcessInfo.processInfo.processIdentifier)-\(suffix).txt"
+    }
+
+    // MARK: - Pane focus tagging
+
+    /// Marker-file path for `tagFocusedPane(_:counter:)` /
+    /// `focusedPaneMatchesTag(_:counter:)`. The marker file is WRITTEN by
+    /// the pane's shell (`tty | tee <path>`) and READ by this runner --
+    /// the same direction as `paneExec`'s own output file, which is the
+    /// established precedent for a pane-written, runner-read file -- so
+    /// it is built by the same `paneWrittenFilePath` helper as that
+    /// output file (same `/tmp` directory, same runner-pid-scoped
+    /// naming). The `pane-tag-<name>` suffix cannot collide with
+    /// `paneExec`'s purely numeric counter suffix.
+    private func paneTagFilePath(_ name: String) -> String {
+        paneWrittenFilePath("pane-tag-\(name)")
+    }
+
+    /// Tags whichever pane CURRENTLY has keyboard focus with `name`, so a
+    /// later `focusedPaneMatchesTag(_:counter:)` call can prove whether
+    /// the SAME physical pane is focused again.
+    ///
+    /// Root-cause fix for a real defect (field-verified 2026-09-26,
+    /// `MenuShortcutsUITests.test_focusSplitDirections_moveFocusBetweenSurfaces`):
+    /// `export PANE=<name>` inside a `paneExec`-run command cannot tag
+    /// the pane's own INTERACTIVE shell at all. `paneExec` always runs
+    /// `command` inside a fresh, short-lived CHILD `sh <scriptPath>`
+    /// process (see this file's header) -- an `export` there dies with
+    /// that child the instant the script finishes; the pane's own
+    /// long-running interactive shell (from which a LATER `paneExec`
+    /// call's `sh <scriptPath>` is typed and re-forked) never observes
+    /// it. A test that `export`s a tag in one `paneExec` call and reads
+    /// it back with `echo $VAR` in another always reads back empty,
+    /// regardless of which pane is actually focused.
+    ///
+    /// Instead of a shell variable, this records the pane's own
+    /// controlling terminal device (`tty`, e.g. `/dev/ttys003`) to a
+    /// marker file named after `name`. `tty` is a KERNEL-level property
+    /// of the pane's PTY, inherited unchanged by every child process the
+    /// pane ever runs (including `paneExec`'s own `sh <scriptPath>`
+    /// children), so unlike a shell variable it needs no persistence
+    /// across `paneExec`'s own child-process boundary at all: reading it
+    /// from a brand new child process still reports the SAME value for
+    /// the SAME physical pane, and a DIFFERENT value the instant a
+    /// different pane is focused.
+    ///
+    /// Precondition: a tag is valid for the lifetime of the surface
+    /// only. Each Ghostty surface owns exactly one PTY, created with the
+    /// surface and released with it; Calyx never replaces the PTY or
+    /// re-execs the shell of an existing surface in place. A surface
+    /// that is closed and recreated, or a persistent session that is
+    /// reattached (which always creates a new surface), gets a new PTY
+    /// and must be re-tagged before `focusedPaneMatchesTag` is used
+    /// against it.
+    @discardableResult
+    func tagFocusedPane(_ name: String, counter: inout Int) -> String {
+        // `tee`, not a bare `tty > <path>`: `paneExec` itself appends its
+        // OWN `> outFile 2>&1` to whatever command string is passed in
+        // (see `paneExec`'s own implementation), so a second `>` here
+        // would silently win over this one -- the tag file would never
+        // be written at all, and `paneExec`'s own completion-polling
+        // would have nothing to observe either (field-verified 2026-09-26:
+        // exactly this happened with a plain `>` redirection here). `tee`
+        // writes `tty`'s output to the tag file AND still passes it
+        // through to stdout, so `paneExec`'s own appended redirection
+        // captures the same content into its poll-until-non-empty
+        // `outFile`, and this call returns promptly instead of idling
+        // out its full timeout.
+        paneExec("tty | tee \(paneTagFilePath(name))", counter: &counter)
+    }
+
+    /// Returns whether whichever pane CURRENTLY has keyboard focus is the
+    /// SAME physical pane previously tagged `name` by
+    /// `tagFocusedPane(_:counter:)`: reads the currently-focused pane's
+    /// own `tty` (via a fresh `paneExec` call -- see that function's own
+    /// doc comment for why this needs no cross-call persistence) and
+    /// compares it against the tty recorded in `name`'s marker file.
+    /// Returns `false` (never `true` by accident) if `name` was never
+    /// tagged, or its marker file is empty/unreadable.
+    func focusedPaneMatchesTag(_ name: String, counter: inout Int) -> Bool {
+        let recordedTTY = (try? String(contentsOfFile: paneTagFilePath(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !recordedTTY.isEmpty else { return false }
+        let currentTTY = paneExec("tty", counter: &counter)
+        return currentTTY == recordedTTY
     }
 }

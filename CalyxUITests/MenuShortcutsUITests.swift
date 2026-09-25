@@ -327,27 +327,33 @@ final class MenuShortcutsUITests: CalyxUITestCase {
     /// `panePasteAndReturn` paste into whatever surface is CURRENTLY the
     /// key window's first responder (the same mechanism every other
     /// pane-driving suite in this directory relies on), so tagging each
-    /// surface's own shell with a distinct `$PANE` value the moment it is
-    /// known to be focused (right after `File > Split Right`/`Split
-    /// Down`, whose own `handleNewSplitNotification` calls
-    /// `window?.makeFirstResponder(newView)` on the just-created surface)
-    /// lets a later `echo $PANE` read back EXACTLY which surface is
+    /// surface the moment it is known to be focused (right after `File >
+    /// Split Right`/`Split Down`, whose own `handleNewSplitNotification`
+    /// calls `window?.makeFirstResponder(newView)` on the just-created
+    /// surface) via `PaneCLIExec.tagFocusedPane(_:counter:)` lets a later
+    /// `focusedPaneMatchesTag(_:counter:)` prove EXACTLY which surface is
     /// focused at that moment -- a Focus Split action that failed to
-    /// move focus would read back the SAME (stale) tag, making this
-    /// assertion fail for the right reason.
+    /// move focus would report a mismatch against the newly-expected
+    /// tag, making this assertion fail for the right reason. (Tagging
+    /// via `export PANE=<name>; echo $PANE` -- as this test originally
+    /// did -- cannot work at all: `paneExec` runs every command inside a
+    /// fresh, short-lived child `sh <scriptPath>` process, so an
+    /// `export` there is gone before the next `paneExec` call ever
+    /// types into the pane's own long-running interactive shell. See
+    /// `tagFocusedPane(_:counter:)`'s own doc comment.)
     func test_focusSplitDirections_moveFocusBetweenSurfaces() {
         var cmdCounter = 0
 
         // Tag the original (only) surface while it is necessarily the
         // one with focus.
-        _ = paneExec("export PANE=ORIGINAL; echo tagged", counter: &cmdCounter)
+        tagFocusedPane("ORIGINAL", counter: &cmdCounter)
 
         // Split Right: the new surface becomes first responder
         // immediately (handleNewSplitNotification). Tag it while known-focused.
         let dividersBeforeRight = app.windows.firstMatch.descendants(matching: .splitter).count
         menuAction("File", item: "Split Right")
         _ = waitForSplitterCount(timeout: 8) { $0 > dividersBeforeRight }
-        _ = paneExec("export PANE=RIGHT; echo tagged", counter: &cmdCounter)
+        tagFocusedPane("RIGHT", counter: &cmdCounter)
 
         // Focus Split Left should move focus from RIGHT back to ORIGINAL.
         openMenuBarItem("Window")
@@ -356,9 +362,8 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         XCTAssertTrue(focusLeft.waitForExistence(timeout: 3), "'Focus Split Left' menu item must exist")
         focusLeft.click()
         Thread.sleep(forTimeInterval: 0.3)
-        let afterFocusLeft = paneExec("echo $PANE", counter: &cmdCounter)
-        XCTAssertEqual(
-            afterFocusLeft, "ORIGINAL",
+        XCTAssertTrue(
+            focusedPaneMatchesTag("ORIGINAL", counter: &cmdCounter),
             "Focus Split Left should move focus back to the original (left) surface"
         )
 
@@ -369,9 +374,8 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         XCTAssertTrue(focusRight.waitForExistence(timeout: 3), "'Focus Split Right' menu item must exist")
         focusRight.click()
         Thread.sleep(forTimeInterval: 0.3)
-        let afterFocusRight = paneExec("echo $PANE", counter: &cmdCounter)
-        XCTAssertEqual(
-            afterFocusRight, "RIGHT",
+        XCTAssertTrue(
+            focusedPaneMatchesTag("RIGHT", counter: &cmdCounter),
             "Focus Split Right should move focus to the right surface"
         )
 
@@ -380,7 +384,7 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         let dividersBeforeDown = app.windows.firstMatch.descendants(matching: .splitter).count
         menuAction("File", item: "Split Down")
         _ = waitForSplitterCount(timeout: 8) { $0 > dividersBeforeDown }
-        _ = paneExec("export PANE=BOTTOM; echo tagged", counter: &cmdCounter)
+        tagFocusedPane("BOTTOM", counter: &cmdCounter)
 
         // Focus Split Up should move focus from BOTTOM to its upper neighbor, RIGHT.
         openMenuBarItem("Window")
@@ -389,9 +393,8 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         XCTAssertTrue(focusUp.waitForExistence(timeout: 3), "'Focus Split Up' menu item must exist")
         focusUp.click()
         Thread.sleep(forTimeInterval: 0.3)
-        let afterFocusUp = paneExec("echo $PANE", counter: &cmdCounter)
-        XCTAssertEqual(
-            afterFocusUp, "RIGHT",
+        XCTAssertTrue(
+            focusedPaneMatchesTag("RIGHT", counter: &cmdCounter),
             "Focus Split Up should move focus to the surface above (RIGHT)"
         )
 
@@ -402,9 +405,8 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         XCTAssertTrue(focusDown.waitForExistence(timeout: 3), "'Focus Split Down' menu item must exist")
         focusDown.click()
         Thread.sleep(forTimeInterval: 0.3)
-        let afterFocusDown = paneExec("echo $PANE", counter: &cmdCounter)
-        XCTAssertEqual(
-            afterFocusDown, "BOTTOM",
+        XCTAssertTrue(
+            focusedPaneMatchesTag("BOTTOM", counter: &cmdCounter),
             "Focus Split Down should move focus back to the surface below (BOTTOM)"
         )
     }
