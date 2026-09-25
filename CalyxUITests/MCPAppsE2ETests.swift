@@ -467,7 +467,10 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
     /// `CockpitApprovalE2ETests.elementText` -- see that file's own doc
     /// comment for the field-verified reason both must be checked.
     func elementText(_ element: XCUIElement) -> String {
-        let label = element.label
+        // See CockpitApprovalE2ETests.elementText's own doc comment: a
+        // collapsed SwiftUI `Menu`'s `.accessibilityLabel(_:)` text
+        // surfaces through `title` (AXTitle), not `label`.
+        let label = element.label.isEmpty ? element.title : element.label
         let value = element.value as? String ?? ""
         if label.isEmpty { return value }
         if value.isEmpty || value == label { return label }
