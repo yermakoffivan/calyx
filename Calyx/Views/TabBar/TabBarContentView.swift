@@ -137,6 +137,11 @@ struct TabBarContentView: View {
         .contentShape(Rectangle())
         .modifier(TabBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .clipped(antialiased: false)
+        // Make the strip a real container element. On a bare stack the
+        // identifier below is propagated to every child, and on macOS 27 it
+        // overrides the children's own identifiers (the "+" button surfaced
+        // as `calyx.tabBar` instead of `calyx.tabBar.newTabButton`).
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.TabBar.container)
     }
 

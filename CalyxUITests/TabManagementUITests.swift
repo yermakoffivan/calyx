@@ -44,6 +44,28 @@ final class TabManagementUITests: CalyxUITestCase {
         waitForNonExistence(app.windows.firstMatch)
     }
 
+    /// Regression guard for a macOS 27 bug: the tab strip's own
+    /// accessibility identifier (`calyx.tabBar`), applied to a plain
+    /// HStack, propagated down to its children and overrode the "+"
+    /// button's own identifier, so the button surfaced as `calyx.tabBar`
+    /// with label "Add" instead of `calyx.tabBar.newTabButton`. Fixed by
+    /// making the strip a real container element via
+    /// `.accessibilityElement(children: .contain)`.
+    func test_newTabButton_isExposedByAccessibilityIdentifier_andCreatesTab() {
+        let initialTabCount = countTabBarTabs()
+
+        let newTabButton = app.buttons["calyx.tabBar.newTabButton"]
+        XCTAssertTrue(waitFor(newTabButton), "New tab '+' button should be exposed by its accessibility identifier")
+
+        newTabButton.click()
+
+        let observedCount = waitForCount({ self.countTabBarTabs() }, toEqual: initialTabCount + 1, timeout: 3)
+        XCTAssertEqual(
+            observedCount, initialTabCount + 1,
+            "Clicking the '+' button should create exactly one new tab"
+        )
+    }
+
     /// Regression guard for a macOS 27 bug: double-clicking the EMPTY area
     /// of the tab strip (right of the last tab, left of the "+" button)
     /// stopped creating a new tab. See `WheelBridgeView.handleDoubleClick`
@@ -63,20 +85,11 @@ final class TabManagementUITests: CalyxUITestCase {
         guard let lastTab else { return }
         let lastTabFrame = lastTab.frame
 
-        // The "+" button's `accessibilityIdentifier(AccessibilityID.TabBar
-        // .newTabButton)` modifier (applied after `.buttonStyle(.glass)`)
-        // does not reach the accessibility tree as its own identifier on
-        // macOS 27: `app.debugDescription` shows this button surfaces as
-        // `Button, identifier: 'calyx.tabBar', label: 'Add'` -- the same
-        // identifier as the tab strip's `ScrollView` container, with the
-        // system-supplied "Add" label being the only way to disambiguate
-        // it. (Raw literal, matching this file's own convention -- see
+        // Raw literal, matching this file's own convention -- see
         // `tabBarTabsQuery()`/`groupHeadersQuery()` above -- since the
         // production `AccessibilityID` enum lives in `Calyx/Helpers/`,
-        // which is not part of the CalyxUITests target's sources.)
-        let newTabButton = app.buttons
-            .matching(NSPredicate(format: "identifier == %@ AND label == %@", "calyx.tabBar", "Add"))
-            .firstMatch
+        // which is not part of the CalyxUITests target's sources.
+        let newTabButton = app.buttons["calyx.tabBar.newTabButton"]
         XCTAssertTrue(waitFor(newTabButton), "New tab '+' button should exist")
         let newTabButtonFrame = newTabButton.frame
 
