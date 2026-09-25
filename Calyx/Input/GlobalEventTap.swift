@@ -15,7 +15,7 @@ private let logger = Logger(subsystem: "com.calyx.terminal", category: "GlobalEv
 /// Singleton that installs a session-level CGEvent tap to intercept global key events
 /// and forward them to ghostty for global keybind matching.
 class GlobalEventTap: @unchecked Sendable {
-    nonisolated(unsafe) static let shared = GlobalEventTap()
+    static let shared = GlobalEventTap()
 
     /// The CGEvent tap mach port. Non-nil when the tap is active.
     /// Accessible from the C callback for re-enabling on timeout.
