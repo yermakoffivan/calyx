@@ -539,30 +539,48 @@ actor LSPSession {
         // flight — a subsequent launch would then `availableSnapshots()`
         // a session that is already shut down.
         //
-        // Bounded wait: cap the drain at 2 seconds via a structured
-        // `withTaskGroup` race between the worker's `value` and a
-        // timer. Once the first child wins (sub-millisecond on a local
-        // tmpfs), we `cancelAll()` the remaining children so the loser
-        // does not stay alive for the full 2 second sleep, holding
-        // captures of `self` and leaking a Task per shutdown. The
-        // structured group implicitly awaits all cancelled children
-        // before returning, but `Task.sleep` honours cancellation and
-        // exits immediately, so total shutdown latency stays bounded
-        // by whichever child won.
+        // Bounded wait: cap the drain at 2 seconds. `Task.value` does not
+        // honour cancellation, so a structured race (`withTaskGroup`)
+        // cannot enforce the bound: the group implicitly awaits every
+        // child, including a cancelled `task.value` child whose persist
+        // worker is stuck in cancellation-blind work (e.g. decoding a
+        // huge file). Instead, two unstructured Tasks — the drain
+        // observer and a timer — signal one `CheckedContinuation`
+        // through an `OSAllocatedUnfairLock` gate so only the first
+        // arrival wakes the caller. Both are then cancelled: the timer
+        // exits its sleep at once, so it does not stay alive for the
+        // full 2 seconds holding captures of `self`; an observer that
+        // lost is left to finish with the persist worker, which does
+        // not retain `self`.
         if let task = persistWorkerTask {
             inflightTeardownTaskCountForTests += 2 // TEST ONLY
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { [weak self] in
-                    _ = await task.value
+            let signaled = OSAllocatedUnfairLock(initialState: false)
+            var observer: Task<Void, Never>?
+            var timer: Task<Void, Never>?
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let signalOnce: @Sendable () -> Void = {
+                    let alreadySignaled = signaled.withLock { (state: inout Bool) -> Bool in
+                        let previous = state
+                        state = true
+                        return previous
+                    }
+                    if !alreadySignaled {
+                        continuation.resume()
+                    }
+                }
+                observer = Task { [weak self] in
+                    await task.value
+                    signalOnce()
                     await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
                 }
-                group.addTask { [weak self] in
+                timer = Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    signalOnce()
                     await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
                 }
-                _ = await group.next()
-                group.cancelAll()
             }
+            observer?.cancel()
+            timer?.cancel()
         }
     }
 
