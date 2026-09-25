@@ -122,7 +122,7 @@ final class MCPServerSettingsModel {
     private func observeRegistry(_ registry: MCPServerRegistry) {
         withObservationTracking {
             _ = registry.servers
-        } onChange: {
+        } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.registry === registry else { return }
                 self.observeRegistry(registry)

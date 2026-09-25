@@ -3,7 +3,7 @@ options:
   bundleIdPrefix: com.calyx
   deploymentTarget:
     macOS: "26.0"
-  xcodeVersion: "26.2"
+  xcodeVersion: "27.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
@@ -23,7 +23,7 @@ configs:
 
 settings:
   base:
-    SWIFT_VERSION: "6.2"
+    SWIFT_VERSION: "6.4"
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     OTHER_LDFLAGS:
       - -framework Metal
@@ -240,7 +240,7 @@ targets:
       base:
         PRODUCT_NAME: calyx
         PRODUCT_MODULE_NAME: CalyxCLI
-        SWIFT_VERSION: "6.2"
+        SWIFT_VERSION: "6.4"
         MACOSX_DEPLOYMENT_TARGET: "26.0"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ""

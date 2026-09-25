@@ -67,7 +67,7 @@ final class MCPServersSettingsView: NSView {
         let generation = observationGeneration
         withObservationTracking {
             rebuild()
-        } onChange: {
+        } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.observationGeneration == generation else { return }
                 self.observeModel()

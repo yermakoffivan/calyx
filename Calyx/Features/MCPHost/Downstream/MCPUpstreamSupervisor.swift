@@ -161,7 +161,7 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
     private func observeRegistry() {
         withObservationTracking {
             _ = registry.servers
-        } onChange: {
+        } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.observeRegistry()

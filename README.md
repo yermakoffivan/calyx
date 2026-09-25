@@ -224,8 +224,8 @@ The browser server starts automatically with the app and listens on `localhost:4
 
 ### Prerequisites
 
-- macOS 26+ (Tahoe)
-- Xcode 26+
+- macOS 26.6+ (Tahoe)
+- Xcode 27+
 - [Zig](https://ziglang.org/) (version matching ghostty's `build.zig.zon`)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
 
@@ -257,7 +257,7 @@ Calyx uses AppKit for window, tab, and focus management with SwiftUI for view re
 - `@MainActor` enforced on all UI and model code
 - Action dispatch via `NotificationCenter`
 
-**Tech stack**: Swift 6.2, AppKit, SwiftUI, libghostty (Metal), XcodeGen
+**Tech stack**: Swift 6.4, AppKit, SwiftUI, libghostty (Metal), XcodeGen
 
 ## Contributing
 
