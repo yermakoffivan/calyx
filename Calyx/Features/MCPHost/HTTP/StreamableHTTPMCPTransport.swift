@@ -84,6 +84,9 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
     private var responseReaders: [UUID: ResponseReader] = [:]
     /// Legacy only: the task running the standalone GET stream.
     private var eventStreamTask: Task<Void, Never>?
+    /// Legacy `notifications/cancelled` POSTs still in flight, keyed by an
+    /// id each removes itself under when done. Cancelled by `stopReading()`.
+    private var cancelNotificationTasks: [UUID: Task<Void, Never>] = [:]
     /// Legacy only: the last event ID and `retry:` delay of the standalone
     /// GET stream, kept across reconnections.
     private var eventStreamLastEventID: String?
@@ -167,20 +170,40 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
         let notification = CancelledNotification(
             params: MCPCancelledNotificationParams(requestId: requestID, reason: reason)
         )
+        let payload: Data
+        let headers: [String: String]
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .withoutEscapingSlashes
-            let payload = try encoder.encode(notification)
+            payload = try encoder.encode(notification)
             let message = try JSONRPCMessage.parse(payload)
-            let headers = messageHeaders(for: message, kind: .notification)
-            let endpoint = self.endpoint
-            let exchange = try await requester.perform { authorization in
-                Self.makeRequest(url: endpoint, method: "POST", headers: headers, authorization: authorization, body: payload)
-            }
-            MCPHTTPAuthorizingRequester.discard(exchange.body)
+            headers = messageHeaders(for: message, kind: .notification)
         } catch {
             return
         }
+        // The POST runs in a task of its own and `cancel` returns without
+        // waiting for it: the caller is typically the request's own, already
+        // cancelled task, whose cancellation would otherwise stop the POST
+        // before it is sent. `close()` cancels POSTs still in flight.
+        let endpoint = self.endpoint
+        let requester = self.requester
+        let taskID = UUID()
+        cancelNotificationTasks[taskID] = Task { [weak self] in
+            do {
+                let exchange = try await requester.perform { authorization in
+                    Self.makeRequest(url: endpoint, method: "POST", headers: headers, authorization: authorization, body: payload)
+                }
+                MCPHTTPAuthorizingRequester.discard(exchange.body)
+            } catch {
+                // Dropped: an `.error` here would read as a failure of every
+                // request in flight.
+            }
+            await self?.cancelNotificationFinished(taskID)
+        }
+    }
+
+    private func cancelNotificationFinished(_ taskID: UUID) {
+        cancelNotificationTasks[taskID] = nil
     }
 
     /// Finishes `inbound` directly and stops every response and event
@@ -440,6 +463,10 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
         responseReaders.removeAll()
         eventStreamTask?.cancel()
         eventStreamTask = nil
+        for task in cancelNotificationTasks.values {
+            task.cancel()
+        }
+        cancelNotificationTasks.removeAll()
     }
 
     /// Session loss: fails the request with `.error(404)`, then reports the
