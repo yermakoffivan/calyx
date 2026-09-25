@@ -538,7 +538,7 @@ final class SessionCommandPaletteTests: XCTestCase {
     /// post, unrelated to `NSApp.delegate`.
     @MainActor
     private final class SurfaceDestroyedClosingTabIDsSpy: NSObject {
-        weak var controller: CalyxWindowController?
+        weak let controller: CalyxWindowController?
         let surfaceID: UUID
         private(set) var observedClosingTabIDs: Set<UUID>?
 

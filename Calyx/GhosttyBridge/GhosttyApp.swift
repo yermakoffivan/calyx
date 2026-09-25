@@ -201,7 +201,7 @@ final class GhosttyAppController {
 
     /// Adapter bridging ConfigReloadDeps to GhosttyAppController internals.
     private final class ReloadDepsAdapter: ConfigReloadDeps {
-        private weak var controller: GhosttyAppController?
+        private weak let controller: GhosttyAppController?
 
         init(controller: GhosttyAppController) {
             self.controller = controller

@@ -1031,7 +1031,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// "small reference-typed helper nested inside `AppDelegate`" shape.
     @MainActor
     private final class HerdrAppDelegateSurfaceFactory: HerdrNativeSurfaceFactory {
-        private weak var appDelegate: AppDelegate?
+        private weak let appDelegate: AppDelegate?
 
         init(appDelegate: AppDelegate) {
             self.appDelegate = appDelegate

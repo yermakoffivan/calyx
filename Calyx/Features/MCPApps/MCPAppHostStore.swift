@@ -122,8 +122,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         self.paneResolver = paneResolver
         self.runtime = runtime
         self.appToolRegistry = appToolRegistry
-        let observer = PaneNotificationObserver()
-        observer.store = self
+        let observer = PaneNotificationObserver(store: self)
         NotificationCenter.default.addObserver(
             observer, selector: #selector(PaneNotificationObserver.handleSurfaceDestroyed(_:)),
             name: .calyxSurfaceDestroyed, object: nil
@@ -711,7 +710,12 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
 /// forwards them to the store.
 @MainActor
 private final class PaneNotificationObserver: NSObject {
-    weak var store: MCPAppHostStore?
+    weak let store: MCPAppHostStore?
+
+    init(store: MCPAppHostStore) {
+        self.store = store
+        super.init()
+    }
 
     @objc func handleSurfaceDestroyed(_ notification: Notification) {
         guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }

@@ -37,8 +37,8 @@ final class MCPAppBridge: NSObject, WKScriptMessageHandlerWithReply {
     /// The world the bridge script and handler live in, invisible to the page.
     nonisolated static let worldName = "calyxMcpAppBridge"
 
-    weak var delegate: any MCPAppBridgeDelegate?
-    weak var webView: WKWebView?
+    weak let delegate: any MCPAppBridgeDelegate?
+    weak let webView: WKWebView?
     let world: WKContentWorld
 
     private var pendingReplies: [String: CheckedContinuation<JSONRPCMessage, Error>] = [:]
@@ -47,7 +47,13 @@ final class MCPAppBridge: NSObject, WKScriptMessageHandlerWithReply {
     /// `ui/notifications/initialized` arrived since the last load.
     private(set) var hasReceivedInitialized = false
 
-    init(world: WKContentWorld = .world(name: MCPAppBridge.worldName)) {
+    init(
+        webView: WKWebView,
+        delegate: any MCPAppBridgeDelegate,
+        world: WKContentWorld = .world(name: MCPAppBridge.worldName)
+    ) {
+        self.webView = webView
+        self.delegate = delegate
         self.world = world
     }
 

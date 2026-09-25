@@ -36,7 +36,7 @@ final class GhosttySurfaceController: Identifiable {
     nonisolated(unsafe) private(set) var surface: ghostty_surface_t? = nil
 
     /// Weak reference back to the hosting view.
-    weak var surfaceView: SurfaceView?
+    weak let surfaceView: SurfaceView?
 
     /// The current cell size (updated via CELL_SIZE action).
     var cellSize: NSSize = .zero

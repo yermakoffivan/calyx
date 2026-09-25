@@ -724,7 +724,7 @@ final class HerdrSessionPresenceTests: XCTestCase {
         let socketPath = root + "/herdr.sock"
         let presence = makePresence(configRoot: root)
         var observer: RecordingPresenceObserver? = RecordingPresenceObserver()
-        weak var weakObserver = observer
+        weak let weakObserver = observer
         presence.setObserver(observer)
         presence.start()
 

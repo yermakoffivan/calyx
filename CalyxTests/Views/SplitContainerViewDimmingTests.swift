@@ -447,7 +447,7 @@ final class SplitContainerViewDimmingTests: XCTestCase {
 
         // Act — drop the strong ref. Because `focusHost` is declared `weak`,
         // the surface must observe nil once the only strong owner goes away.
-        weak var weakHostProbe = host
+        weak let weakHostProbe = host
         host = nil
         XCTAssertNil(
             weakHostProbe,

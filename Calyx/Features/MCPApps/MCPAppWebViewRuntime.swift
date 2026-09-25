@@ -98,7 +98,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     /// found through `environment`.
     private struct DockAttachment {
         let dock: MCPAppDockView
-        weak var container: SplitContainerView?
+        weak let container: SplitContainerView?
     }
 
     weak var store: MCPAppHostStore? {
@@ -146,9 +146,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
             throw MCPAppWebViewFactoryError.invalidOrigin
         }
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        let bridge = MCPAppBridge()
-        bridge.webView = webView
-        bridge.delegate = self
+        let bridge = MCPAppBridge(webView: webView, delegate: self)
         MCPAppWebViewFactory.installBridge(into: webView, world: bridge.world, handler: bridge)
         let navigationGuard = MCPAppNavigationGuard(allowedInitialURLs: [hostPageURL, viewURL])
         navigationGuard.onDidFinishLoad = { [weak self] in self?.store?.viewDidLoadDocument(viewID: viewID) }
