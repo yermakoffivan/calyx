@@ -10,7 +10,7 @@
 // relabels the standard Cmd+, app-menu item to "Settings…" at runtime
 // regardless of the string the source passes to `withTitle:`, so this
 // suite looks it up as "Settings…", not "Preferences…") shows a toolbar with one button per
-// SettingsPane ("Appearance" / "Sessions" / "Agents" / "LSP") -- a shipped defect
+// SettingsPane ("Appearance" / "Sessions" / "Agents" / "MCP Apps" / "LSP") -- a shipped defect
 // had these collapse into one degenerate merged header instead (no
 // per-item image, per `SettingsWindowController.setupContent()`'s own
 // doc comment; XCUITest cannot read an NSToolbarItem's NSImage directly,
@@ -94,12 +94,36 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
                 "LSP pane) found on the LSP pane.",
                 file: file, line: line
             )
+        case "MCP Apps":
+            // Unlike every other pane's first control, this one control
+            // DOES carry a production accessibilityIdentifier
+            // (AccessibilityID.MCPServersSettings.addButton, set in
+            // MCPServersSettingsView.addAndImportButtons()) -- reused here
+            // by its literal string rather than by ordinal lookup because
+            // the pane's first control depends on whether any MCP server
+            // is registered (SettingsRow.mcpServers ->
+            // MCPServersSettingsView.rebuild(): emptyState() vs.
+            // addAndImportButtons() + serverList()), while the "Add
+            // Server" button (identifier "calyx.settings.mcpServers.
+            // addButton") is present in both branches, so it alone is a
+            // stable ordinal-independent marker for this pane. Mirrors
+            // MCPAppsE2ETests's own use of this same identifier string.
+            XCTAssertTrue(
+                waitFor(
+                    app.descendants(matching: .any)
+                        .matching(identifier: "calyx.settings.mcpServers.addButton").firstMatch,
+                    timeout: 5
+                ),
+                "No \"Add Server\" button (SettingsRow.mcpServers, always present regardless of " +
+                "whether any server is registered) found on the MCP Apps pane.",
+                file: file, line: line
+            )
         default:
             XCTFail("Unknown pane \"\(pane)\"", file: file, line: line)
         }
     }
 
-    /// Opens Settings, asserts the toolbar shows three distinct
+    /// Opens Settings, asserts the toolbar shows five distinct
     /// individually-labeled buttons (not one merged header -- see this
     /// method's own inline comment for why that, not an image-presence
     /// check, is what's actually assertable here), then for each pane in
@@ -138,7 +162,7 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         // The window is expected to open already showing the first
         // pane (Appearance) -- SettingsWindowController.setupContent()
         // adds tab items in SettingsPane.allCases order (Appearance,
-        // Sessions, Agents, LSP) with no explicit initial-selection
+        // Sessions, Agents, MCP Apps, LSP) with no explicit initial-selection
         // override, so NSTabViewController defaults to index 0.
         XCTAssertEqual(
             settingsWindow.title, "Appearance",
@@ -160,21 +184,21 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         // defect (`SettingsWindowController.setupContent()`'s own doc
         // comment: "the toolbar-style NSTabViewController renders a tab
         // item with no image as a degenerate fat header instead of a
-        // proper toolbar button"): whether FOUR separate,
+        // proper toolbar button"): whether FIVE separate,
         // individually-labeled buttons exist at all, vs. one merged
         // header. A screenshot is saved below for the one part of this
         // (the icon glyphs themselves) that only a human eye can
         // confirm.
         let toolbarButtonLabels = Set(settingsWindow.toolbars.buttons.allElementsBoundByIndex.map { $0.label })
         XCTAssertEqual(
-            toolbarButtonLabels, ["Appearance", "Sessions", "Agents", "LSP"],
-            "Settings toolbar should expose four distinct, individually-labeled buttons " +
-            "(Appearance/Sessions/Agents/LSP), not a single merged/degenerate header. Actual labels " +
+            toolbarButtonLabels, ["Appearance", "Sessions", "Agents", "MCP Apps", "LSP"],
+            "Settings toolbar should expose five distinct, individually-labeled buttons " +
+            "(Appearance/Sessions/Agents/MCP Apps/LSP), not a single merged/degenerate header. Actual labels " +
             "found: \(toolbarButtonLabels). Window hierarchy: " +
             "\(settingsWindow.debugDescription.prefix(2000))"
         )
 
-        for pane in ["Appearance", "Sessions", "Agents", "LSP"] {
+        for pane in ["Appearance", "Sessions", "Agents", "MCP Apps", "LSP"] {
             let toolbarButton = settingsWindow.toolbars.buttons[pane]
             XCTAssertTrue(
                 waitFor(toolbarButton, timeout: 5),
@@ -190,7 +214,10 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
                 "toolbar button (actual: \"\(settingsWindow.title)\")."
             )
             assertPaneContentVisible(pane)
-            saveScreenshot(name: "settings-\(pane.lowercased())")
+            // "MCP Apps" contains a space -- collapse it to a hyphen so
+            // this pane's screenshot filename stays a single sane token
+            // like every other pane's.
+            saveScreenshot(name: "settings-\(pane.lowercased().replacingOccurrences(of: " ", with: "-"))")
         }
     }
 }

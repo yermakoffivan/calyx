@@ -198,7 +198,11 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
                 once.resume()
             }
             Task { @MainActor in
-                try await Task.sleep(for: wait)
+                do {
+                    try await Task.sleep(for: wait)
+                } catch {
+                    logger.info("ui/resource-teardown wait ended early: \(error, privacy: .public)")
+                }
                 once.resume()
             }
         }

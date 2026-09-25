@@ -254,6 +254,13 @@ private final class WheelBridgeView: NSView {
         }
     }
 
+    // Unaffected by the macOS 27 empty-strip hit-test change documented
+    // below on `handleDoubleClick`: `targetScrollView(for:)` only needs
+    // `enclosingScrollView` on whatever view is hit, and that resolves
+    // correctly to the tab strip's `NSScrollView` (height <= 48) on macOS
+    // 27 as well -- confirmed via the same diagnostic pass, the failure
+    // there was specific to the `NSClipView`/`NSScroller`/scroll-view-
+    // itself class check that only `handleDoubleClick` performed.
     private func handleScrollWheel(_ event: NSEvent) -> NSEvent? {
         guard abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) else { return event }
         guard let scrollView = targetScrollView(for: event) else { return event }
@@ -275,22 +282,57 @@ private final class WheelBridgeView: NSView {
         return nil
     }
 
+    // Empty-strip detection (macOS 27 finding):
+    // Previously this recognized "empty area" by requiring the hit-tested
+    // view to be `NSClipView`, `NSScroller`, or the `NSScrollView` itself
+    // -- the AppKit views a double-click on empty scroll content used to
+    // land on. On macOS 27 that hit-test instead lands on SwiftUI's own
+    // private compositing view (observed: `SwiftUI.PlatformGroupContainer`,
+    // nested inside `SwiftUI.HostingScrollView`/`HostingClipView`), which is
+    // none of those three AppKit classes, so the old check always failed
+    // and the double-click was silently swallowed with the window not
+    // zooming either (confirming no other monitor consumed it).
+    //
+    // Rather than special-case a SwiftUI-private class name that can
+    // change again on a future OS, "empty area" is now decided
+    // structurally:
+    // 1. The click point falls inside this bridge view's own bounds. The
+    //    bridge is installed as `.background(...)` of the tab strip's
+    //    `ScrollView`, so it is always laid out with that scroll view's
+    //    exact frame -- checking the bridge's own bounds is equivalent to
+    //    checking "inside the tab strip", independent of which AppKit/
+    //    SwiftUI class backs the scroll view internally.
+    // 2. No view on the path from the hit view up to the window's content
+    //    view is an interactive control that should own the click
+    //    instead: a tab's `ClickContainerNSView` (handles its own
+    //    single/double click, see `TabClickRecognizer.swift`), an
+    //    `NSControl` (covers `NSButton` and `NSTextField`, including the
+    //    rename field's `InlineEditorTextField`), or an `NSTextView` (that
+    //    field's editor).
     private func handleDoubleClick(_ event: NSEvent) -> NSEvent? {
         guard event.clickCount == 2 else { return event }
         guard let window, let contentView = window.contentView else { return event }
+
+        let locationInSelf = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(locationInSelf) else { return event }
+
         let locationInContent = contentView.convert(event.locationInWindow, from: nil)
         guard let hitView = contentView.hitTest(locationInContent) else { return event }
-        guard let scrollView = hitView.enclosingScrollView else { return event }
-        guard scrollView.contentView.bounds.height <= 48 else { return event }
-
-        let isEmptyStripArea =
-            hitView is NSClipView ||
-            hitView is NSScroller ||
-            hitView == scrollView
-        guard isEmptyStripArea else { return event }
+        guard !hasInteractiveAncestor(startingAt: hitView) else { return event }
 
         onDoubleClickEmptyArea?()
         return nil
+    }
+
+    private func hasInteractiveAncestor(startingAt hitView: NSView) -> Bool {
+        var current: NSView? = hitView
+        while let view = current {
+            if view is ClickContainerNSView || view is NSControl || view is NSTextView {
+                return true
+            }
+            current = view.superview
+        }
+        return false
     }
 
     private func targetScrollView(for event: NSEvent) -> NSScrollView? {

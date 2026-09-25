@@ -989,7 +989,15 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// in advance which one a given SwiftUI container/modifier
     /// combination picks.
     private func elementText(_ element: XCUIElement) -> String {
-        let label = element.label
+        // A collapsed SwiftUI `Menu` (e.g. the approval banner's queue
+        // navigator, `AccessibilityID.ApprovalBanner.queueMenu`) surfaces
+        // its `.accessibilityLabel(_:)` text through the element's `title`
+        // (AXTitle) attribute, not `label` (field-verified: `label` reads
+        // "" for that element while `debugDescription` still shows
+        // `title: '1 / 2'`). Falling back to `title` before `value` keeps
+        // every existing label-based read working unchanged (most
+        // elements' `title` is empty) while also covering this case.
+        let label = element.label.isEmpty ? element.title : element.label
         let value = element.value as? String ?? ""
         if label.isEmpty { return value }
         if value.isEmpty || value == label { return label }

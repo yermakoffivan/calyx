@@ -88,8 +88,15 @@ final class TabReorderUITests: CalyxUITestCase {
             return XCTFail("Tab at index 2 should exist")
         }
 
-        // Act: drag the first tab to the right, past the third tab
-        firstTabElement.press(forDuration: 0.2, thenDragTo: thirdTabElement)
+        // Act: drag the first tab to the right, past the third tab.
+        // `press(forDuration:thenDragTo:)` delivers ZERO synthetic mouse
+        // events to the app-under-test on this Xcode/macOS toolchain
+        // (field-verified via mouseDown/mouseDragged/mouseUp
+        // instrumentation in ClickContainerNSView and an app-wide
+        // NSEvent local monitor: neither ever fired). `click(forDuration:
+        // thenDragTo:)` is the same click-and-hold-then-drag gesture via
+        // a different XCTest code path and does deliver events.
+        firstTabElement.click(forDuration: 0.2, thenDragTo: thirdTabElement)
 
         // Allow the reorder animation to settle
         Thread.sleep(forTimeInterval: 1.0)
@@ -136,8 +143,11 @@ final class TabReorderUITests: CalyxUITestCase {
             return XCTFail("Sidebar tab at index 2 should exist")
         }
 
-        // Act: drag the first sidebar tab down past the third
-        firstSidebarTab.press(forDuration: 0.2, thenDragTo: thirdSidebarTab)
+        // Act: drag the first sidebar tab down past the third. See
+        // test_dragTabBarTab_reordersCorrectly's own comment above for
+        // why `click(forDuration:thenDragTo:)`, not `press(forDuration:
+        // thenDragTo:)`, is used here.
+        firstSidebarTab.click(forDuration: 0.2, thenDragTo: thirdSidebarTab)
 
         // Allow the reorder animation to settle
         Thread.sleep(forTimeInterval: 1.0)
@@ -178,7 +188,12 @@ final class TabReorderUITests: CalyxUITestCase {
         // We drag to a nearby coordinate offset (2pt right, 0pt down) which is < minimumDistance.
         let startCoordinate = firstTabElement.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         let nearbyCoordinate = startCoordinate.withOffset(CGVector(dx: 2, dy: 0))
-        startCoordinate.press(forDuration: 0.1, thenDragTo: nearbyCoordinate)
+        // `click(forDuration:thenDragTo:)`, not `press(forDuration:
+        // thenDragTo:)` -- see test_dragTabBarTab_reordersCorrectly's own
+        // comment. Using the broken `press` variant here made this
+        // assertion pass vacuously (no drag was ever delivered to assert
+        // "no reorder" against).
+        startCoordinate.click(forDuration: 0.1, thenDragTo: nearbyCoordinate)
 
         Thread.sleep(forTimeInterval: 0.5)
 
