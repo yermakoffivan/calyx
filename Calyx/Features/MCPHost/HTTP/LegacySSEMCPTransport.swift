@@ -213,7 +213,7 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
         }
 
         var parser = SSEEventParser(maxEventBytes: requester.session.maxBodyBytes)
-        var streamError: (any Error)?
+        var streamError: any Error?
         do {
             for try await chunk in exchange.body {
                 receive(try parser.feed(chunk))
@@ -260,7 +260,7 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
     /// The GET stream ended. Before the endpoint event this fails
     /// `openStream()`; afterwards, unless the transport was closed, it is
     /// reported as `.closed`.
-    private func streamEnded(error: (any Error)?) {
+    private func streamEnded(error: any Error?) {
         if endpointWaiter != nil {
             failOpening(error ?? MCPTransportError.closed)
             return

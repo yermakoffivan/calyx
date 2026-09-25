@@ -20,7 +20,7 @@
 import Foundation
 
 protocol MCPConnectionLookup: Sendable {
-    func connection(forServerID serverID: MCPServerID) async -> (any MCPUpstreamConnecting)?
+    func connection(forServerID serverID: MCPServerID) async -> any MCPUpstreamConnecting?
 }
 
 protocol MCPCatalogProviding: Sendable {

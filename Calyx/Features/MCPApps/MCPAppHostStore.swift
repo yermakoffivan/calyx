@@ -377,7 +377,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         records[viewID]?.invocation
     }
 
-    func session(forView viewID: UUID) -> (any MCPAppServerSession)? {
+    func session(forView viewID: UUID) -> any MCPAppServerSession? {
         records[viewID]?.session
     }
 

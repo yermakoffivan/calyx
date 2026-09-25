@@ -37,7 +37,7 @@ final class MCPAppBridge: NSObject, WKScriptMessageHandlerWithReply {
     /// The world the bridge script and handler live in, invisible to the page.
     nonisolated static let worldName = "calyxMcpAppBridge"
 
-    weak var delegate: (any MCPAppBridgeDelegate)?
+    weak var delegate: any MCPAppBridgeDelegate?
     weak var webView: WKWebView?
     let world: WKContentWorld
 

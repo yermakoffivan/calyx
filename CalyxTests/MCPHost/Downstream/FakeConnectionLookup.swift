@@ -19,7 +19,7 @@ struct FakeConnectionLookup: MCPConnectionLookup {
         self.connections = connections
     }
 
-    func connection(forServerID serverID: MCPServerID) async -> (any MCPUpstreamConnecting)? {
+    func connection(forServerID serverID: MCPServerID) async -> any MCPUpstreamConnecting? {
         connections[serverID]
     }
 }

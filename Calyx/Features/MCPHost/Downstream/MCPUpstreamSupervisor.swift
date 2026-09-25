@@ -62,8 +62,8 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
     private let httpSession: MCPHTTPSession
 
     private var entries: [MCPServerID: Entry] = [:]
-    private var viewHosting: (any MCPAppViewHosting)?
-    private var elicitationPresenting: (any MCPElicitationPresenting)?
+    private var viewHosting: any MCPAppViewHosting?
+    private var elicitationPresenting: any MCPElicitationPresenting?
     private var isObservingRegistry = false
     /// The last queued change of `entries`. `connectAll()`,
     /// `disconnectAll()` and each registry change run after it, one at a
@@ -170,7 +170,7 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
         }
     }
 
-    func connection(forServerID serverID: MCPServerID) -> (any MCPUpstreamConnecting)? {
+    func connection(forServerID serverID: MCPServerID) -> any MCPUpstreamConnecting? {
         entries[serverID]?.supervised
     }
 

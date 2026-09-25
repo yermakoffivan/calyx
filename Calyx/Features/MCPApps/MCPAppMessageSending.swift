@@ -16,7 +16,7 @@ enum MCPAppMessageSending {
     static func send(
         _ blocks: [MCPMessageContentBlock],
         imageDirectory: URL = MCPAppMessageFormatter.imageDirectory,
-        isolation: isolated (any Actor)? = #isolation,
+        isolation: isolated any Actor? = #isolation,
         deliver: (String) async throws -> Void
     ) async -> Result<AnyCodable, JSONRPCError> {
         let text: String

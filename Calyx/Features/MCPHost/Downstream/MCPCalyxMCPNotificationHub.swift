@@ -141,7 +141,7 @@ actor MCPCalyxMCPNotificationHub {
     func watchServers(_ serverIDs: [MCPServerID], connections: any MCPConnectionLookup) {
         for serverID in serverIDs where watchedServers.insert(serverID).inserted {
             Task {
-                var watched: (any MCPUpstreamConnecting)?
+                var watched: any MCPUpstreamConnecting?
                 while let connection = await connections.connection(forServerID: serverID),
                       !Self.isSame(connection, watched) {
                     watched = connection
@@ -155,7 +155,7 @@ actor MCPCalyxMCPNotificationHub {
     }
 
     /// Connections are actors, compared by identity.
-    private static func isSame(_ connection: any MCPUpstreamConnecting, _ other: (any MCPUpstreamConnecting)?) -> Bool {
+    private static func isSame(_ connection: any MCPUpstreamConnecting, _ other: any MCPUpstreamConnecting?) -> Bool {
         guard let other else { return false }
         return (connection as AnyObject) === (other as AnyObject)
     }

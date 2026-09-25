@@ -78,7 +78,7 @@ final class HerdrSessionPresence {
     private let probeDelays: [Duration]
     private let sleep: @Sendable (Duration) async -> Void
 
-    private weak var observer: (any HerdrSessionPresenceObserver)?
+    private weak var observer: any HerdrSessionPresenceObserver?
 
     /// The live session at each candidate socket path, as last reported.
     /// A path absent here has no live session behind it.
@@ -112,7 +112,7 @@ final class HerdrSessionPresence {
     }
 
     /// Stored WEAKLY -- this type never owns an observer's lifecycle.
-    func setObserver(_ observer: (any HerdrSessionPresenceObserver)?) {
+    func setObserver(_ observer: any HerdrSessionPresenceObserver?) {
         self.observer = observer
     }
 

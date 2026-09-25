@@ -512,7 +512,7 @@ final class HerdrIntegrationCoordinator {
 
     /// See `HerdrStructureEventObserver`'s own doc comment -- stored
     /// WEAKLY, set via `setStructureEventObserver`, never through `init`.
-    private weak var structureEventObserver: (any HerdrStructureEventObserver)?
+    private weak var structureEventObserver: any HerdrStructureEventObserver?
 
     /// The transport behind the CURRENT, subscribed event-stream
     /// connection, once `attemptConnect(socketPath:)` has succeeded --
@@ -520,7 +520,7 @@ final class HerdrIntegrationCoordinator {
     /// reconnecting. See this file's header "EXPLICIT TRANSPORT
     /// TEARDOWN" for why every path that supersedes or gives up on it
     /// closes it explicitly rather than relying on ARC.
-    private var currentEventStreamTransport: (any HerdrTransport)?
+    private var currentEventStreamTransport: any HerdrTransport?
 
     /// REPLACE semantics -- see this file's header, CONNECT SEQUENCE
     /// step 3 and REPLAY BURST RECONCILIATION. ONLY EVER exactly this
@@ -646,7 +646,7 @@ final class HerdrIntegrationCoordinator {
     /// Stored WEAKLY: pass `nil` to clear; a deallocated observer simply
     /// stops being notified rather than being kept alive by this
     /// coordinator.
-    func setStructureEventObserver(_ observer: (any HerdrStructureEventObserver)?) {
+    func setStructureEventObserver(_ observer: any HerdrStructureEventObserver?) {
         structureEventObserver = observer
     }
 

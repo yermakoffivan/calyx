@@ -416,7 +416,7 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
 
     /// A reader ended. A failure other than cancellation is reported as
     /// `.error`, since the reply it carried is lost.
-    private func readerFinished(_ readerID: UUID, error: (any Error)?) {
+    private func readerFinished(_ readerID: UUID, error: any Error?) {
         responseReaders[readerID] = nil
         guard let error, !isClosed, !Self.isCancellation(error) else { return }
         continuation.yield(.error(MCPTransportSignal(httpStatus: nil, message: "response stream failed: \(error)")))
@@ -505,7 +505,7 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
             }
 
             var parser = SSEEventParser(maxEventBytes: requester.session.maxBodyBytes)
-            var streamError: (any Error)?
+            var streamError: any Error?
             do {
                 for try await chunk in exchange.body {
                     receiveEventStream(try parser.feed(chunk))

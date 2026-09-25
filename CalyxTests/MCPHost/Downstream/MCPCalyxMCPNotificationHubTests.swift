@@ -15,11 +15,11 @@ import XCTest
 private actor MutableConnectionLookup: MCPConnectionLookup {
     private var connections: [MCPServerID: any MCPUpstreamConnecting] = [:]
 
-    func set(_ connection: (any MCPUpstreamConnecting)?, for serverID: MCPServerID) {
+    func set(_ connection: any MCPUpstreamConnecting?, for serverID: MCPServerID) {
         connections[serverID] = connection
     }
 
-    func connection(forServerID serverID: MCPServerID) async -> (any MCPUpstreamConnecting)? {
+    func connection(forServerID serverID: MCPServerID) async -> any MCPUpstreamConnecting? {
         connections[serverID]
     }
 }

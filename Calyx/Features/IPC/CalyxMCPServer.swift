@@ -198,7 +198,7 @@ final class CalyxMCPServer {
 
     /// What `app_context` reads. Nil until a view host is attached, in
     /// which case no pane has a live view.
-    var calyxMCPModelContextProvider: (any MCPAppModelContextProviding)?
+    var calyxMCPModelContextProvider: any MCPAppModelContextProviding?
 
     /// The herdr socket a pane is looked up under when its
     /// `X-Calyx-Herdr-Socket-Path` is empty (`HERDR_SOCKET_PATH` unset):

@@ -31,7 +31,7 @@ class SurfaceView: NSView {
 
     /// Weak back-reference to the container that should be told when this
     /// surface gains focus. Held weakly so the container owns the lifetime.
-    weak var focusHost: (any SurfaceFocusHost)?
+    weak var focusHost: any SurfaceFocusHost?
 
     /// The surface controller managing the ghostty surface for this view.
     var surfaceController: GhosttySurfaceController?
