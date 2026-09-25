@@ -111,74 +111,71 @@ actor MCPOAuthFlow {
             await previous.cancel(reason: "replaced by a new sign-in")
         }
 
+        var reason = "sign-in failed"
+        defer { await endSignIn(listener, serverID: serverID, reason: reason) }
+        let bound: (port: Int, host: String)
         do {
-            let bound: (port: Int, host: String)
-            do {
-                bound = try await listener.start()
-            } catch let error as MCPOAuthRedirectListenerError {
-                throw Self.flowError(error)
-            }
-            let redirectURI = "http://\(bound.host):\(bound.port)\(Self.callbackPath)"
-
-            let clientID = try await resolveClientID(serverMetadata: serverMetadata, preRegisteredClientID: preRegisteredClientID)
-
-            let verifier = MCPOAuthPKCE.generateVerifier()
-            let authorizationURL = MCPOAuthAuthorizationRequestBuilder.buildURL(
-                authorizationEndpoint: authorizationEndpoint,
-                clientID: clientID,
-                redirectURI: redirectURI,
-                codeChallenge: MCPOAuthPKCE.codeChallenge(forVerifier: verifier),
-                state: state,
-                canonicalResourceURI: canonicalResourceURI,
-                scope: requestedScope
-            )
-            await browser.open(authorizationURL)
-
-            let callback = try await waitForCallback(listener)
-            if case .failure = MCPOAuthIssuerValidator.validate(
-                issuerParameter: callback.iss,
-                recordedIssuer: serverMetadata.issuer,
-                serverAdvertisesIss: serverMetadata.authorizationResponseIssParameterSupported == true
-            ) {
-                throw MCPOAuthFlowError.issuerMismatch
-            }
-
-            let tokenClient = MCPOAuthTokenClient(
-                session: session,
-                tokenEndpoint: tokenEndpoint,
-                clientID: clientID,
-                clientAuthentication: clientAuthentication,
-                canonicalResourceURI: canonicalResourceURI
-            )
-            let tokens: MCPOAuthTokenSet
-            do {
-                tokens = try await tokenClient.exchangeCode(callback.code, verifier: verifier, redirectURI: redirectURI, canonicalResourceURI: canonicalResourceURI)
-            } catch let error as MCPOAuthFlowError {
-                throw error
-            } catch {
-                throw Task.isCancelled
-                    ? MCPOAuthFlowError.cancelled
-                    : MCPOAuthFlowError.tokenEndpointFailed(error: "request_failed", description: String(describing: error))
-            }
-
-            // RFC 6749 section 5.1: an omitted `scope` equals the requested one.
-            let storedClient = MCPOAuthStoredClient(
-                clientID: clientID,
-                tokenEndpoint: tokenEndpoint,
-                clientAuthentication: clientAuthentication,
-                grantedScope: tokens.scope ?? requestedScope
-            )
-            let credentials = self.credentials
-            try await Self.storing {
-                try await credentials.setTokens(tokens, for: serverID)
-                try await credentials.setClientRegistration(storedClient, for: serverID)
-            }
-            await endSignIn(listener, serverID: serverID, reason: "sign-in finished")
-            return (tokens, clientID, tokenEndpoint)
-        } catch {
-            await endSignIn(listener, serverID: serverID, reason: "sign-in failed")
-            throw error
+            bound = try await listener.start()
+        } catch let error as MCPOAuthRedirectListenerError {
+            throw Self.flowError(error)
         }
+        let redirectURI = "http://\(bound.host):\(bound.port)\(Self.callbackPath)"
+
+        let clientID = try await resolveClientID(serverMetadata: serverMetadata, preRegisteredClientID: preRegisteredClientID)
+
+        let verifier = MCPOAuthPKCE.generateVerifier()
+        let authorizationURL = MCPOAuthAuthorizationRequestBuilder.buildURL(
+            authorizationEndpoint: authorizationEndpoint,
+            clientID: clientID,
+            redirectURI: redirectURI,
+            codeChallenge: MCPOAuthPKCE.codeChallenge(forVerifier: verifier),
+            state: state,
+            canonicalResourceURI: canonicalResourceURI,
+            scope: requestedScope
+        )
+        await browser.open(authorizationURL)
+
+        let callback = try await waitForCallback(listener)
+        if case .failure = MCPOAuthIssuerValidator.validate(
+            issuerParameter: callback.iss,
+            recordedIssuer: serverMetadata.issuer,
+            serverAdvertisesIss: serverMetadata.authorizationResponseIssParameterSupported == true
+        ) {
+            throw MCPOAuthFlowError.issuerMismatch
+        }
+
+        let tokenClient = MCPOAuthTokenClient(
+            session: session,
+            tokenEndpoint: tokenEndpoint,
+            clientID: clientID,
+            clientAuthentication: clientAuthentication,
+            canonicalResourceURI: canonicalResourceURI
+        )
+        let tokens: MCPOAuthTokenSet
+        do {
+            tokens = try await tokenClient.exchangeCode(callback.code, verifier: verifier, redirectURI: redirectURI, canonicalResourceURI: canonicalResourceURI)
+        } catch let error as MCPOAuthFlowError {
+            throw error
+        } catch {
+            throw Task.isCancelled
+                ? MCPOAuthFlowError.cancelled
+                : MCPOAuthFlowError.tokenEndpointFailed(error: "request_failed", description: String(describing: error))
+        }
+
+        // RFC 6749 section 5.1: an omitted `scope` equals the requested one.
+        let storedClient = MCPOAuthStoredClient(
+            clientID: clientID,
+            tokenEndpoint: tokenEndpoint,
+            clientAuthentication: clientAuthentication,
+            grantedScope: tokens.scope ?? requestedScope
+        )
+        let credentials = self.credentials
+        try await Self.storing {
+            try await credentials.setTokens(tokens, for: serverID)
+            try await credentials.setClientRegistration(storedClient, for: serverID)
+        }
+        reason = "sign-in finished"
+        return (tokens, clientID, tokenEndpoint)
     }
 
     // MARK: - Transport Hooks

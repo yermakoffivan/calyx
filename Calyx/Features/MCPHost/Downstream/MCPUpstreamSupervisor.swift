@@ -184,22 +184,19 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
         guard let mcpServerURL = URL(string: url) else { throw MCPUpstreamSupervisorError.invalidURL(url) }
         let auth = entry.config.auth
         await entry.connection.beginAuthorization()
-        do {
-            let clientAuthentication = try await clientAuthentication(for: serverID, method: auth?.clientAuthenticationMethod)
-            _ = try await authFlow.authorize(
-                serverID: serverID,
-                mcpServerURL: mcpServerURL,
-                resourceMetadataHintURL: nil,
-                preRegisteredClientID: auth?.preRegisteredClientID,
-                clientAuthentication: clientAuthentication,
-                scopeOverride: auth?.scopeOverride,
-                redirect: auth?.redirect
-            )
-        } catch {
-            await entry.connection.endAuthorization(succeeded: false)
-            throw error
-        }
-        await entry.connection.endAuthorization(succeeded: true)
+        var succeeded = false
+        defer { await entry.connection.endAuthorization(succeeded: succeeded) }
+        let clientAuthentication = try await clientAuthentication(for: serverID, method: auth?.clientAuthenticationMethod)
+        _ = try await authFlow.authorize(
+            serverID: serverID,
+            mcpServerURL: mcpServerURL,
+            resourceMetadataHintURL: nil,
+            preRegisteredClientID: auth?.preRegisteredClientID,
+            clientAuthentication: clientAuthentication,
+            scopeOverride: auth?.scopeOverride,
+            redirect: auth?.redirect
+        )
+        succeeded = true
     }
 
     /// Deletes the server's stored OAuth tokens and keeps its client
