@@ -145,15 +145,51 @@ struct HerdrSessionRow: Identifiable, Equatable, Sendable {
     /// `refresh()` passes straight through. Evaluated once, here, per
     /// workspace; the result is stored on the row.
     init(info: HerdrSessionInfo, isAttachedHere: (String, String) -> Bool) {
+        self.init(info: info, tuiSurfaceID: nil, isAttachedHere: isAttachedHere)
+    }
+
+    /// `tuiSurfaceID` is the surface of a pane in this process running a
+    /// herdr TUI client attached to this session (resolved by
+    /// `SessionBrowserModel.refresh()` from `info.tuiClients`). Each
+    /// workspace row's attachment is decided per workspace, in this
+    /// order: `.nativeTab` when `isAttachedHere(workspaceID, socketPath)`
+    /// answers true -- that workspace's own open tab always wins, so
+    /// "Show" reveals it rather than a TUI that may be displaying a
+    /// different workspace; otherwise `.tuiPane(surfaceID:)` when
+    /// `tuiSurfaceID` is non-nil -- the TUI can be switched to any of the
+    /// session's workspaces (`SessionBrowserModel.attachHerdrWorkspace(_:)`
+    /// sends `workspace.focus` first); otherwise `.none`.
+    init(info: HerdrSessionInfo, tuiSurfaceID: UUID?, isAttachedHere: (String, String) -> Bool) {
         self.info = info
         self.workspaces = info.workspaces.map { workspace in
-            HerdrWorkspaceRow(
-                socketPath: info.id,
-                info: workspace,
-                isAttachedHere: isAttachedHere(workspace.workspaceID, info.id)
-            )
+            let attachment: HerdrWorkspaceAttachment
+            if isAttachedHere(workspace.workspaceID, info.id) {
+                attachment = .nativeTab
+            } else if let tuiSurfaceID {
+                attachment = .tuiPane(surfaceID: tuiSurfaceID)
+            } else {
+                attachment = .none
+            }
+            return HerdrWorkspaceRow(socketPath: info.id, info: workspace, attachment: attachment)
         }
     }
+}
+
+/// Where a herdr workspace is already displayed in this process, if
+/// anywhere -- decides both `HerdrWorkspaceRow.attachButtonLabel` and
+/// what its button does (`SessionBrowserWindowController
+/// .attachHerdrWorkspace(_:)`).
+enum HerdrWorkspaceAttachment: Equatable, Sendable {
+    /// Not displayed here: the button opens it as a native tab.
+    case none
+    /// Open as a native herdr tab (`HerdrTabCoordinator`). Takes
+    /// precedence over `.tuiPane` for the same workspace.
+    case nativeTab
+    /// No native tab of its own, but a herdr TUI client attached to this
+    /// workspace's session runs in the pane `surfaceID`: the button asks
+    /// herdr to switch that TUI to this workspace (`workspace.focus`),
+    /// then focuses the pane.
+    case tuiPane(surfaceID: UUID)
 }
 
 /// One workspace nested under its own server row (`HerdrSessionRow
@@ -166,21 +202,32 @@ struct HerdrSessionRow: Identifiable, Equatable, Sendable {
 struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
     let socketPath: String
     let info: HerdrWorkspaceInfo
-    /// `true` when this workspace currently has an open tab in this
-    /// window -- the herdr counterpart of `SessionBrowserRow
-    /// .isAttachedHere`. Stored on the row (answered once by
-    /// `SessionBrowserModel.herdrWorkspaceIsAttachedHere` inside
-    /// `refresh()`, via `HerdrSessionRow.init(info:isAttachedHere:)`)
-    /// rather than read from that closure at render time: the closure's
-    /// source (`HerdrTabCoordinator.activeTabIDs`) is not observable, so
-    /// only a change to this stored, `Equatable`-participating value
-    /// makes `@Observable` notice an Attach/close.
-    let isAttachedHere: Bool
+    /// Where this workspace is already displayed in this process -- a
+    /// native tab, or a pane running a herdr TUI client. Stored on the
+    /// row (answered once inside `SessionBrowserModel.refresh()`, via
+    /// `HerdrSessionRow.init(info:tuiSurfaceID:isAttachedHere:)`) rather
+    /// than read at render time: its sources
+    /// (`HerdrTabCoordinator.activeTabIDs`, the process table) are not
+    /// observable, so only a change to this stored,
+    /// `Equatable`-participating value makes `@Observable` notice an
+    /// Attach/close.
+    let attachment: HerdrWorkspaceAttachment
 
-    init(socketPath: String, info: HerdrWorkspaceInfo, isAttachedHere: Bool) {
+    /// `true` when this workspace is already displayed in this process
+    /// (`attachment != .none`) -- the herdr counterpart of
+    /// `SessionBrowserRow.isAttachedHere`.
+    var isAttachedHere: Bool { attachment != .none }
+
+    init(socketPath: String, info: HerdrWorkspaceInfo, attachment: HerdrWorkspaceAttachment) {
         self.socketPath = socketPath
         self.info = info
-        self.isAttachedHere = isAttachedHere
+        self.attachment = attachment
+    }
+
+    /// `isAttachedHere == true` means an open native tab (`.nativeTab`),
+    /// `false` means `.none`.
+    init(socketPath: String, info: HerdrWorkspaceInfo, isAttachedHere: Bool) {
+        self.init(socketPath: socketPath, info: info, attachment: isAttachedHere ? .nativeTab : .none)
     }
 
     /// `isAttachedHere` defaults to `false` -- a workspace row built with
@@ -207,14 +254,14 @@ struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
     var paneCountText: String { "\(info.paneCount) pane(s)" }
 
     /// Mirrors `SessionBrowserRow.attachButtonLabel`'s exact ternary and
-    /// wording: "Show" once this workspace already has an open tab in
-    /// this window, unchanged "Attach" otherwise. Pressing "Attach" on an
-    /// already-open workspace still calls the same open path
-    /// (`HerdrTabCoordinator.openWorkspace`'s own double-open guard
-    /// focuses the existing tab instead of opening a second), so the
-    /// label must read a focus verb instead. Reads this row's own stored
-    /// `isAttachedHere` (see that property's doc comment for where it
-    /// comes from).
+    /// wording: "Show" once this workspace is already displayed in this
+    /// process (an open native tab, or a pane running a herdr TUI client
+    /// -- see `attachment`), unchanged "Attach" otherwise. Pressing the
+    /// button on an already-displayed workspace focuses it
+    /// (`SessionBrowserWindowController.attachHerdrWorkspace(_:)`: the
+    /// TUI pane via `.calyxFocusSurface`, or the native tab via
+    /// `HerdrTabCoordinator.openWorkspace`'s own double-open guard), so
+    /// the label must read a focus verb instead.
     var attachButtonLabel: String {
         isAttachedHere ? "Show" : "Attach"
     }
@@ -312,14 +359,27 @@ final class SessionBrowserModel {
     /// of `isAttachedHere` on a calyx-session row (`SessionBrowserRow`,
     /// set in `refresh()` below from `surfaceMap`). `refresh()` evaluates
     /// it once per workspace while building `herdrRows` and stores the
-    /// answer as `HerdrWorkspaceRow.isAttachedHere`, which backs that
-    /// row's `attachButtonLabel`. Injected the same
+    /// answer as `HerdrWorkspaceRow.attachment` -- `.nativeTab` when true
+    /// (winning over any herdr TUI client resolved via
+    /// `resolveTUISurface`), otherwise `.tuiPane`/`.none` -- which backs
+    /// that row's `attachButtonLabel`. Injected the same
     /// way every other side-effectful dependency here is: a closure,
     /// default `{ _, _ in false }` so existing tests, and any
     /// construction with no herdr tab coordinator to ask, answer exactly
     /// like today. `SessionBrowserWindowController` wires it to
     /// `HerdrTabCoordinator.hasOpenTab(workspaceID:socketPath:)`.
     private let herdrWorkspaceIsAttachedHere: (String, String) -> Bool
+
+    /// Resolves a herdr TUI client's `SurfaceHint`
+    /// (`HerdrSessionInfo.tuiClients`) to a surface of THIS process, or
+    /// nil when it names no surface here (e.g. a pane of another Calyx
+    /// instance). Called on the main actor from `refresh()`; the first
+    /// client of a session that resolves marks every workspace row of
+    /// that session with no native tab of its own
+    /// (`herdrWorkspaceIsAttachedHere` false) `.tuiPane(surfaceID:)`.
+    /// Defaults to
+    /// `defaultResolveTUISurface`.
+    private let resolveTUISurface: (HerdrTUIClient.SurfaceHint) -> UUID?
 
     /// Remote host candidates for the "New Remote Session…" picker,
     /// populated by `refreshRemoteHostCandidates()` from the injected
@@ -398,7 +458,8 @@ final class SessionBrowserModel {
         hostCandidateProvider: SSHHostCandidateProvider = SSHHostCandidateProvider(),
         herdrProvider: HerdrSessionProviderProtocol = HerdrCLISessionProvider(),
         herdrAvailability: @escaping () async -> Bool = SessionBrowserModel.defaultHerdrAvailability(),
-        herdrWorkspaceIsAttachedHere: @escaping (String, String) -> Bool = { _, _ in false }
+        herdrWorkspaceIsAttachedHere: @escaping (String, String) -> Bool = { _, _ in false },
+        resolveTUISurface: @escaping (HerdrTUIClient.SurfaceHint) -> UUID? = { SessionBrowserModel.defaultResolveTUISurface($0) }
     ) {
         self.daemonClient = daemonClient
         self.surfaceMap = surfaceMap
@@ -406,6 +467,25 @@ final class SessionBrowserModel {
         self.herdrProvider = herdrProvider
         self.herdrAvailability = herdrAvailability
         self.herdrWorkspaceIsAttachedHere = herdrWorkspaceIsAttachedHere
+        self.resolveTUISurface = resolveTUISurface
+    }
+
+    /// Production `resolveTUISurface`: `.sessionID` goes through
+    /// `SessionSurfaceMap.shared`, `.surfaceID` is taken as-is, and in
+    /// both cases the UUID is returned only when `SurfaceLocator.shared`
+    /// knows a live controller for it -- i.e. the surface belongs to this
+    /// process, not to another Calyx instance whose pane the client
+    /// inherited its env from.
+    static func defaultResolveTUISurface(_ hint: HerdrTUIClient.SurfaceHint) -> UUID? {
+        let candidate: UUID?
+        switch hint {
+        case .sessionID(let sessionID):
+            candidate = SessionSurfaceMap.shared.surfaceID(for: sessionID)
+        case .surfaceID(let surfaceID):
+            candidate = surfaceID
+        }
+        guard let candidate, SurfaceLocator.shared.controller(for: candidate) != nil else { return nil }
+        return candidate
     }
 
     /// Builds the production `herdrAvailability` default: binary
@@ -550,7 +630,10 @@ final class SessionBrowserModel {
         }
         let herdrSessions = await boundedHerdrListSessions()
         guard !Task.isCancelled else { return }
-        herdrRows = herdrSessions.map { HerdrSessionRow(info: $0, isAttachedHere: herdrWorkspaceIsAttachedHere) }
+        herdrRows = herdrSessions.map { info in
+            let tuiSurfaceID = info.tuiClients.lazy.compactMap { self.resolveTUISurface($0.surfaceHint) }.first
+            return HerdrSessionRow(info: info, tuiSurfaceID: tuiSurfaceID, isAttachedHere: herdrWorkspaceIsAttachedHere)
+        }
     }
 
     /// Races `herdrProvider.listSessions()` against the shared
@@ -583,10 +666,21 @@ final class SessionBrowserModel {
         onHerdrCreateRequested?(row)
     }
 
-    /// Requests attaching to `row`'s already-existing herdr workspace.
-    /// Mirrors `attach(_:)` exactly -- herdr identity flows through the
-    /// same injected-closure seam, just its own closure/row type.
-    func attachHerdrWorkspace(_ row: HerdrWorkspaceRow) {
+    /// Requests attaching to `row`'s already-existing herdr workspace
+    /// through the same injected-closure seam as `attach(_:)`, just its
+    /// own closure/row type. For a `.tuiPane(surfaceID:)` row it first
+    /// sends `workspace.focus` for the row's workspace
+    /// (`herdrProvider.focusWorkspace(workspaceID:socketPath:)`) and only
+    /// then invokes the closure: the pane runs a herdr TUI client that
+    /// displays whichever workspace herdr has focused, so herdr must
+    /// switch it to this row's workspace before the window controller
+    /// focuses the pane -- otherwise "Show" would reveal a different
+    /// workspace. `.nativeTab`/`.none` rows invoke the closure directly;
+    /// no TUI is involved.
+    func attachHerdrWorkspace(_ row: HerdrWorkspaceRow) async {
+        if case .tuiPane = row.attachment {
+            await herdrProvider.focusWorkspace(workspaceID: row.info.workspaceID, socketPath: row.socketPath)
+        }
         onHerdrWorkspaceAttachRequested?(row)
     }
 

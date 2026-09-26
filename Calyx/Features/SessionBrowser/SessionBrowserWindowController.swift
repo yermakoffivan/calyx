@@ -154,8 +154,20 @@ final class SessionBrowserWindowController: NSWindowController {
         }
     }
 
-    /// A herdr workspace row's "Attach" button opens THAT workspace
-    /// NATIVELY as a Calyx tab, through the exact same
+    /// A herdr workspace row's "Attach"/"Show" button. When the row is
+    /// `.tuiPane(surfaceID:)` -- the workspace has no native tab of its
+    /// own, but a herdr TUI client attached to its server runs in one of
+    /// this process's panes -- `SessionBrowserModel.attachHerdrWorkspace(_:)`
+    /// has already sent `workspace.focus` so that TUI displays this
+    /// workspace, and this method focuses that pane by posting
+    /// `.calyxFocusSurface`, exactly like
+    /// `attach(_:)` above does for an attached calyx-session row, and
+    /// opens nothing. Known limitation: Quick Terminal panes are not
+    /// reached by that notification (only window controllers observe
+    /// it), so "Show" on a TUI client running there does nothing
+    /// visible.
+    ///
+    /// Otherwise it opens THAT workspace NATIVELY as a Calyx tab, through the exact same
     /// `AppDelegate.herdrTabCoordinator.openWorkspace(workspaceID:
     /// socketPath:)` entry point `createHerdrWorkspace(_:)` above already
     /// uses for a newly created one -- there is exactly one place that
@@ -166,6 +178,12 @@ final class SessionBrowserWindowController: NSWindowController {
     /// poll (`HerdrTabCoordinator.activeTabIDs` is not observable; only
     /// `refresh()` carries the new answer into `herdrRows`).
     private func attachHerdrWorkspace(_ row: HerdrWorkspaceRow) {
+        if case .tuiPane(let surfaceID) = row.attachment {
+            NotificationCenter.default.post(
+                name: .calyxFocusSurface, object: nil, userInfo: ["surfaceID": surfaceID]
+            )
+            return
+        }
         guard let coordinator = (NSApp.delegate as? AppDelegate)?.herdrTabCoordinator else { return }
         let model = self.model
         Task {

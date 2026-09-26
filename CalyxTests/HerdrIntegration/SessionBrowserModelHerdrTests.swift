@@ -120,6 +120,12 @@ private final class FakeHerdrSessionProvider: HerdrSessionProviderProtocol, @unc
     /// closure-before-close via `closeWorkspaceCalls.count` read inside
     /// `onHerdrWorkspaceKilled`.
     private(set) var listSessionsCallCountAtCloseCall: [Int] = []
+    /// Every `focusWorkspace(workspaceID:socketPath:)` call, in order --
+    /// added ahead of `HerdrSessionProviderProtocol` actually declaring
+    /// this requirement, so the fake is ready once production adds it
+    /// (`SessionBrowserModel.attachHerdrWorkspace(_:)`'s new `.tuiPane`
+    /// path). See `test_attachHerdrWorkspace_tuiPaneRow_sendsWorkspaceFocusThenRequestsAttach`.
+    private(set) var focusWorkspaceCalls: [(workspaceID: String, socketPath: String)] = []
 
     func listSessions() async -> [HerdrSessionInfo] {
         listSessionsCallCount += 1
@@ -129,6 +135,14 @@ private final class FakeHerdrSessionProvider: HerdrSessionProviderProtocol, @unc
     func closeWorkspace(workspaceID: String, socketPath: String) async {
         listSessionsCallCountAtCloseCall.append(listSessionsCallCount)
         closeWorkspaceCalls.append((workspaceID: workspaceID, socketPath: socketPath))
+    }
+
+    /// Not yet part of `HerdrSessionProviderProtocol` -- see this
+    /// property's own doc comment. Once production declares the
+    /// requirement, this conformance starts satisfying it with no
+    /// further change needed here.
+    func focusWorkspace(workspaceID: String, socketPath: String) async {
+        focusWorkspaceCalls.append((workspaceID: workspaceID, socketPath: socketPath))
     }
 }
 
@@ -148,6 +162,12 @@ private final class NeverCompletingHerdrSessionProvider: HerdrSessionProviderPro
     }
 
     func closeWorkspace(workspaceID: String, socketPath: String) async {}
+
+    /// Inert, mirroring `closeWorkspace(workspaceID:socketPath:)` above --
+    /// not yet part of `HerdrSessionProviderProtocol`; see
+    /// `FakeHerdrSessionProvider.focusWorkspace(workspaceID:socketPath:)`'s
+    /// own doc comment.
+    func focusWorkspace(workspaceID: String, socketPath: String) async {}
 }
 
 /// MainActor-isolated box letting a `herdrAvailability` closure reach
@@ -176,14 +196,16 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
         daemonClient: FakeDaemonClient = FakeDaemonClient(),
         herdrProvider: HerdrSessionProviderProtocol,
         herdrAvailability: @escaping () async -> Bool,
-        herdrWorkspaceIsAttachedHere: @escaping (String, String) -> Bool = { _, _ in false }
+        herdrWorkspaceIsAttachedHere: @escaping (String, String) -> Bool = { _, _ in false },
+        resolveTUISurface: @escaping (HerdrTUIClient.SurfaceHint) -> UUID? = { _ in nil }
     ) -> SessionBrowserModel {
         SessionBrowserModel(
             daemonClient: daemonClient,
             surfaceMap: SessionSurfaceMap(),
             herdrProvider: herdrProvider,
             herdrAvailability: herdrAvailability,
-            herdrWorkspaceIsAttachedHere: herdrWorkspaceIsAttachedHere
+            herdrWorkspaceIsAttachedHere: herdrWorkspaceIsAttachedHere,
+            resolveTUISurface: resolveTUISurface
         )
     }
 
@@ -282,7 +304,7 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
 
     // MARK: - attachHerdrWorkspace(_:) requests attaching via the injected callback
 
-    func test_attachHerdrWorkspace_invokesOnHerdrWorkspaceAttachRequested_withTheRow() {
+    func test_attachHerdrWorkspace_invokesOnHerdrWorkspaceAttachRequested_withTheRow() async {
         let model = makeModel(herdrProvider: FakeHerdrSessionProvider(), herdrAvailability: { false })
         let row = HerdrWorkspaceRow(
             socketPath: "test-herdr-socket-1",
@@ -292,7 +314,7 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
         var requestedRow: HerdrWorkspaceRow?
         model.onHerdrWorkspaceAttachRequested = { requestedRow = $0 }
 
-        model.attachHerdrWorkspace(row)
+        await model.attachHerdrWorkspace(row)
 
         XCTAssertEqual(
             requestedRow?.id, row.id,
@@ -968,5 +990,233 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
             model.herdrRows[0].workspaces[0].attachButtonLabel, "Show",
             "once isAttachedHere is true, the zero-argument attachButtonLabel must read \"Show\""
         )
+    }
+
+    // MARK: - TDD Red (herdr TUI-client integration): a herdr TUI client running
+    // inside one of THIS Calyx instance's own panes must mark every workspace
+    // row of that client's session as attached via `.tuiPane(surfaceID:)`, even
+    // though `herdrWorkspaceIsAttachedHere` (the native-tab closure) has no
+    // opinion on it at all. `HerdrWorkspaceRow.attachment`/
+    // `SessionBrowserModel.init(resolveTUISurface:)` do not exist yet -- this
+    // fails to COMPILE (unresolved `HerdrTUIClient`, `attachment`,
+    // `resolveTUISurface` argument).
+
+    func test_refresh_tuiClientResolvesToOwnSurface_marksEveryWorkspaceRowAttachedViaTUIPane() async {
+        let surfaceID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let provider = FakeHerdrSessionProvider()
+        provider.sessionsToReturn = [
+            HerdrSessionInfo(
+                id: "test-herdr-socket-1", name: "work", workspaceCount: 2, paneCount: 2, agentCount: 0,
+                workspaces: [
+                    HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1),
+                    HerdrWorkspaceInfo(workspaceID: "w2", activeTabID: "w2:t1", label: "personal", paneCount: 1),
+                ],
+                tuiClients: [
+                    HerdrTUIClient(socketPath: "test-herdr-socket-1", surfaceHint: .surfaceID(surfaceID))
+                ]
+            )
+        ]
+        let model = makeModel(
+            herdrProvider: provider, herdrAvailability: { true },
+            herdrWorkspaceIsAttachedHere: { _, _ in false },
+            resolveTUISurface: { hint in
+                hint == .surfaceID(surfaceID) ? surfaceID : nil
+            }
+        )
+
+        await model.refresh()
+
+        let workspaces = model.herdrRows[0].workspaces
+        XCTAssertEqual(workspaces.count, 2)
+        for workspace in workspaces {
+            XCTAssertEqual(
+                workspace.attachment, .tuiPane(surfaceID: surfaceID),
+                "every workspace row of a session with a resolving herdr TUI client must be marked " +
+                ".tuiPane(surfaceID:), regardless of which workspace the TUI client itself is attached to"
+            )
+            XCTAssertTrue(workspace.isAttachedHere)
+            XCTAssertEqual(workspace.attachButtonLabel, "Show")
+        }
+    }
+
+    func test_refresh_tuiClientDoesNotResolve_fallsBackToNativeTabClosure() async {
+        let provider = FakeHerdrSessionProvider()
+        provider.sessionsToReturn = [
+            HerdrSessionInfo(
+                id: "test-herdr-socket-1", name: "work", workspaceCount: 2, paneCount: 2, agentCount: 0,
+                workspaces: [
+                    HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1),
+                    HerdrWorkspaceInfo(workspaceID: "w2", activeTabID: "w2:t1", label: "personal", paneCount: 1),
+                ],
+                tuiClients: [
+                    HerdrTUIClient(
+                        socketPath: "test-herdr-socket-1",
+                        surfaceHint: .surfaceID(UUID(uuidString: "99999999-8888-7777-6666-555555555555")!)
+                    )
+                ]
+            )
+        ]
+
+        // Resolver returns nil for every hint, and the native-tab closure
+        // also answers false -- rows must fall back to `.none` / "Attach".
+        let modelFalling = makeModel(
+            herdrProvider: provider, herdrAvailability: { true },
+            herdrWorkspaceIsAttachedHere: { _, _ in false },
+            resolveTUISurface: { _ in nil }
+        )
+        await modelFalling.refresh()
+        for workspace in modelFalling.herdrRows[0].workspaces {
+            XCTAssertEqual(workspace.attachment, .none)
+            XCTAssertFalse(workspace.isAttachedHere)
+            XCTAssertEqual(workspace.attachButtonLabel, "Attach")
+        }
+
+        // Same non-resolving TUI client, but the native-tab closure now
+        // answers true -- rows must fall back to `.nativeTab` / "Show".
+        let modelNativeTab = makeModel(
+            herdrProvider: provider, herdrAvailability: { true },
+            herdrWorkspaceIsAttachedHere: { _, _ in true },
+            resolveTUISurface: { _ in nil }
+        )
+        await modelNativeTab.refresh()
+        for workspace in modelNativeTab.herdrRows[0].workspaces {
+            XCTAssertEqual(workspace.attachment, .nativeTab)
+            XCTAssertTrue(workspace.isAttachedHere)
+            XCTAssertEqual(workspace.attachButtonLabel, "Show")
+        }
+    }
+
+    // MARK: - TDD Red (defect A): a native tab must win over the session's
+    // shared .tuiPane attachment, PER WORKSPACE -- today, once ANY herdr TUI
+    // client resolves to a surface in this process, `HerdrSessionRow.init(
+    // info:tuiSurfaceID:isAttachedHere:)` marks EVERY workspace row
+    // `.tuiPane(surfaceID:)` unconditionally, even one that also has its own
+    // open native tab (`herdrWorkspaceIsAttachedHere` answering true for it).
+    // That is wrong: Show on that workspace's row must reveal its own native
+    // tab, not the (possibly different) workspace the TUI happens to be
+    // showing. Required precedence: `.nativeTab` wins per workspace; `.tuiPane`
+    // applies only to a workspace with no native tab of its own. This is a
+    // runtime assertion failure today, not a compile failure -- the shape
+    // already exists, just with the wrong precedence.
+
+    func test_refresh_nativeTabWinsOverTUIPane_perWorkspace() async {
+        let surfaceID = UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!
+        let provider = FakeHerdrSessionProvider()
+        provider.sessionsToReturn = [
+            HerdrSessionInfo(
+                id: "test-herdr-socket-1", name: "work", workspaceCount: 2, paneCount: 2, agentCount: 0,
+                workspaces: [
+                    HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1),
+                    HerdrWorkspaceInfo(workspaceID: "w2", activeTabID: "w2:t1", label: "personal", paneCount: 1),
+                ],
+                tuiClients: [
+                    HerdrTUIClient(socketPath: "test-herdr-socket-1", surfaceHint: .surfaceID(surfaceID))
+                ]
+            )
+        ]
+        let model = makeModel(
+            herdrProvider: provider, herdrAvailability: { true },
+            // Only w1 has an open native tab; w2 has none.
+            herdrWorkspaceIsAttachedHere: { workspaceID, _ in workspaceID == "w1" },
+            resolveTUISurface: { hint in hint == .surfaceID(surfaceID) ? surfaceID : nil }
+        )
+
+        await model.refresh()
+
+        let workspaces = model.herdrRows[0].workspaces
+        XCTAssertEqual(workspaces.count, 2)
+        guard
+            let w1 = workspaces.first(where: { $0.info.workspaceID == "w1" }),
+            let w2 = workspaces.first(where: { $0.info.workspaceID == "w2" })
+        else {
+            XCTFail("expected both w1 and w2 rows")
+            return
+        }
+        XCTAssertEqual(
+            w1.attachment, .nativeTab,
+            "w1 has its own open native tab -- that must win over the session's shared TUI-pane " +
+            "attachment, so Show on w1 reveals w1's own tab, not the TUI pane"
+        )
+        XCTAssertEqual(
+            w2.attachment, .tuiPane(surfaceID: surfaceID),
+            "w2 has no native tab of its own -- it falls back to the session's TUI-pane attachment"
+        )
+        XCTAssertEqual(w1.attachButtonLabel, "Show")
+        XCTAssertEqual(w2.attachButtonLabel, "Show")
+    }
+
+    // MARK: - TDD Red (defect B): attaching a .tuiPane workspace row must send
+    // herdr workspace.focus before asking the window controller to focus the
+    // pane -- today `attachHerdrWorkspace(_:)` is synchronous and only ever
+    // invokes `onHerdrWorkspaceAttachRequested`; it never sends anything to
+    // the herdr provider first, and is not `async` at all. Fails to COMPILE
+    // today: no `HerdrSessionProviderProtocol.focusWorkspace(workspaceID:
+    // socketPath:)` requirement exists yet (only the fake's own extra method
+    // above), and `SessionBrowserModel.attachHerdrWorkspace(_:)` is not
+    // `async`, so `await model.attachHerdrWorkspace(row)` fails to type-check
+    // against a synchronous, non-throwing method.
+
+    func test_attachHerdrWorkspace_tuiPaneRow_sendsWorkspaceFocusThenRequestsAttach() async {
+        let surfaceID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let provider = FakeHerdrSessionProvider()
+        let model = makeModel(herdrProvider: provider, herdrAvailability: { false })
+        let row = HerdrWorkspaceRow(
+            socketPath: "test-herdr-socket-1",
+            info: HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1),
+            attachment: .tuiPane(surfaceID: surfaceID)
+        )
+
+        // Captured AT closure-invocation time (not after attachHerdrWorkspace
+        // returns), mirroring test_killHerdrWorkspace_sendsCloseForExactlyThatWorkspace_thenRefreshes's
+        // own ordering-proof shape: pins that workspace.focus was already
+        // sent BEFORE onHerdrWorkspaceAttachRequested fires, not merely that
+        // both eventually happened.
+        var requestedRow: HerdrWorkspaceRow?
+        var focusCallCountWhenClosureInvoked: [Int] = []
+        model.onHerdrWorkspaceAttachRequested = { attachedRow in
+            requestedRow = attachedRow
+            focusCallCountWhenClosureInvoked.append(provider.focusWorkspaceCalls.count)
+        }
+
+        await model.attachHerdrWorkspace(row)
+
+        XCTAssertEqual(
+            provider.focusWorkspaceCalls.map(\.workspaceID), ["w1"],
+            "attaching a .tuiPane row must send workspace.focus for exactly that workspace"
+        )
+        XCTAssertEqual(provider.focusWorkspaceCalls.map(\.socketPath), ["test-herdr-socket-1"])
+        XCTAssertEqual(
+            focusCallCountWhenClosureInvoked, [1],
+            "onHerdrWorkspaceAttachRequested must fire AFTER workspace.focus was sent, not before"
+        )
+        XCTAssertEqual(
+            requestedRow?.id, row.id,
+            "onHerdrWorkspaceAttachRequested must still be invoked with the row, so the window " +
+            "controller can go on to focus the pane"
+        )
+    }
+
+    /// Sanity/regression companion: a `.nativeTab` (or `.none`) row must not
+    /// send `workspace.focus` at all -- that RPC only makes sense for a herdr
+    /// TUI client, which only ever backs `.tuiPane`.
+    func test_attachHerdrWorkspace_nativeTabRow_doesNotSendWorkspaceFocus() async {
+        let provider = FakeHerdrSessionProvider()
+        let model = makeModel(herdrProvider: provider, herdrAvailability: { false })
+        let row = HerdrWorkspaceRow(
+            socketPath: "test-herdr-socket-1",
+            info: HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1),
+            attachment: .nativeTab
+        )
+
+        var requestedRow: HerdrWorkspaceRow?
+        model.onHerdrWorkspaceAttachRequested = { requestedRow = $0 }
+
+        await model.attachHerdrWorkspace(row)
+
+        XCTAssertTrue(
+            provider.focusWorkspaceCalls.isEmpty,
+            "a .nativeTab row must never send workspace.focus"
+        )
+        XCTAssertEqual(requestedRow?.id, row.id)
     }
 }

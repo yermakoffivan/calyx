@@ -271,12 +271,13 @@ private struct HerdrSessionRowView: View {
 /// blank, `HerdrTabTitlePolicy`'s own rule); line 2 is `row.paneCountText`
 /// ("N pane(s)"). The dot is a fixed green for the identical reason the
 /// server row's own is (`HerdrSessionRowView`'s own doc comment). Both
-/// trailing buttons are never disabled: the leading button always opens
-/// this workspace natively through the same path
-/// (`SessionBrowserModel.attachHerdrWorkspace(_:)`,
-/// `SessionBrowserWindowController.attachHerdrWorkspace(_:)`, which
-/// focuses the tab instead of opening a second one when it is already
-/// open), with its own label following `row.attachButtonLabel` --
+/// trailing buttons are never disabled: the leading button goes through
+/// `SessionBrowserModel.attachHerdrWorkspace(_:)` and
+/// `SessionBrowserWindowController.attachHerdrWorkspace(_:)`, which open
+/// this workspace natively (focusing the tab instead of opening a second
+/// one when it is already open) or, for a `.tuiPane` row, switch the
+/// herdr TUI to it via `workspace.focus` and focus that pane, with its
+/// own label following `row.attachButtonLabel` --
 /// "Show" once the row's own stored `isAttachedHere` is true (set by
 /// `SessionBrowserModel.refresh()`; because it is part of the row's
 /// `Equatable` value, a flip changes `herdrRows` and re-renders this
@@ -308,7 +309,7 @@ private struct HerdrWorkspaceRowView: View {
 
             Spacer()
 
-            Button(row.attachButtonLabel) { model.attachHerdrWorkspace(row) }
+            Button(row.attachButtonLabel) { Task { await model.attachHerdrWorkspace(row) } }
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier(AccessibilityID.SessionBrowser.herdrWorkspaceAttachButton(row.id))
             Button("Kill") { Task { await model.killHerdrWorkspace(row) } }

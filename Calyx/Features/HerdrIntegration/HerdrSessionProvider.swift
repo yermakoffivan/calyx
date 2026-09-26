@@ -1,7 +1,8 @@
 // HerdrSessionProvider.swift
 // Calyx
 //
-// Abstraction over listing herdr sessions and closing a herdr workspace,
+// Abstraction over listing herdr sessions and focusing/closing a herdr
+// workspace,
 // so `SessionBrowserModel` can be tested with a fake instead of touching
 // real PATH/socket state -- mirrors `SessionDaemonClientProtocol`'s own
 // injectable-dependency shape. The production conformer below,
@@ -15,7 +16,13 @@
 // session-list subcommand (`herdr session list --json`, verified against
 // real herdr 0.8.0); this provider still never shells out to it.
 // `closeWorkspace(workspaceID:socketPath:)` sends `workspace.close` for
-// the session browser's Kill action on a single workspace row.
+// the session browser's Kill action on a single workspace row;
+// `focusWorkspace(workspaceID:socketPath:)` sends `workspace.focus` so a
+// herdr TUI client switches to that workspace before the session
+// browser's "Show" focuses the pane it runs in.
+// `listSessions()` also attaches the herdr TUI clients found running in
+// Calyx panes (`HerdrTUIClientScanner.swift`) to the session whose socket
+// they are attached to (`HerdrSessionInfo.tuiClients`).
 
 import Foundation
 
@@ -30,6 +37,16 @@ protocol HerdrSessionProviderProtocol: Sendable {
     /// `HerdrCLISessionProvider.closeWorkspace(workspaceID:socketPath:)`'s
     /// own doc comment for why.
     func closeWorkspace(workspaceID: String, socketPath: String) async
+
+    /// Makes one herdr workspace the one herdr's TUI clients display, via
+    /// `workspace.focus` -- sent by `SessionBrowserModel
+    /// .attachHerdrWorkspace(_:)` for a `.tuiPane` row before the pane
+    /// running that TUI client is focused, so the pane reveals the row's
+    /// own workspace rather than whichever one the TUI was already
+    /// showing. Same fire-and-forget shape as `closeWorkspace(workspaceID:
+    /// socketPath:)` above -- see `HerdrCLISessionProvider.focusWorkspace(
+    /// workspaceID:socketPath:)`'s own doc comment.
+    func focusWorkspace(workspaceID: String, socketPath: String) async
 }
 
 /// One herdr session as `SessionBrowserModel` needs it. `id` is the
@@ -65,6 +82,30 @@ struct HerdrSessionInfo: Identifiable, Equatable, Sendable {
     /// either way the session browser renders zero workspace rows under
     /// this session's own server row.
     let workspaces: [HerdrWorkspaceInfo]
+    /// herdr TUI clients (`HerdrTUIClientScanner`) attached to this
+    /// session's own socket (`id`) and running inside a Calyx pane, in
+    /// scan order. `[]` when none were found -- herdr's own API reports
+    /// nothing about clients, so this is the only source of "this
+    /// session is already displayed in a pane".
+    let tuiClients: [HerdrTUIClient]
+
+    init(
+        id: String,
+        name: String?,
+        workspaceCount: Int?,
+        paneCount: Int?,
+        agentCount: Int?,
+        workspaces: [HerdrWorkspaceInfo],
+        tuiClients: [HerdrTUIClient] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.workspaceCount = workspaceCount
+        self.paneCount = paneCount
+        self.agentCount = agentCount
+        self.workspaces = workspaces
+        self.tuiClients = tuiClients
+    }
 }
 
 /// One socket's workspace/pane/agent counts and per-workspace rows,
@@ -82,7 +123,9 @@ private struct HerdrSessionCounts: Equatable {
 /// `listSessions()` runs in two phases.
 ///
 /// Phase 1: `discovery.discover()`'s candidates, kept only when
-/// `discovery.isAlive(socketPath:)`. Neither throws, so "a degraded row
+/// `discovery.isAlive(socketPath:)`, plus one `tuiClientScanner.scan()`
+/// (a blocking process-table walk, run on the same background queue for
+/// the same reason). Neither throws, so "a degraded row
 /// beats an error" (`HerdrSessionInfo`'s own doc comment) holds
 /// structurally: a config directory that doesn't exist yields `[]` from
 /// `discover()`, and a stale/crashed socket file yields `false` from
@@ -119,28 +162,39 @@ private struct HerdrSessionCounts: Equatable {
 /// becomes a row -- see `HerdrSessionInfo`'s own doc comment -- only its
 /// counts stay `nil`.
 ///
-/// `discovery`/`transportFactory` are injectable (production defaults:
-/// `HerdrSessionDiscovery()` / `LiveHerdrTransportFactory()`), so tests
+/// Each resulting `HerdrSessionInfo` carries the scanned TUI clients
+/// whose `socketPath` equals that candidate's own socket path
+/// (`HerdrSessionInfo.tuiClients`).
+///
+/// `discovery`/`transportFactory`/`tuiClientScanner` are injectable
+/// (production defaults: `HerdrSessionDiscovery()` /
+/// `LiveHerdrTransportFactory()` / `HerdrTUIClientScanner()`), so tests
 /// can drive both phases with fakes -- see `HerdrSessionProviderTests.swift`.
 final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
     private let discovery: any HerdrSessionDiscoveryProtocol
     private let transportFactory: any HerdrTransportFactory
+    private let tuiClientScanner: any HerdrTUIClientScanning
 
     init(
         discovery: any HerdrSessionDiscoveryProtocol = HerdrSessionDiscovery(),
-        transportFactory: any HerdrTransportFactory = LiveHerdrTransportFactory()
+        transportFactory: any HerdrTransportFactory = LiveHerdrTransportFactory(),
+        tuiClientScanner: any HerdrTUIClientScanning = HerdrTUIClientScanner()
     ) {
         self.discovery = discovery
         self.transportFactory = transportFactory
+        self.tuiClientScanner = tuiClientScanner
     }
 
     func listSessions() async -> [HerdrSessionInfo] {
         guard !Task.isCancelled else { return [] }
         let discovery = self.discovery
-        let candidates: [HerdrSessionCandidate] = await withCheckedContinuation { (continuation: CheckedContinuation<[HerdrSessionCandidate], Never>) in
+        let tuiClientScanner = self.tuiClientScanner
+        let (candidates, tuiClients) = await withCheckedContinuation {
+            (continuation: CheckedContinuation<([HerdrSessionCandidate], [HerdrTUIClient]), Never>) in
             DispatchQueue.global().async {
                 let alive = discovery.discover().filter { discovery.isAlive(socketPath: $0.socketPath) }
-                continuation.resume(returning: alive)
+                let clients = tuiClientScanner.scan()
+                continuation.resume(returning: (alive, clients))
             }
         }
         guard !Task.isCancelled else { return [] }
@@ -156,7 +210,8 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
                     workspaceCount: counts?.workspaceCount,
                     paneCount: counts?.paneCount,
                     agentCount: counts?.agentCount,
-                    workspaces: counts?.workspaces ?? []
+                    workspaces: counts?.workspaces ?? [],
+                    tuiClients: tuiClients.filter { $0.socketPath == candidate.socketPath }
                 )
             )
         }
@@ -198,6 +253,39 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
         } catch {
             // See this method's own doc comment: best-effort, the caller
             // refreshes regardless.
+        }
+    }
+
+    /// Sends `workspace.focus` for `workspaceID` on `socketPath` -- see
+    /// `HerdrSessionProviderProtocol.focusWorkspace(workspaceID:
+    /// socketPath:)`'s own doc comment. Params are `WorkspaceTarget`'s
+    /// schema shape (`herdr api schema --json`), the same
+    /// `HerdrWorkspaceTargetParams` `closeWorkspace(workspaceID:
+    /// socketPath:)` above sends, bounded by the same
+    /// `oneShotRequestTimeout`/`watchdog` pattern for the same reason: a
+    /// server that accepts the connection and never answers must not hang
+    /// the session browser's "Show" forever. Any failure -- an RPC error,
+    /// a transport EOF/failure, or `oneShotRequestTimeout` expiry -- is
+    /// swallowed, exactly like `closeWorkspace`: there is no result to
+    /// report, and the caller focuses the TUI pane regardless.
+    func focusWorkspace(workspaceID: String, socketPath: String) async {
+        let transport = await transportFactory.makeTransport()
+        let watchdog = Task {
+            try? await Task.sleep(for: Self.oneShotRequestTimeout)
+            guard !Task.isCancelled else { return }
+            await transport.close()
+        }
+        defer { watchdog.cancel() }
+
+        do {
+            let request = HerdrOneShotRequest(transport: transport)
+            let params = HerdrWorkspaceTargetParams(workspaceID: workspaceID)
+            let _: HerdrWorkspaceFocusRPCResult = try await request.send(
+                method: "workspace.focus", params: params, socketPath: socketPath
+            )
+        } catch {
+            // See this method's own doc comment: best-effort, the caller
+            // focuses the pane regardless.
         }
     }
 
@@ -271,3 +359,10 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
 /// `closeWorkspace(workspaceID:socketPath:)` never reads this value --
 /// only that the request did not throw.
 private struct HerdrWorkspaceCloseRPCResult: Decodable {}
+
+/// `workspace.focus`'s own result -- decoded only far enough to confirm
+/// "result" is a JSON object, for the identical reason as
+/// `HerdrWorkspaceCloseRPCResult` above.
+/// `focusWorkspace(workspaceID:socketPath:)` never reads this value --
+/// only that the request did not throw.
+private struct HerdrWorkspaceFocusRPCResult: Decodable {}

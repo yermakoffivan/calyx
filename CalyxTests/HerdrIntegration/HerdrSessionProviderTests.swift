@@ -49,6 +49,15 @@ private struct FakeHerdrSessionDiscovery: HerdrSessionDiscoveryProtocol {
     func isAlive(socketPath: String) -> Bool { aliveSocketPaths.contains(socketPath) }
 }
 
+/// Fixed `HerdrTUIClientScanning` fake -- returns a canned client list
+/// regardless of when `scan()` is called, mirroring
+/// `FakeHerdrSessionDiscovery`'s own immutable-fixture shape above (no
+/// test below needs `scan()` to change mid-run).
+private struct FakeHerdrTUIClientScanner: HerdrTUIClientScanning {
+    let clients: [HerdrTUIClient]
+    func scan() -> [HerdrTUIClient] { clients }
+}
+
 /// `HerdrTransportFactory` spy: each `makeTransport()` call hands out a
 /// fresh `InMemoryHerdrTransport`, retaining it so tests can drive it --
 /// mirrors `HerdrIntegrationCoordinatorTests.SpyHerdrTransportFactory`.
@@ -93,7 +102,11 @@ final class HerdrSessionProviderTests: XCTestCase {
             aliveSocketPaths: [socketPath]
         )
         let factory = SpyHerdrTransportFactory()
-        let provider = HerdrCLISessionProvider(discovery: discovery, transportFactory: factory)
+        let provider = HerdrCLISessionProvider(
+            discovery: discovery,
+            transportFactory: factory,
+            tuiClientScanner: FakeHerdrTUIClientScanner(clients: [])
+        )
 
         let task = Task { await provider.listSessions() }
         guard let transport = await awaitTransport(factory, at: 0) else {
@@ -140,7 +153,11 @@ final class HerdrSessionProviderTests: XCTestCase {
             aliveSocketPaths: [socketPath]
         )
         let factory = SpyHerdrTransportFactory()
-        let provider = HerdrCLISessionProvider(discovery: discovery, transportFactory: factory)
+        let provider = HerdrCLISessionProvider(
+            discovery: discovery,
+            transportFactory: factory,
+            tuiClientScanner: FakeHerdrTUIClientScanner(clients: [])
+        )
 
         let task = Task { await provider.listSessions() }
         guard let transport = await awaitTransport(factory, at: 0) else {
@@ -165,12 +182,60 @@ final class HerdrSessionProviderTests: XCTestCase {
         XCTAssertEqual(session.workspaces, [], "a failed snapshot must yield no workspace rows")
     }
 
+    // MARK: - listSessions() attaches only the scanned TUI clients matching this session's own socket path
+
+    /// TDD Red (herdr TUI-client integration): `HerdrCLISessionProvider`
+    /// has no `tuiClientScanner:` initializer parameter yet, and
+    /// `HerdrSessionInfo` has no `tuiClients` field yet -- this fails to
+    /// COMPILE (unresolved `HerdrTUIClient`/`HerdrTUIClientScanning`,
+    /// unexpected `tuiClientScanner:` argument, unknown `tuiClients`
+    /// member).
+    func test_listSessions_attachesScannedTUIClientsToTheirSession() async {
+        let discovery = FakeHerdrSessionDiscovery(
+            candidates: [HerdrSessionCandidate(name: "default", socketPath: socketPath)],
+            aliveSocketPaths: [socketPath]
+        )
+        let factory = SpyHerdrTransportFactory()
+        let matchingClient = HerdrTUIClient(
+            socketPath: socketPath,
+            surfaceHint: .surfaceID(UUID(uuidString: "11111111-2222-3333-4444-555555555555")!)
+        )
+        let otherClient = HerdrTUIClient(
+            socketPath: "/other/herdr.sock",
+            surfaceHint: .surfaceID(UUID(uuidString: "99999999-8888-7777-6666-555555555555")!)
+        )
+        let scanner = FakeHerdrTUIClientScanner(clients: [matchingClient, otherClient])
+        let provider = HerdrCLISessionProvider(discovery: discovery, transportFactory: factory, tuiClientScanner: scanner)
+
+        let task = Task { await provider.listSessions() }
+        guard let transport = await awaitTransport(factory, at: 0) else {
+            XCTFail("expected listSessions() to request a transport for the one alive candidate")
+            return
+        }
+        _ = await awaitSentMessages(transport, atLeast: 1)
+        await transport.simulateLine(snapshotResponseLineWithTwoWorkspaces(id: "1"))
+
+        let sessions = await task.value
+
+        XCTAssertEqual(sessions.count, 1)
+        guard let session = sessions.first else { return }
+        XCTAssertEqual(
+            session.tuiClients, [matchingClient],
+            "listSessions() must attach exactly the scanned TUI clients whose own socketPath equals this " +
+            "session's own socket path, never a client scanned for a different socket"
+        )
+    }
+
     // MARK: - closeWorkspace(workspaceID:socketPath:) sends workspace.close with exactly the given id
 
     func test_closeWorkspace_sendsWorkspaceCloseWithExactlyTheGivenWorkspaceID() async {
         let discovery = FakeHerdrSessionDiscovery(candidates: [], aliveSocketPaths: [])
         let factory = SpyHerdrTransportFactory()
-        let provider = HerdrCLISessionProvider(discovery: discovery, transportFactory: factory)
+        let provider = HerdrCLISessionProvider(
+            discovery: discovery,
+            transportFactory: factory,
+            tuiClientScanner: FakeHerdrTUIClientScanner(clients: [])
+        )
 
         let task = Task { await provider.closeWorkspace(workspaceID: "w1", socketPath: socketPath) }
         guard let transport = await awaitTransport(factory, at: 0) else {
@@ -195,6 +260,50 @@ final class HerdrSessionProviderTests: XCTestCase {
 
         let callCount = await factory.callCount
         XCTAssertEqual(callCount, 1, "closeWorkspace must request exactly one transport")
+    }
+
+    // MARK: - focusWorkspace(workspaceID:socketPath:) sends workspace.focus
+
+    /// TDD Red: mirrors `test_closeWorkspace_sendsWorkspaceCloseWithExactlyTheGivenWorkspaceID`
+    /// above exactly, for the new `focusWorkspace(workspaceID:socketPath:)`
+    /// requirement -- sent by `SessionBrowserModel.attachHerdrWorkspace(_:)`
+    /// for a `.tuiPane` row before it asks the window controller to focus
+    /// the pane, so the herdr TUI itself switches to the right workspace
+    /// instead of merely revealing whichever one it was already on. Fails
+    /// to COMPILE today: `HerdrCLISessionProvider` has no `focusWorkspace`
+    /// member at all.
+    func test_focusWorkspace_sendsWorkspaceFocusWithExactlyTheGivenWorkspaceID() async {
+        let discovery = FakeHerdrSessionDiscovery(candidates: [], aliveSocketPaths: [])
+        let factory = SpyHerdrTransportFactory()
+        let provider = HerdrCLISessionProvider(
+            discovery: discovery,
+            transportFactory: factory,
+            tuiClientScanner: FakeHerdrTUIClientScanner(clients: [])
+        )
+
+        let task = Task { await provider.focusWorkspace(workspaceID: "w1", socketPath: socketPath) }
+        guard let transport = await awaitTransport(factory, at: 0) else {
+            XCTFail("expected focusWorkspace to request a transport")
+            return
+        }
+        let sent = await awaitSentMessages(transport, atLeast: 1)
+        guard sent.count == 1, let requestID = requestID(inLine: sent[0]) else {
+            XCTFail("expected exactly one request line; got \(sent)")
+            return
+        }
+        XCTAssertEqual(requestMethod(inLine: sent[0]), "workspace.focus")
+        let params = jsonObject(inLine: sent[0])?["params"] as? [String: Any] ?? [:]
+        XCTAssertEqual(
+            params as NSDictionary, ["workspace_id": "w1"] as NSDictionary,
+            "workspace.focus's params must carry EXACTLY {\"workspace_id\":...} -- the same " +
+            "HerdrWorkspaceTargetParams shape workspace.close/workspace.get already use"
+        )
+
+        await transport.simulateLine(okResponseLine(id: requestID))
+        await task.value
+
+        let callCount = await factory.callCount
+        XCTAssertEqual(callCount, 1, "focusWorkspace must request exactly one transport")
     }
 
     // MARK: - Fixtures
