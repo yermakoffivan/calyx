@@ -105,3 +105,50 @@ final class SurfaceLocatorTests: XCTestCase {
         XCTAssertEqual(registry.count, 1, "register(_:) must prune stale boxes too, not just value(for:)")
     }
 }
+
+// MARK: - SurfaceLocator.view(for:)
+
+/// `SurfaceLocator.view(for:)` returns the SurfaceView registered via
+/// `registerView(id:view:)`, held weakly; nil for unknown, unregistered,
+/// or released views.
+@MainActor
+final class SurfaceLocatorViewLookupTests: XCTestCase {
+
+    func test_viewForID_returnsRegisteredView() {
+        let locator = SurfaceLocator()
+        let view = SurfaceView(frame: .zero)
+        let id = UUID()
+        locator.registerView(id: id, view: view)
+        XCTAssertTrue(locator.view(for: id) === view)
+    }
+
+    func test_viewForID_unknownIDReturnsNil() {
+        let locator = SurfaceLocator()
+        let view = SurfaceView(frame: .zero)
+        locator.registerView(id: UUID(), view: view)
+        XCTAssertNil(locator.view(for: UUID()))
+    }
+
+    func test_viewForID_afterUnregisterReturnsNil() {
+        let locator = SurfaceLocator()
+        let view = SurfaceView(frame: .zero)
+        let id = UUID()
+        locator.registerView(id: id, view: view)
+        locator.unregisterView(id: id)
+        XCTAssertNil(locator.view(for: id))
+    }
+
+    func test_viewForID_releasedViewReturnsNil() {
+        let locator = SurfaceLocator()
+        let id = UUID()
+        weak var weakView: SurfaceView?
+        autoreleasepool {
+            var view: SurfaceView? = SurfaceView(frame: .zero)
+            weakView = view
+            locator.registerView(id: id, view: view!)
+            view = nil
+        }
+        XCTAssertNil(weakView, "precondition: view must be deallocated")
+        XCTAssertNil(locator.view(for: id))
+    }
+}

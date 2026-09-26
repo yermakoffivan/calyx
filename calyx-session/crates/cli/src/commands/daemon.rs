@@ -53,6 +53,11 @@ use crate::commands::{resolve_runtime_dir, resolve_state_dir, CommandError};
 ///   must not spoof pane identity through `spec.env`), and this
 ///   closes the same leak one level up, for the daemon's own
 ///   inherited copy.
+/// - `CALYX_SECURE_INPUT_SOCKET`: names one Calyx app instance's
+///   secure-input datagram socket. Like `CALYX_SURFACE_ID` it is an
+///   instance/pane identifier that no long-lived daemon can hold
+///   correctly; `attach` reads its own fresh copy, and `spawn_session`
+///   also removes it per session spawn.
 ///
 /// `TERMINFO` and `GHOSTTY_BIN_DIR` are deliberately NOT in this
 /// list. `ghostty/src/termio/Exec.zig`'s `Subprocess.init` sets both
@@ -118,6 +123,7 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "GHOSTTY_SHELL_FEATURES",
     "CALYX_ZSH_ZDOTDIR",
     "CALYX_SURFACE_ID",
+    "CALYX_SECURE_INPUT_SOCKET",
 ];
 
 /// Runs (or backgrounds) the session daemon. `--foreground` runs
@@ -379,9 +385,10 @@ mod tests {
     /// Pins the invariant `SCRUBBED_ENV_VARS`'s own doc comment
     /// depends on: that const must equal exactly
     /// `resolve_shell_integration_env`'s own key set (minus the
-    /// documented `XDG_DATA_DIRS` carve-out) plus `CALYX_SURFACE_ID`,
-    /// the one deliberate addition that const's doc comment justifies
-    /// on its own terms (a pane identifier, not a re-supplied value).
+    /// documented `XDG_DATA_DIRS` carve-out) plus `CALYX_SURFACE_ID`
+    /// and `CALYX_SECURE_INPUT_SOCKET`, the deliberate additions that
+    /// const's doc comment justifies on their own terms (pane/instance
+    /// identifiers, not re-supplied values).
     /// Probes across every shell `resolve_shell_integration_env`'s own
     /// doc comment names, zsh (wired) and bash/fish (documented future
     /// extension points), crossed with resources-dir present/absent,
@@ -389,7 +396,7 @@ mod tests {
     /// caught here even before it is wired for zsh specifically.
     /// Asserting equality rather than a subset also catches the
     /// opposite mistake: adding a variable to `SCRUBBED_ENV_VARS` that
-    /// neither this function pushes nor `CALYX_SURFACE_ID` justifies,
+    /// neither this function pushes nor the identifier carve-outs justify,
     /// where nothing re-supplies it, so scrubbing it is a pure loss,
     /// not a fix (`SCRUBBED_ENV_VARS`'s own doc comment covers exactly
     /// this trade-off for `TERMINFO`/`GHOSTTY_BIN_DIR`). Without this,
@@ -419,23 +426,24 @@ mod tests {
             .map(String::as_str)
             .filter(|key| *key != "XDG_DATA_DIRS")
             .collect();
-        // The one addition SCRUBBED_ENV_VARS makes beyond
+        // The additions SCRUBBED_ENV_VARS makes beyond
         // resolve_shell_integration_env's own key set: justified on
-        // its own terms (a pane identifier) rather than by re-supply,
-        // per that const's own doc comment.
+        // their own terms (pane/instance identifiers) rather than by
+        // re-supply, per that const's own doc comment.
         expected.insert("CALYX_SURFACE_ID");
+        expected.insert("CALYX_SECURE_INPUT_SOCKET");
         let scrubbed: BTreeSet<&str> = SCRUBBED_ENV_VARS.iter().copied().collect();
 
         assert_eq!(
             scrubbed,
             expected,
             "SCRUBBED_ENV_VARS must equal exactly resolve_shell_integration_env's own key \
-             set (other than the documented XDG_DATA_DIRS carve-out) plus CALYX_SURFACE_ID: \
-             missing {:?} (resolve_shell_integration_env can push these, or CALYX_SURFACE_ID \
-             names a pane, but SCRUBBED_ENV_VARS omits them, so a stale copy sitting in the \
+             set (other than the documented XDG_DATA_DIRS carve-out) plus CALYX_SURFACE_ID and \
+             CALYX_SECURE_INPUT_SOCKET: missing {:?} (resolve_shell_integration_env can push \
+             these, or they name a pane/instance, but SCRUBBED_ENV_VARS omits them, so a stale copy sitting in the \
              daemon's own inherited environment could leak into a session that never \
              re-supplies it), unjustified extra {:?} (SCRUBBED_ENV_VARS scrubs these even \
-             though nothing re-supplies them and they are not CALYX_SURFACE_ID, so removing \
+             though nothing re-supplies them and they are not a pane/instance identifier, so removing \
              them is a pure loss, not a fix, per SCRUBBED_ENV_VARS's own doc comment)",
             expected.difference(&scrubbed).collect::<Vec<_>>(),
             scrubbed.difference(&expected).collect::<Vec<_>>()

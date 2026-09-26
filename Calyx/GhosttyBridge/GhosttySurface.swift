@@ -101,7 +101,10 @@ final class GhosttySurfaceController: Identifiable {
         // the nested `withCString`/`withUnsafeMutableBufferPointer`
         // closures provide exactly that. Any env_vars already on
         // `baseConfig` are preserved, with CALYX_SURFACE_ID and
-        // CALYX_ENDPOINT_FILE prepended.
+        // CALYX_ENDPOINT_FILE prepended, followed by
+        // CALYX_SECURE_INPUT_SOCKET when SecureInputChannel is listening
+        // (lets `calyx-session attach` report password prompts that the
+        // raw outer pty hides from ghostty's termios detection).
         var existingEnvKeys: [String] = []
         var existingEnvValues: [String] = []
         if baseConfig.env_var_count > 0, let vars = baseConfig.env_vars {
@@ -113,8 +116,14 @@ final class GhosttySurfaceController: Identifiable {
                 existingEnvValues.append(value)
             }
         }
-        let envKeys = ["CALYX_SURFACE_ID", "CALYX_ENDPOINT_FILE"] + existingEnvKeys
-        let envValues = [id.uuidString, AgentEndpointFile.path] + existingEnvValues
+        var calyxEnvKeys = ["CALYX_SURFACE_ID", "CALYX_ENDPOINT_FILE"]
+        var calyxEnvValues = [id.uuidString, AgentEndpointFile.path]
+        if let secureInputSocket = SecureInputChannel.shared.ensureStarted() {
+            calyxEnvKeys.append("CALYX_SECURE_INPUT_SOCKET")
+            calyxEnvValues.append(secureInputSocket)
+        }
+        let envKeys = calyxEnvKeys + existingEnvKeys
+        let envValues = calyxEnvValues + existingEnvValues
 
         let newSurface: ghostty_surface_t? = envKeys.withCStrings { keyPointers in
             envValues.withCStrings { valuePointers in

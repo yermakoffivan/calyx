@@ -1070,6 +1070,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // launch unchanged.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
 
+        // Open the secure-input datagram socket before any surface is
+        // created (restoreSession()/createNewWindow() below): each
+        // surface calls SecureInputChannel.shared.ensureStarted() while
+        // building its env (so a launch-time failure is retried per
+        // surface). Deliberately not gated on --uitesting or on
+        // the AI Agent IPC switch -- see SecureInputChannel.
+        SecureInputChannel.shared.start()
+
         // Wire the real Ghostty-FFI-backed output reader now that we're
         // definitely not in the unit-test host (a GhosttyCommandOutputReader
         // read touches live ghostty FFI, unsafe there).
@@ -1284,6 +1292,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // developer's real ~/.calyx even though nothing in this launch
         // was ever gated by a window/session-emptiness check alone.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
+
+        SecureInputChannel.shared.stop()
 
         // Belt-and-suspenders alongside
         // applicationShouldTerminate's own set, in case this notification

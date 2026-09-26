@@ -69,6 +69,8 @@ struct SecureInputOverlay: View {
 
             Spacer()
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(AccessibilityID.SecureInput.overlay)
         .onAppear {
             withAnimation(Animation.linear(duration: 2).repeatForever(autoreverses: false)) {
                 gradientAngle = .degrees(360)

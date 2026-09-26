@@ -9,6 +9,7 @@ pub mod ls;
 pub mod meta;
 pub mod new;
 pub mod remote_install;
+pub(crate) mod secure_input_notify;
 pub(crate) mod shell_integration;
 pub(crate) mod terminal_env;
 pub mod upgrade;

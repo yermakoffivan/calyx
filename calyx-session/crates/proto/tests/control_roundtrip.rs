@@ -217,3 +217,19 @@ fn roundtrip_err() {
         msg: "no such session".to_string(),
     });
 }
+
+#[test]
+fn roundtrip_event_password_input_active() {
+    assert_roundtrips(ControlMsg::Event(SessionEvent::PasswordInput {
+        id: "01ABC".into(),
+        active: true,
+    }));
+}
+
+#[test]
+fn roundtrip_event_password_input_inactive() {
+    assert_roundtrips(ControlMsg::Event(SessionEvent::PasswordInput {
+        id: "01ABC".into(),
+        active: false,
+    }));
+}

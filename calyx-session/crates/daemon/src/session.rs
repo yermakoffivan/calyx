@@ -47,6 +47,16 @@ const SCROLLBACK_BYTES: u32 = 8 * 1024 * 1024;
 /// and keep the daemon from ever reaching its idle exit).
 const EXIT_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the PTY termios is sampled for password-input mode while
+/// at least one client is attached (see `SessionEvent::PasswordInput`).
+const PASSWORD_INPUT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A client currently mirrored by a session thread.
+struct AttachedClient {
+    conn_id: u64,
+    queue: Arc<OutQueue>,
+}
+
 pub(crate) enum SessionRequest {
     /// Register a new attached client. Handled on the session thread:
     /// render replay -> enqueue `Replay` -> start mirroring, all
@@ -456,6 +466,10 @@ pub(crate) fn spawn_session(
     // value inherited from whichever client first started it, and a
     // session can be reattached to a different pane, so drop it here.
     cmd.env_remove("CALYX_SURFACE_ID");
+    // CALYX_SECURE_INPUT_SOCKET is an instance-specific Calyx socket
+    // path that a non-launchd daemon inherits from its first client;
+    // it is meaningless inside the session.
+    cmd.env_remove("CALYX_SECURE_INPUT_SOCKET");
     let stdin_fd = pty.slave.try_clone().map_err(|e| e.to_string())?;
     let stdout_fd = pty.slave.try_clone().map_err(|e| e.to_string())?;
     cmd.stdin(Stdio::from(stdin_fd));
@@ -705,10 +719,6 @@ fn session_thread(ctx: SessionThread) {
         }
     }
 
-    struct AttachedClient {
-        conn_id: u64,
-        queue: Arc<OutQueue>,
-    }
     let mut clients: Vec<AttachedClient> = Vec::new();
     // One dup for the responder closure's whole lifetime. If it fails,
     // detached queries go unanswered (logged), which degrades better
@@ -731,6 +741,11 @@ fn session_thread(ctx: SessionThread) {
         &mut responder_active,
     );
 
+    // Last password-input state pushed to the attached clients. Reset
+    // whenever nobody is attached, so the next attach re-derives it.
+    let mut last_password_input = false;
+    let mut last_password_check = std::time::Instant::now();
+
     let mut buf = [0u8; 8192];
     loop {
         // Requests first: an Attach queued before the next chunk of
@@ -743,6 +758,14 @@ fn session_thread(ctx: SessionThread) {
             match request {
                 SessionRequest::Attach { conn_id, queue } => {
                     push_replay(&mut terminal, &queue, &id);
+                    // Before `clients.push`, so the FIFO holds Replay
+                    // first. A refused push means the queue is already
+                    // overflowing; the Output fan-out drops it later.
+                    if last_password_input {
+                        if let Some(event) = password_input_event(&id, true) {
+                            queue.push(FrameType::Control, event);
+                        }
+                    }
                     clients.push(AttachedClient { conn_id, queue });
                 }
                 SessionRequest::Remove { conn_id } => {
@@ -818,6 +841,20 @@ fn session_thread(ctx: SessionThread) {
             &mut responder_active,
         );
 
+        if clients.is_empty() {
+            // Nobody is listening; the state is re-derived on the next
+            // attach (the change check then fires right after its Replay).
+            last_password_input = false;
+        } else if last_password_check.elapsed() >= PASSWORD_INPUT_POLL {
+            last_password_check = std::time::Instant::now();
+            if let Some(active) = password_input_active(master.as_fd()) {
+                if active != last_password_input {
+                    last_password_input = active;
+                    push_password_input(&mut clients, &id, active);
+                }
+            }
+        }
+
         let mut master_events = PollFlags::POLLIN;
         if input.has_pending() {
             master_events |= PollFlags::POLLOUT;
@@ -826,7 +863,14 @@ fn session_thread(ctx: SessionThread) {
             PollFd::new(master.as_fd(), master_events),
             PollFd::new(wake_rx.as_fd(), PollFlags::POLLIN),
         ];
-        match poll(&mut poll_fds, PollTimeout::NONE) {
+        // With clients attached, wake at least every PASSWORD_INPUT_POLL
+        // to sample the termios; a timeout (no revents) just loops.
+        let timeout = if clients.is_empty() {
+            PollTimeout::NONE
+        } else {
+            PollTimeout::from(PASSWORD_INPUT_POLL.as_millis() as u16)
+        };
+        match poll(&mut poll_fds, timeout) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
@@ -1044,6 +1088,10 @@ fn session_thread(ctx: SessionThread) {
         }
     }
 
+    if last_password_input {
+        push_password_input(&mut clients, &id, false);
+    }
+
     if let Ok(event) = encode_control(&ControlMsg::Event(SessionEvent::Exited {
         id: id.clone(),
         code: exit_code,
@@ -1089,6 +1137,47 @@ fn push_replay(terminal: &mut vt::Terminal, queue: &Arc<OutQueue>, id: &str) {
             queue.push_replay(Vec::new());
         }
     }
+}
+
+/// Whether the PTY is in canonical-no-echo mode (ICANON set, ECHO
+/// clear), ghostty's password-prompt heuristic. `None` when `tcgetattr`
+/// fails (e.g. a hung-up master after the child exited): no
+/// information, not a change.
+fn password_input_active(master: BorrowedFd<'_>) -> Option<bool> {
+    use nix::sys::termios::LocalFlags;
+    let termios = nix::sys::termios::tcgetattr(master).ok()?;
+    let flags = termios.local_flags;
+    Some(flags.contains(LocalFlags::ICANON) && !flags.contains(LocalFlags::ECHO))
+}
+
+fn password_input_event(id: &str, active: bool) -> Option<Vec<u8>> {
+    match encode_control(&ControlMsg::Event(SessionEvent::PasswordInput {
+        id: id.to_string(),
+        active,
+    })) {
+        Ok(event) => Some(event),
+        Err(e) => {
+            eprintln!("calyx-sessiond: encoding PasswordInput failed for {id}: {e}");
+            None
+        }
+    }
+}
+
+/// Pushes one `PasswordInput` control frame to every attached client.
+fn push_password_input(clients: &mut Vec<AttachedClient>, id: &str, active: bool) {
+    let Some(event) = password_input_event(id, active) else {
+        return;
+    };
+    let mut overflowed: Vec<u64> = Vec::new();
+    for client in clients.iter() {
+        if !client.queue.push(FrameType::Control, event.clone()) {
+            overflowed.push(client.conn_id);
+        }
+    }
+    // The overflowed client's socket is shut down by its writer
+    // thread; its conn reader then runs the usual detach cleanup. Here
+    // it only stops being mirrored to.
+    clients.retain(|client| !overflowed.contains(&client.conn_id));
 }
 
 /// Keeps the detached-query responder registered exactly while no

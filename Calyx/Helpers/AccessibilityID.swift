@@ -27,6 +27,9 @@ enum AccessibilityID {
         static let agentMonitoringDisabledBanner = "calyx.sidebar.agentMonitoringDisabledBanner"
         static let agentServerIssuesBanner = "calyx.sidebar.agentServerIssuesBanner"
     }
+    enum SecureInput {
+        static let overlay = "calyx.secureInput.overlay"
+    }
     enum GroupContextMenu {
         static let close = "calyx.groupMenu.close"
         static let closeOthers = "calyx.groupMenu.closeOthers"

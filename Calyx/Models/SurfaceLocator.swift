@@ -136,6 +136,13 @@ final class SurfaceLocator {
         viewsByID.key(forValue: view)
     }
 
+    /// Reverse of `id(forView:)`: the live `SurfaceView` registered under
+    /// `id`, or nil when the id is unknown, was unregistered, or its view
+    /// has already been released (weak reference).
+    func view(for id: UUID) -> SurfaceView? {
+        viewsByID.value(for: id)
+    }
+
     #if DEBUG
     /// Test-only: clears both the controller and view weak indices.
     /// `SurfaceLocator.shared` is a global singleton that persists

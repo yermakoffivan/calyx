@@ -181,6 +181,14 @@ pub enum SessionEvent {
     /// is then the shell's real exit status. Explicit-argv sessions and
     /// other platforms carry the child's real exit status.
     Exited { id: String, code: i32 },
+    /// The session's PTY termios entered (`active: true`) or left (`active: false`)
+    /// canonical-no-echo mode (ICANON set, ECHO clear), the same heuristic ghostty
+    /// uses to detect a password prompt. Pushed to every attached client on change,
+    /// sampled at 200 ms while at least one client is attached; a client that
+    /// attaches while the state is already active receives one `active: true` right
+    /// after its Replay; `active: false` is pushed before `Exited` if the child
+    /// exits while active.
+    PasswordInput { id: String, active: bool },
 }
 
 /// Describes a session to be created, via `ControlMsg::New` or

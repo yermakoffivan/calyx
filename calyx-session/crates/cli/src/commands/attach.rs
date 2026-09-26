@@ -20,6 +20,7 @@ use proto::{
 
 use crate::cli::AttachArgs;
 use crate::commands::client::{server_err, unexpected, DaemonClient};
+use crate::commands::secure_input_notify::SecureInputNotifier;
 use crate::commands::shell_integration::resolve_shell_integration_env;
 use crate::commands::terminal_env::resolve_terminal_env;
 use crate::commands::{resolve_runtime_dir, resolve_state_dir, socket_path, CommandError};
@@ -76,13 +77,17 @@ pub fn run(
         other => return Err(unexpected(&other)),
     }
 
-    bridge(client.stream)
+    let notifier = SecureInputNotifier::from_env(&args.id, |k| std::env::var(k).ok());
+    bridge(client.stream, notifier)
 }
 
 /// Runs the attached bridge until the session exits (0) or the
 /// connection is lost (2). The tty raw-mode guard restores the
 /// original termios on every path out, including panics (Drop).
-fn bridge(stream: UnixStream) -> Result<u8, CommandError> {
+fn bridge(
+    stream: UnixStream,
+    mut notifier: Option<SecureInputNotifier>,
+) -> Result<u8, CommandError> {
     // From here on the stream carries bulk traffic with no
     // request/reply rhythm; reads block until the session ends.
     stream.set_read_timeout(None)?;
@@ -152,31 +157,46 @@ fn bridge(stream: UnixStream) -> Result<u8, CommandError> {
     }
 
     // Main loop: session output (Replay and Output frames) -> stdout;
-    // Event(Exited) is the clean-exit signal.
+    // Event(Exited) is the clean-exit signal; Event(PasswordInput) is
+    // forwarded to Calyx's secure-input socket when one is configured.
     let mut reader = FrameReader::new(stream);
     let mut stdout = std::io::stdout();
-    loop {
+    let code = loop {
         let frame = match reader.read_frame() {
             Ok(frame) => frame,
             // EOF/reset: daemon or connection is gone.
-            Err(_) => return Ok(EXIT_DISCONNECTED),
+            Err(_) => break EXIT_DISCONNECTED,
         };
         match frame.frame_type {
             FrameType::Replay | FrameType::Output => {
                 if stdout.write_all(&frame.payload).is_err() || stdout.flush().is_err() {
-                    return Ok(EXIT_DISCONNECTED);
+                    break EXIT_DISCONNECTED;
                 }
             }
-            FrameType::Control => {
-                if let Ok(ControlMsg::Event(proto::SessionEvent::Exited { .. })) =
-                    decode_control(&frame.payload)
-                {
-                    return Ok(0);
+            FrameType::Control => match decode_control(&frame.payload) {
+                Ok(ControlMsg::Event(proto::SessionEvent::Exited { .. })) => break 0,
+                Ok(ControlMsg::Event(proto::SessionEvent::PasswordInput { active, .. })) => {
+                    if let Some(n) = notifier.as_mut() {
+                        n.notify(active);
+                    }
                 }
-            }
+                _ => {}
+            },
             FrameType::Input => {}
         }
+    };
+    // A lost connection may leave Calyx believing a password prompt is
+    // still up; clear it. On a clean exit the daemon already pushed
+    // `active: false` before `Exited`. The signal path
+    // (`process::exit` in the signal thread) bypasses this: the pane
+    // is going away and Calyx clears its per-surface state on surface
+    // teardown.
+    if code == EXIT_DISCONNECTED {
+        if let Some(n) = notifier.as_mut() {
+            n.disconnected();
+        }
     }
+    Ok(code)
 }
 
 /// Connects to the daemon, auto-starting it if the socket is dead:

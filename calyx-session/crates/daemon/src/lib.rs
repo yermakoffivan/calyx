@@ -35,6 +35,13 @@
 //! - **Exit**: when a session's child process exits, every attached
 //!   client receives `ControlMsg::Event(SessionEvent::Exited { .. })`
 //!   and the session is removed from the registry.
+//! - **Password input**: while at least one client is attached, the
+//!   session samples its PTY termios every 200 ms and pushes
+//!   `SessionEvent::PasswordInput { active }` to every attached client
+//!   when canonical-no-echo mode (ICANON set, ECHO clear) is entered or
+//!   left. A client attaching while it is active gets one
+//!   `active: true` right after its Replay; `active: false` precedes
+//!   `Exited` if the child exits while active.
 //! - **Ledger**: `state_dir/sessions.json`, mode `0600`, written
 //!   atomically (temp file + rename), updated on every registry change.
 //! - **Idempotent create**: `Attach { id, create: Some(spec), .. }`
@@ -360,7 +367,8 @@ pub fn run_handoff_receiver(
         // still-earlier daemon generation left behind that even the
         // handing-off daemon did not own), so it is unowned here too
         // and gets the same treatment as a fresh bind's stale records.
-        let registered: std::collections::HashSet<String> = state.sessions.keys().cloned().collect();
+        let registered: std::collections::HashSet<String> =
+            state.sessions.keys().cloned().collect();
         let changed = ledger::reconcile_unowned_running(
             &mut state.ledger,
             |id| registered.contains(id),
