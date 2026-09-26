@@ -127,7 +127,7 @@ struct MCPCalyxMCPRouter: Sendable {
     func routeCalyxMCP(
         request: HTTPRequest,
         paneContext: MCPPaneResolutionContext,
-        modelContextProvider: (any MCPAppModelContextProviding)?
+        modelContextProvider: any MCPAppModelContextProviding?
     ) async -> RoutedResponse {
         await hub.watchServers(registry.servers.map(\.id), connections: connections)
 
@@ -198,7 +198,7 @@ struct MCPCalyxMCPRouter: Sendable {
         _ incoming: MCPCalyxMCPIncoming,
         request: HTTPRequest,
         paneContext: MCPPaneResolutionContext,
-        modelContextProvider: (any MCPAppModelContextProviding)?
+        modelContextProvider: any MCPAppModelContextProviding?
     ) async -> RoutedResponse {
         let id = incoming.id
         let params = incoming.params ?? [:]
@@ -386,7 +386,7 @@ struct MCPCalyxMCPRouter: Sendable {
         _ incoming: MCPCalyxMCPIncoming,
         request: HTTPRequest,
         paneContext: MCPPaneResolutionContext,
-        modelContextProvider: (any MCPAppModelContextProviding)?
+        modelContextProvider: any MCPAppModelContextProviding?
     ) async -> RoutedResponse {
         let session = await legacySession(of: request, paneContext: paneContext)
         if case .invalid = session, incoming.method != "initialize" {
@@ -408,7 +408,7 @@ struct MCPCalyxMCPRouter: Sendable {
         _ batch: [AnyCodable],
         request: HTTPRequest,
         paneContext: MCPPaneResolutionContext,
-        modelContextProvider: (any MCPAppModelContextProviding)?
+        modelContextProvider: any MCPAppModelContextProviding?
     ) async -> HTTPResponse {
         let session = await legacySession(of: request, paneContext: paneContext)
         if case .invalid = session {
@@ -454,7 +454,7 @@ struct MCPCalyxMCPRouter: Sendable {
         session: LegacySession,
         paneContext: MCPPaneResolutionContext,
         allowStream: Bool,
-        modelContextProvider: (any MCPAppModelContextProviding)?
+        modelContextProvider: any MCPAppModelContextProviding?
     ) async -> LegacyOutcome {
         let params = incoming.params ?? [:]
         guard let id = incoming.id else {
@@ -601,7 +601,7 @@ struct MCPCalyxMCPRouter: Sendable {
         sessionNonce: String?,
         isLegacy: Bool,
         allowStream: Bool,
-        modelContextProvider: (any MCPAppModelContextProviding)?,
+        modelContextProvider: any MCPAppModelContextProviding?,
         decorate: @escaping @Sendable ([String: AnyCodable]) -> [String: AnyCodable]
     ) async -> RoutedResponse {
         guard let name = params["name"]?.stringValue else {

@@ -136,7 +136,7 @@ final class MCPUpstreamConnectionTests: XCTestCase {
         clock: MCPClock,
         handshakeOrder: MCPHandshakeOrder = .initializeFirst,
         knownEra: MCPProtocolEra? = nil,
-        presenter: (any MCPElicitationPresenting)? = nil,
+        presenter: any MCPElicitationPresenting? = nil,
         configuration: MCPUpstreamConnection.Configuration? = nil
     ) -> MCPUpstreamConnection {
         MCPUpstreamConnection(

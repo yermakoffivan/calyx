@@ -60,6 +60,9 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
     /// The suspended `openStream()` while it waits for the `endpoint` event.
     private var endpointWaiter: CheckedContinuation<URL, Error>?
     private var streamTask: Task<Void, Never>?
+    /// `notifications/cancelled` POSTs still in flight, keyed by an id
+    /// each removes itself under when done. Cancelled by `tearDown()`.
+    private var cancelNotificationTasks: [UUID: Task<Void, Never>] = [:]
 
     nonisolated let inbound: AsyncStream<MCPInbound>
     private let continuation: AsyncStream<MCPInbound>.Continuation
@@ -148,22 +151,41 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
     /// POSTs `notifications/cancelled`. A failure to encode or send it, and
     /// its response, are dropped, since an `.error` here would read as a
     /// failure of every request in flight.
+    ///
+    /// The POST runs in a task of its own and `cancel` returns without
+    /// waiting for it: the caller is typically the request's own, already
+    /// cancelled task, whose cancellation would otherwise stop the POST
+    /// before it is sent. `close()` cancels POSTs still in flight.
     func cancel(requestID: JSONRPCId, reason: String?) async {
         guard !isClosed, let postEndpoint else { return }
         let notification = CancelledNotification(
             params: MCPCancelledNotificationParams(requestId: requestID, reason: reason)
         )
+        let payload: Data
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .withoutEscapingSlashes
-            let payload = try encoder.encode(notification)
-            let exchange = try await requester.perform { authorization in
-                Self.makePOST(url: postEndpoint, authorization: authorization, body: payload)
-            }
-            MCPHTTPAuthorizingRequester.discard(exchange.body)
+            payload = try encoder.encode(notification)
         } catch {
             return
         }
+        let requester = self.requester
+        let taskID = UUID()
+        cancelNotificationTasks[taskID] = Task { [weak self] in
+            do {
+                let exchange = try await requester.perform { authorization in
+                    Self.makePOST(url: postEndpoint, authorization: authorization, body: payload)
+                }
+                MCPHTTPAuthorizingRequester.discard(exchange.body)
+            } catch {
+                // Dropped, as documented above.
+            }
+            await self?.cancelNotificationFinished(taskID)
+        }
+    }
+
+    private func cancelNotificationFinished(_ taskID: UUID) {
+        cancelNotificationTasks[taskID] = nil
     }
 
     /// Finishes `inbound` directly and stops the GET stream. Idempotent.
@@ -213,7 +235,7 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
         }
 
         var parser = SSEEventParser(maxEventBytes: requester.session.maxBodyBytes)
-        var streamError: (any Error)?
+        var streamError: any Error?
         do {
             for try await chunk in exchange.body {
                 receive(try parser.feed(chunk))
@@ -260,7 +282,7 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
     /// The GET stream ended. Before the endpoint event this fails
     /// `openStream()`; afterwards, unless the transport was closed, it is
     /// reported as `.closed`.
-    private func streamEnded(error: (any Error)?) {
+    private func streamEnded(error: any Error?) {
         if endpointWaiter != nil {
             failOpening(error ?? MCPTransportError.closed)
             return
@@ -286,6 +308,10 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
         continuation.finish()
         streamTask?.cancel()
         streamTask = nil
+        for task in cancelNotificationTasks.values {
+            task.cancel()
+        }
+        cancelNotificationTasks.removeAll()
     }
 
     // MARK: - Helpers

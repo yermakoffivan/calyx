@@ -1018,6 +1018,70 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let identifiers = await WKContentRuleListStore.default().availableIdentifiers() ?? []
         XCTAssertFalse(identifiers.contains(identifier), "the compiled rule list is removed")
     }
+
+    /// `document.contentRuleListIdentifier` is stable per `viewID`
+    /// (`MCPAppWebViewFactory.contentRuleListIdentifierPrefix +
+    /// viewID.uuidString` -- see `MCPAppHostStore.mount(resolved:viewID:)`),
+    /// so a reload that lands on a document with unparsable origins (e.g. a
+    /// `_meta.ui.domain` that stops being a valid host) reuses the
+    /// identifier of the view's own PREVIOUS, successfully compiled rule
+    /// list. `mount`'s `invalidOrigin` path throws without removing it
+    /// (verified against Foundation: neither `hostPageURL` nor
+    /// `viewDocumentURL` parses `"...://bad host"`), so that compiled list
+    /// is never released by this call and nothing else will ever remove it
+    /// for a view that never finishes mounting.
+    func test_mountWithUnparsableOrigins_throwsInvalidOrigin_andRemovesThePriorRuleList() async throws {
+        let harness = makeHarness()
+        // The view stays in the store (card-only, no mount attempted yet),
+        // so `store.snapshot(viewID:)` is non-nil and the `viewRemoved`
+        // guard does not fire on either mount below.
+        let viewID = try await startCardOnlyView(harness, surfaceID: nil)
+        let identifier = MCPAppWebViewFactory.contentRuleListIdentifierPrefix + viewID.uuidString
+
+        // First mount: valid origins, so its rule list actually compiles
+        // into `WKContentRuleListStore` under `identifier`.
+        let firstHostOrigin = "\(MCPAppWebViewFactory.hostScheme)://\(UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: ""))"
+        let firstViewOrigin = "\(MCPAppWebViewFactory.appScheme)://\(UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: ""))"
+        let firstDocument = MCPAppViewDocument(
+            html: "<!DOCTYPE html><html></html>",
+            viewOrigin: firstViewOrigin,
+            hostOrigin: firstHostOrigin,
+            cspPolicy: MCPAppCSPBuilder.buildPolicy(csp: nil, hostOrigin: firstHostOrigin).policy,
+            contentRuleListJSON: MCPAppCSPBuilder.contentRuleList(csp: nil, hostOrigin: firstHostOrigin, calyxOrigins: [firstViewOrigin]),
+            contentRuleListIdentifier: identifier
+        )
+        try await harness.runtime.mount(viewID: viewID, document: firstDocument)
+        var identifiers = await WKContentRuleListStore.default().availableIdentifiers() ?? []
+        XCTAssertTrue(identifiers.contains(identifier), "precondition: the first mount compiled a rule list under the view's identifier")
+
+        // Second mount (a reload): same identifier, unparsable origins. An
+        // embedded space keeps `URL(string:)` from parsing the origin into
+        // a URL at all.
+        let hostOrigin = "\(MCPAppWebViewFactory.hostScheme)://bad host"
+        let viewOrigin = "\(MCPAppWebViewFactory.appScheme)://bad host"
+        XCTAssertNil(MCPAppSchemeHandler.hostPageURL(hostOrigin: hostOrigin), "precondition: the host origin does not parse")
+        XCTAssertNil(MCPAppSchemeHandler.viewDocumentURL(viewOrigin: viewOrigin), "precondition: the view origin does not parse")
+        let document = MCPAppViewDocument(
+            html: "<!DOCTYPE html><html></html>",
+            viewOrigin: viewOrigin,
+            hostOrigin: hostOrigin,
+            cspPolicy: MCPAppCSPBuilder.buildPolicy(csp: nil, hostOrigin: hostOrigin).policy,
+            contentRuleListJSON: MCPAppCSPBuilder.contentRuleList(csp: nil, hostOrigin: hostOrigin, calyxOrigins: [viewOrigin]),
+            contentRuleListIdentifier: identifier
+        )
+
+        do {
+            try await harness.runtime.mount(viewID: viewID, document: document)
+            XCTFail("mounting a document with unparsable origins must throw")
+        } catch let error as MCPAppWebViewFactoryError {
+            XCTAssertEqual(error, .invalidOrigin)
+        } catch {
+            XCTFail("expected MCPAppWebViewFactoryError.invalidOrigin, got \(error)")
+        }
+
+        identifiers = await WKContentRuleListStore.default().availableIdentifiers() ?? []
+        XCTAssertFalse(identifiers.contains(identifier), "the rule list compiled for this view must not survive a failed reload")
+    }
 }
 
 // MARK: - The card is just header + web view: no inline consent prompt

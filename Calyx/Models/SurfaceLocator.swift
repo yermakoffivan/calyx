@@ -30,7 +30,7 @@ import Foundation
 /// isolation (`SurfaceLocator` provides `@MainActor`).
 final class WeakValueRegistry<Key: Hashable, Value: AnyObject> {
     private final class Box {
-        weak var value: Value?
+        weak let value: Value?
         init(_ value: Value) { self.value = value }
     }
 

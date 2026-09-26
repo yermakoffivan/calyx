@@ -98,7 +98,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     /// found through `environment`.
     private struct DockAttachment {
         let dock: MCPAppDockView
-        weak var container: SplitContainerView?
+        weak let container: SplitContainerView?
     }
 
     weak var store: MCPAppHostStore? {
@@ -132,13 +132,20 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
     // MARK: - MCPAppViewRuntime
 
-    /// Throws `MCPAppWebViewFactoryError.viewRemoved`, after removing the
-    /// compiled rule list, when the store dropped the view while the
-    /// configuration was being built.
+    /// Throws `MCPAppWebViewFactoryError.viewRemoved` when the store dropped
+    /// the view while the configuration was being built. Any throw removes
+    /// the rule list stored under `document.contentRuleListIdentifier`: the
+    /// identifier is stable per view, so a failed reload would otherwise
+    /// leave the view's previously compiled list registered with no owner.
     func mount(viewID: UUID, document: MCPAppViewDocument) async throws {
+        var webViewOwnsRuleList = false
+        defer {
+            if !webViewOwnsRuleList {
+                await removeContentRuleList(identifier: document.contentRuleListIdentifier)
+            }
+        }
         let configuration = try await MCPAppWebViewFactory.makeViewConfiguration(document: document, additionalSchemeHandlers: [:])
         guard store?.snapshot(viewID: viewID) != nil else {
-            await removeContentRuleList(identifier: document.contentRuleListIdentifier)
             throw MCPAppWebViewFactoryError.viewRemoved
         }
         guard let hostPageURL = MCPAppSchemeHandler.hostPageURL(hostOrigin: document.hostOrigin),
@@ -146,9 +153,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
             throw MCPAppWebViewFactoryError.invalidOrigin
         }
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        let bridge = MCPAppBridge()
-        bridge.webView = webView
-        bridge.delegate = self
+        let bridge = MCPAppBridge(webView: webView, delegate: self)
         MCPAppWebViewFactory.installBridge(into: webView, world: bridge.world, handler: bridge)
         let navigationGuard = MCPAppNavigationGuard(allowedInitialURLs: [hostPageURL, viewURL])
         navigationGuard.onDidFinishLoad = { [weak self] in self?.store?.viewDidLoadDocument(viewID: viewID) }
@@ -165,6 +170,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
                               mediaDelegate: mediaDelegate, document: document)
         let state = viewState(for: viewID)
         state.mounted = mounted
+        webViewOwnsRuleList = true
         state.pane.setWebView(webView)
         syncWithStore()
         webView.load(URLRequest(url: hostPageURL))

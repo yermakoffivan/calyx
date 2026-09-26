@@ -637,7 +637,7 @@ final class HerdrTransportTests: XCTestCase {
         let peerFD = try acceptOnePeer(listenerFD: listenerFD)
         defer { Darwin.close(peerFD) }
 
-        weak var weakTransport = transport
+        weak let weakTransport = transport
         await transport!.close()
         transport = nil
 

@@ -279,6 +279,51 @@ final class LegacySSEMCPTransportTests: XCTestCase {
         XCTAssertTrue(bodyString.contains("notifications/cancelled"))
     }
 
+    /// `MCPUpstreamClient.request(...)`'s `.cancelled` reply path calls
+    /// `transport.cancel(requestID:reason:)` from inside the Task whose
+    /// own cancellation produced `.cancelled` -- so `cancel(...)` always
+    /// runs with `Task.isCancelled == true` on that call stack. The POST
+    /// must still go out: a cancelled Task is still running, it merely
+    /// checks cancellation cooperatively, and `notifications/cancelled`
+    /// is the one message a cancelled caller most needs delivered.
+    func test_cancel_calledFromAnAlreadyCancelledTask_stillPostsNotificationsCancelled() async throws {
+        recorder.enqueue { _ in .sse(status: 200, chunks: [self.endpointEventChunk()], thenClose: false) } // GET
+        recorder.enqueue { _ in .empty(status: 202) } // cancel POST
+        let transport = transport()
+        try await transport.openStream()
+
+        // Spin the Task's body until its own cancellation flag is visibly
+        // set before calling `cancel(...)`, so `cancel(...)`'s whole call
+        // stack -- including `MCPHTTPSession.stream`'s
+        // `withTaskCancellationHandler` -- observes `Task.isCancelled ==
+        // true` from its very first check, exactly like `request(...)`'s
+        // `.cancelled` reply path. Racing `task.cancel()` directly against
+        // the Task's start (without this spin) is nondeterministic: the
+        // POST can slip out before cancellation is observed, masking the
+        // bug with a flaky green.
+        let task = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            await transport.cancel(requestID: .int(1), reason: "request cancelled")
+        }
+        task.cancel()
+
+        // Do not `await task.value`: if `cancel(...)` never resumes (the
+        // very failure mode under test -- a cancelled URLSession task that
+        // never calls back), that await would hang with no XCTest
+        // timeout. Poll the recorder with a bounded wait instead so the
+        // test fails cleanly on the missing POST rather than hanging.
+        let deadline = Date().addingTimeInterval(2)
+        while !(recorder.requests.contains { $0.method == "POST" }), Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let postRequest = recorder.requests.first { $0.method == "POST" }
+        XCTAssertNotNil(postRequest, "notifications/cancelled must be POSTed even when cancel(...) runs inside an already-cancelled Task")
+        let bodyString = postRequest?.bodyData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        XCTAssertTrue(bodyString.contains("notifications/cancelled"), "the POST body must carry notifications/cancelled")
+    }
+
     // MARK: - A dropped GET stream is an unsolicited close
 
     func test_droppedGETStream_isUnsolicitedClosed() async throws {

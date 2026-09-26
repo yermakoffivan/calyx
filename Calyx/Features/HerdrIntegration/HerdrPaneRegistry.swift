@@ -102,7 +102,7 @@ final class HerdrPaneRegistry: NSObject {
 
     /// See `HerdrPaneBridgeObserver`'s own doc comment -- stored
     /// WEAKLY, set via `setBridgeObserver`, never through `init`.
-    private weak var bridgeObserver: (any HerdrPaneBridgeObserver)?
+    private weak var bridgeObserver: any HerdrPaneBridgeObserver?
 
     override init() {
         super.init()
@@ -112,7 +112,7 @@ final class HerdrPaneRegistry: NSObject {
     /// -- see `HerdrPaneBridgeObserver`'s own doc comment. Stored
     /// WEAKLY: pass `nil` to clear; a deallocated observer simply stops
     /// being notified rather than being kept alive by this registry.
-    func setBridgeObserver(_ observer: (any HerdrPaneBridgeObserver)?) {
+    func setBridgeObserver(_ observer: any HerdrPaneBridgeObserver?) {
         bridgeObserver = observer
     }
 

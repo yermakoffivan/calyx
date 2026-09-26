@@ -14,7 +14,7 @@ final class GhosttyThemeProvider {
     private(set) var ghosttyBackground: NSColor = ThemeColorPreset.ghostty.color
     private(set) var ghosttyForeground: NSColor = .white
     private(set) var splitDividerColor: NSColor? = nil
-    nonisolated(unsafe) private var observer: Any?
+    @ObservationIgnored private var observer: Any?
 
     private init() {
         refreshFromConfig()
@@ -25,7 +25,7 @@ final class GhosttyThemeProvider {
         }
     }
 
-    deinit {
+    isolated deinit {
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }

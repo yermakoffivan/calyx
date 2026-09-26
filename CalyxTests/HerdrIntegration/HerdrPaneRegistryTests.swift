@@ -379,7 +379,7 @@ final class HerdrPaneRegistryTests: XCTestCase {
     // MARK: - Bridge observer: held weakly
 
     func test_setBridgeObserver_holdsObserverWeakly_registerAfterDeallocationDoesNotCrash_recordsNothing() {
-        weak var weakObserver: RecordingBridgeObserver?
+        weak let weakObserver: RecordingBridgeObserver?
         do {
             let observer = RecordingBridgeObserver()
             weakObserver = observer

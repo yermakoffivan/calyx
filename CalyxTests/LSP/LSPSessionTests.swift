@@ -864,6 +864,66 @@ final class LSPSessionTests: XCTestCase {
         driver.cancel()
     }
 
+    // MARK: - Regression: the drain bound is enforced when the persist worker ignores cancellation
+
+    /// Regression: `shutdown()`'s drain once raced `task.value` (the
+    /// persist worker) against a 2s sleep in a `withTaskGroup`, then
+    /// called `group.cancelAll()`. But `withTaskGroup` still implicitly
+    /// awaits every child before returning, including the `task.value`
+    /// child — and `cancelAll()` only requests cooperative cancellation.
+    /// A persist worker doing synchronous, cancellation-blind work (here:
+    /// `JSONDecoder` decoding a very large file — `Task.isCancelled` is
+    /// never consulted mid-decode) kept `task.value` unresolved, so the
+    /// group — and `shutdown()` — waited for however long that work
+    /// took, not the advertised ~2s bound.
+    ///
+    /// Reproduced with no test-only injection point (none exists for the
+    /// persist worker's timing, and `LSPSessionPersistence` is a
+    /// concrete `actor`, not swappable for a slow fake): a 1,000,000-entry
+    /// `sessions.json` fixture is written directly as raw JSON text (one
+    /// entry repeated — the decode cost does not depend on the entries
+    /// being distinct — which keeps fixture setup well under a second).
+    /// `shutdown()`'s `scheduleRemoveSnapshot()` makes the persist worker
+    /// call `LSPSessionPersistence.remove(...)`, which reads and
+    /// JSON-decodes this fixture on the actor's executor; measured
+    /// against the old `withTaskGroup` drain, 2,000,000 entries kept
+    /// `shutdown()` busy for ~21s, so 1,000,000 stays ~10s — comfortably
+    /// past the 4s bound asserted below. The entry does not need to
+    /// match this session's `(workspaceRoot, languageId)` for the decode
+    /// cost to be paid.
+    func test_shutdown_drainBound_isEnforced_whenThePersistWorkerDecodesAHugeFile() async throws {
+        let dir = try makeTempDir()
+        let storage = dir.appendingPathComponent("sessions.json")
+
+        let entryCount = 1_000_000
+        let entry = "{\"workspaceRoot\":\"file:///tmp/lsp-drain-fixture\",\"languageId\":\"swift\",\"openFiles\":[\"file:///tmp/lsp-drain-fixture/main.swift\"],\"initializationOptions\":null,\"savedAtUptimeMillis\":0}"
+        let json = "[" + Array(repeating: entry, count: entryCount).joined(separator: ",") + "]"
+        try Data(json.utf8).write(to: storage)
+
+        let persistence = LSPSessionPersistence(storageURL: storage)
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        let session = LSPSession(
+            workspaceRoot: testWorkspaceRoot,
+            languageId: testLanguageId,
+            client: client,
+            persistence: persistence
+        )
+        let driver = driveInitAndShutdown(on: transport)
+        try await session.start()
+
+        let started = Date()
+        try await session.shutdown()
+        let elapsed = Date().timeIntervalSince(started)
+
+        driver.cancel()
+
+        XCTAssertLessThanOrEqual(
+            elapsed, 4.0,
+            "shutdown() must return within its bounded drain (~2s) even when the persist worker is stuck decoding a huge file — took \(elapsed)s"
+        )
+    }
+
     // MARK: - Regression 4: shutdown() before start() is a no-op on the wire
 
     /// Bug: when the session is still in `.notStarted` (or `.shutdown` /

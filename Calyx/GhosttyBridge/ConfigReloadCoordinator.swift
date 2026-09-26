@@ -28,7 +28,7 @@ final class ConfigReloadCoordinator {
     /// Monotonically increasing config version. 0 = no successful load yet.
     private(set) var configGeneration: Int = 0
 
-    private weak var deps: ConfigReloadDeps?
+    private weak let deps: ConfigReloadDeps?
     private var reloadDebounceWork: DispatchWorkItem?
 
     init(deps: ConfigReloadDeps) {

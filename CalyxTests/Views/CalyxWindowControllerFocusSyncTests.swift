@@ -223,7 +223,7 @@ final class CalyxWindowControllerFocusSyncTests: XCTestCase {
         // nested scope. Outside the scope we keep ONLY the container and a
         // weak probe — no strong tab reference can survive in test-local
         // scope.
-        weak var weakTabProbe: Tab?
+        weak let weakTabProbe: Tab?
         var capturedContainer: SplitContainerView?
         var capturedFirstSurface: SurfaceView?
 

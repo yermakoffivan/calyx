@@ -492,18 +492,12 @@ struct HerdrOneShotRequest: ~Copyable {
         method: String, params: Params, socketPath: String
     ) async throws -> Result {
         let transport = self.transport
-        do {
-            try await transport.connect(socketPath: socketPath)
-            let line = try HerdrConnectionWire.requestLine(id: UUID().uuidString, method: method, params: params)
-            try await transport.send(line)
-            let responseLine = try await HerdrConnectionWire.awaitResponseLine(on: transport)
-            let result: Result = try HerdrConnectionWire.decodeResult(from: responseLine)
-            await transport.close()
-            return result
-        } catch {
-            await transport.close()
-            throw error
-        }
+        defer { await transport.close() }
+        try await transport.connect(socketPath: socketPath)
+        let line = try HerdrConnectionWire.requestLine(id: UUID().uuidString, method: method, params: params)
+        try await transport.send(line)
+        let responseLine = try await HerdrConnectionWire.awaitResponseLine(on: transport)
+        return try HerdrConnectionWire.decodeResult(from: responseLine)
     }
 }
 

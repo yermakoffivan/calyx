@@ -155,7 +155,7 @@ final class LoopbackRedirectListenerTests: XCTestCase {
         let listener = LoopbackRedirectListener(config: MCPOAuthRedirectConfig(host: .loopback, port: .random), expectedState: "state-abc")
         _ = try await listener.start()
 
-        let capturedError = Locked<(any Error)?>(nil)
+        let capturedError = Locked<any Error?>(nil)
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 do {

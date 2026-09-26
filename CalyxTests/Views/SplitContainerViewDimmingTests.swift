@@ -12,7 +12,7 @@
 //    1. `@MainActor protocol SurfaceFocusHost: AnyObject`
 //       with `func surfaceDidBecomeActive(_ surfaceView: SurfaceView)`,
 //       declared at file scope in `Calyx/GhosttyBridge/SurfaceView.swift`.
-//    2. `weak var focusHost: (any SurfaceFocusHost)?` stored on `SurfaceView`.
+//    2. `weak var focusHost: any SurfaceFocusHost?` stored on `SurfaceView`.
 //    3. `extension SplitContainerView: SurfaceFocusHost` implementing
 //       `surfaceDidBecomeActive(_:)`, plus `private var activeLeafID: UUID?`
 //       and `private func applyActiveDimming()`.
@@ -426,7 +426,7 @@ final class SplitContainerViewDimmingTests: XCTestCase {
     // MARK: - 6. SurfaceView has a focusHost property that holds weakly
 
     /// Compile-time smoke test: `SurfaceView` exposes a settable
-    /// `focusHost` property typed `(any SurfaceFocusHost)?`. Assignment must
+    /// `focusHost` property typed `any SurfaceFocusHost?`. Assignment must
     /// compile, round-trip (the getter returns the same conformer), and
     /// release on nil-out so the strong side retains the only reference.
     ///
@@ -447,7 +447,7 @@ final class SplitContainerViewDimmingTests: XCTestCase {
 
         // Act — drop the strong ref. Because `focusHost` is declared `weak`,
         // the surface must observe nil once the only strong owner goes away.
-        weak var weakHostProbe = host
+        weak let weakHostProbe = host
         host = nil
         XCTAssertNil(
             weakHostProbe,

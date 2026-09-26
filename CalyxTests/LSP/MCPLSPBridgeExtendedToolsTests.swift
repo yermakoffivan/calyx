@@ -739,6 +739,55 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
         )
     }
 
+    // MARK: - 10b. lsp_install with auto-install off records the disabled failure
+
+    /// With the Settings master switch off, `lsp_install` must report the
+    /// installer's explicit disabled failure without running any command,
+    /// and a following `lsp_install_status` must report that same
+    /// `.failed` status — the installer records it, so the bridge must
+    /// route the disabled case through `LSPInstaller.install(...)`.
+    func test_lspInstall_autoInstallOff_reportsDisabledFailure_andInstallStatusReportsIt() async throws {
+        LSPSettings.autoInstallEnabled = false
+        let (installer, runner) = await makeMissingInstaller()
+        let (bridge, _, _) = await makeBridge(installerOverride: installer)
+        let expected = String(
+            decoding: try JSONEncoder().encode(LSPInstaller.autoInstallDisabledReason),
+            as: UTF8.self
+        )
+
+        let installContent = try await bridge.handleToolCall(
+            name: "lsp_install",
+            arguments: [
+                "language_id": AnyCodable("typescript"),
+                "approve_prerequisites": AnyCodable(true),
+            ]
+        )
+        XCTAssertTrue(
+            installContent.text.contains(#""state":"failed""#),
+            "lsp_install must report .failed when auto-install is off; got: \(installContent.text)"
+        )
+        XCTAssertTrue(
+            installContent.text.contains(expected),
+            "lsp_install must report the installer's disabled reason; got: \(installContent.text)"
+        )
+
+        let statusContent = try await bridge.handleToolCall(
+            name: "lsp_install_status",
+            arguments: ["language_id": AnyCodable("typescript")]
+        )
+        XCTAssertEqual(
+            statusContent.text,
+            installContent.text,
+            "lsp_install_status must report the same .failed status lsp_install returned"
+        )
+
+        let history = await runner.history()
+        XCTAssertFalse(
+            history.contains(where: { $0.executable == "npm" }),
+            "no install command may run when auto-install is off; history=\(history)"
+        )
+    }
+
     // MARK: - 11. lsp_session_status returns every cached session
 
     func test_lspSessionStatus_returnsAllSessions() async throws {

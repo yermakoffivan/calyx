@@ -193,7 +193,7 @@ private final class MCPHTTPTaskDelegate: NSObject, URLSessionDataDelegate, Senda
         nil
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: any Error?) {
         if let error {
             takeHead()?.resume(throwing: error)
             body.finish(throwing: error)

@@ -15,7 +15,9 @@
 //    ------------------  -------------------   ---------------------------------
 //          false               (ignored)       .prompt with a handler that
 //                                              UNCONDITIONALLY returns `false`
-//                                              (effectively refuses any install)
+//                                              (fail-safe only: the installer's
+//                                              own guard reports "auto-install
+//                                              disabled" first)
 //          true                  true          .prompt with the caller-supplied
 //                                              handler (UI surfaces the prompt)
 //          true                  false         .silent
@@ -103,15 +105,13 @@ struct LSPSettings: Sendable {
         }
     }
 
-    // MARK: - Resolution (preferred)
+    // MARK: - Resolution
 
     /// Collapse the two knobs into an explicit three-state resolution.
     ///
-    /// Prefer this over `confirmationMode(confirmationHandler:)` — it lets
-    /// callers route on `.disabled` and surface a clear
-    /// "auto-install disabled in Settings" error to the MCP caller, instead
-    /// of round-tripping through a rejecting handler that the installer
-    /// would report as a spurious `"user declined: ..."`.
+    /// This is the lower-level primitive `confirmationMode(confirmationHandler:)`
+    /// builds on; use it directly when the caller needs to route on
+    /// `.disabled` itself.
     ///
     /// Mapping:
     ///   - `autoInstallEnabled == false`                              → `.disabled`
@@ -129,27 +129,26 @@ struct LSPSettings: Sendable {
         return .silent
     }
 
-    // MARK: - Mapping into ConfirmationMode (deprecated)
+    // MARK: - Mapping into ConfirmationMode
 
-    /// Collapse the two knobs into the `ConfirmationMode` expected by
-    /// `LSPInstaller.install(...)`. Callers supply the handler they would
-    /// like to be consulted in "prompt" mode (typically a UI bridge); when
-    /// auto-install is disabled the supplied handler is OVERRIDDEN by a
-    /// closure that unconditionally refuses, so no install command ever
-    /// runs.
+    /// Maps `resolve(confirmationHandler:)` into the `ConfirmationMode`
+    /// that `LSPInstaller.install(...)` takes. `.silent` and
+    /// `.prompt(handler:)` map to themselves; `.disabled` becomes a prompt
+    /// whose handler refuses every step.
     ///
-    /// Deprecated: prefer `resolve(confirmationHandler:)`, which exposes an
-    /// explicit `.disabled` case so the caller can surface a clear error
-    /// instead of relying on a rejecting handler.
-    @available(*, deprecated, message: "use resolve(confirmationHandler:) instead")
+    /// Callers still call `install(...)` when auto-install is disabled:
+    /// the installer's own `autoInstallEnabled` guard is the source of
+    /// truth — it returns the explicit "auto-install disabled" failure
+    /// (`LSPInstaller.autoInstallDisabledReason`) without running any step
+    /// and records it for `lsp_install_status`. The refusing prompt only
+    /// guards the window in which the master switch flips on between this
+    /// read and the hop onto the installer actor: the install then fails
+    /// closed instead of running without confirmation.
     static func confirmationMode(
         confirmationHandler: @Sendable @escaping (String) async -> Bool
     ) -> ConfirmationMode {
         switch resolve(confirmationHandler: confirmationHandler) {
         case .disabled:
-            // Preserve the exact legacy behaviour: master switch off used
-            // to map to `.prompt` with a handler that unconditionally
-            // refuses. Existing call sites still depend on this shape.
             return .prompt(handler: { @Sendable _ in false })
         case .silent:
             return .silent
