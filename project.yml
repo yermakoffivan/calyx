@@ -48,6 +48,21 @@ packages:
     url: https://github.com/apple/swift-argument-parser
     from: "1.5.0"
 
+settingGroups:
+  debugDeveloperIDSigning:
+    # Sign Debug-type builds with the same Developer ID as
+    # scripts/release.sh. Ad-hoc signing yields a cdhash-based
+    # designated requirement that changes every build, so macOS TCC
+    # treats each Debug build as a new app and re-prompts for
+    # Accessibility on every launch. Manual is required: Automatic
+    # only manages Apple Development certs, none exist for this team.
+    # Hosted test bundles (CalyxTests) must be signed with the same team
+    # because hardened-runtime library validation rejects bundles from a
+    # different Team ID.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Developer ID Application"
+    DEVELOPMENT_TEAM: PQQBSRKD72
+
 targets:
   Calyx:
     type: application
@@ -185,6 +200,8 @@ targets:
         release:
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
+        debug:
+          groups: [debugDeveloperIDSigning]
         debuguitesting:
           # Exact-match key (case-insensitive) against the "DebugUITesting"
           # config name — applies ONLY to that config, not to Debug/Release.
@@ -216,6 +233,9 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
+      configs:
+        debug:
+          groups: [debugDeveloperIDSigning]
     dependencies:
       - target: Calyx
 
