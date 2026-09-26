@@ -69,11 +69,11 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 ### Sessions and remote work
 
-- **Persistent Sessions** -- opt-in daemon-backed terminals survive app quit and crashes, with a Session Browser, recovery flow, and optional on-disk history
+- **Persistent Sessions** -- opt-in daemon-backed terminals survive app quit and crashes, with a Session Browser that shows why a Kill failed, recovery flow, and optional on-disk history
 - **Remote Sessions** -- deploy `calyx-session` once to an SSH host from `~/.ssh/config`, then browse and reattach to remote persistent sessions
 - **Agent Resume** -- offer to resume the agent CLI conversation associated with a reattached session
 - **Layout Restore** -- restore tabs, splits, and working directories on launch
-- **herdr Integration** -- browse and manage herdr workspaces as native split-pane tabs; herdr-hosted agents also appear in the Agents Sidebar, and a row bridged into a Calyx tab focuses that pane on click. Calyx watches for herdr instead of polling, so herdr started or installed after Calyx launched is picked up without a relaunch
+- **herdr Integration** -- browse and manage herdr workspaces as native split-pane tabs, or jump to a workspace in a herdr TUI already running in a Calyx pane; herdr-hosted agents also appear in the Agents Sidebar, and a row bridged into a Calyx tab focuses that pane on click. Calyx watches for herdr instead of polling, so herdr started or installed after Calyx launched is picked up without a relaunch
 
 ### Terminal workspace
 
@@ -84,7 +84,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **Command Palette** -- search and run operations with `Cmd+Shift+P`
 - **Ghostty Compatibility** -- read `~/.config/ghostty/config`, hot-reload most settings, and bind Calyx operations through Ghostty keybind actions
 - **Search and Navigation** -- highlighted scrollback search, native overlay scrollbar, smooth trackpad and mouse-wheel scrolling, and prompt-line cursor click-to-move
-- **Input Tools** -- shell-escaped drag and drop, multiline Compose Overlay, clipboard safety confirmation, and Secure Keyboard Entry
+- **Input Tools** -- shell-escaped drag and drop, multiline Compose Overlay, clipboard safety confirmation, and Secure Keyboard Entry that turns on automatically at password prompts, including inside local persistent sessions
 - **Quick Terminal and Notifications** -- a system-wide drop-down terminal plus OSC 9/99/777 desktop notifications
 - **Liquid Glass Appearance** -- macOS 26-native glass UI drawn as one seamless sheet of window chrome, eight theme presets, custom colors, adaptive text color, an optional opacity pass that reaches cells an app paints itself, and a fully opaque window under Reduce Transparency ([demo video](https://www.youtube.com/watch?v=cUYc7yzI_eM))
 - **About Window and Help Menu** -- **About Calyx** shows the version, build, and a linked git commit with **Docs** and **GitHub** buttons; **Help -> Calyx Help** (`Cmd+?`) opens the help center
