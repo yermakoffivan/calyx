@@ -15,8 +15,8 @@
 //    3. Cross-language prerequisite duplication — installing TypeScript
 //       and Python concurrently runs `brew install node` twice instead
 //       of dedup'ing the shared `npm` prerequisite.
-//    4. `LSPSettings.resolve(...).disabled` round-trips through the
-//       `confirmationMode(...)` mapping, surfacing a
+//    4. With auto-install disabled, `LSPSettings.confirmationMode(...)`
+//       yields a rejecting `.prompt`, which would surface a
 //       misleading `"user declined: ..."` failure when no user ever
 //       saw a prompt — the installer should report
 //       `"auto-install disabled"` instead.
@@ -260,7 +260,7 @@ final class LSPInstallerBugSpecTests: XCTestCase {
     }
 
     // ====================================================================
-    // MARK: - Bug 4. `.disabled` resolution surfaces a clear error
+    // MARK: - Bug 4. Disabled auto-install surfaces a clear error
     // ====================================================================
     //
     // `LSPSettings.confirmationMode(...)` collapses

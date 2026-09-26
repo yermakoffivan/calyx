@@ -3,17 +3,17 @@
 //  CalyxTests
 //
 //  Wave 1 RETROFIT — independent regression tests derived purely from the
-//  bug specification for `LSPSettings.resolve(confirmationHandler:)`.
+//  bug specification for `LSPSettings.confirmationMode(confirmationHandler:)`.
 //
 //  BUG SPEC:
-//    When `autoInstallEnabled = false`, the pre-fix `confirmationMode(...)`
-//    returned `.prompt(handler: { _ in false })` — a handler that refuses
-//    every step. Downstream `LSPInstaller` then surfaced
-//    `failed(reason: "user declined: <step>")` — misleading since no
-//    actual user declined.
-//    POST-FIX: introduce a `.disabled` resolution case (separate enum
-//    `LSPSettingsResolution`) that callers route on directly to emit a
-//    clear "auto-install disabled in Settings" message.
+//    When `autoInstallEnabled = false`, `confirmationMode(...)` returns
+//    `.prompt(handler: { _ in false })` — a handler that refuses every
+//    step. It is only a fail-safe: `LSPInstaller.install(...)` checks
+//    `autoInstallEnabled` itself first and reports the explicit
+//    "auto-install disabled" failure instead of a misleading
+//    `"user declined: <step>"` (covered by LSPInstallerBugSpecTests,
+//    Bug 4). These tests pin the three-outcome mapping and that the
+//    disabled branch takes priority over `requireInstallConfirmation`.
 //
 //  These tests are INDEPENDENT of LSPSettingsTests.swift — different test
 //  class, derived purely from the bug spec above.
@@ -24,87 +24,80 @@ import XCTest
 
 final class LSPSettingsBugSpecTests: XCTestCase {
 
-    // MARK: - .disabled resolution when auto-install is off
+    // MARK: - Rejecting .prompt when auto-install is off
 
-    func test_resolve_returnsDisabled_whenAutoInstallEnabledFalse() {
+    func test_confirmationMode_returnsRejectingPrompt_whenAutoInstallEnabledFalse() async {
         defer { LSPSettings.resetToDefaults() }
 
         LSPSettings.autoInstallEnabled = false
 
-        let resolution = LSPSettings.resolve(confirmationHandler: { _ in true })
+        let mode = LSPSettings.confirmationMode(confirmationHandler: { _ in true })
 
-        switch resolution {
-        case .disabled:
-            // Expected.
-            break
-        case .prompt:
-            XCTFail("Expected .disabled but got .prompt — pre-fix behavior detected")
+        switch mode {
+        case .prompt(let handler):
+            let decision = await handler("any-step")
+            XCTAssertFalse(decision, "Disabled auto-install must yield a rejecting handler, not the caller's")
         case .silent:
-            XCTFail("Expected .disabled but got .silent")
+            XCTFail("Expected rejecting .prompt but got .silent")
         }
     }
 
-    // MARK: - .prompt resolution when auto-install is on AND confirmation required
+    // MARK: - Caller's .prompt when auto-install is on AND confirmation required
 
-    func test_resolve_returnsPrompt_whenAutoInstallEnabledAndConfirmationRequired() {
+    func test_confirmationMode_returnsPrompt_whenAutoInstallEnabledAndConfirmationRequired() async {
         defer { LSPSettings.resetToDefaults() }
 
         LSPSettings.autoInstallEnabled = true
         LSPSettings.requireInstallConfirmation = true
 
-        let resolution = LSPSettings.resolve(confirmationHandler: { _ in true })
+        let mode = LSPSettings.confirmationMode(confirmationHandler: { _ in true })
 
-        switch resolution {
-        case .prompt:
-            // Expected.
-            break
-        case .disabled:
-            XCTFail("Expected .prompt but got .disabled")
+        switch mode {
+        case .prompt(let handler):
+            let decision = await handler("any-step")
+            XCTAssertTrue(decision, "Expected the caller-supplied (approving) handler to be forwarded")
         case .silent:
             XCTFail("Expected .prompt but got .silent")
         }
     }
 
-    // MARK: - .silent resolution when auto-install on AND confirmation NOT required
+    // MARK: - .silent when auto-install on AND confirmation NOT required
 
-    func test_resolve_returnsSilent_whenAutoInstallEnabledAndConfirmationNotRequired() {
+    func test_confirmationMode_returnsSilent_whenAutoInstallEnabledAndConfirmationNotRequired() {
         defer { LSPSettings.resetToDefaults() }
 
         LSPSettings.autoInstallEnabled = true
         LSPSettings.requireInstallConfirmation = false
 
-        let resolution = LSPSettings.resolve(confirmationHandler: { _ in true })
+        let mode = LSPSettings.confirmationMode(confirmationHandler: { _ in true })
 
-        switch resolution {
+        switch mode {
         case .silent:
             // Expected.
             break
-        case .disabled:
-            XCTFail("Expected .silent but got .disabled")
         case .prompt:
             XCTFail("Expected .silent but got .prompt")
         }
     }
 
-    // MARK: - .disabled wins over .silent even when confirmation not required
+    // MARK: - Disabled wins over .silent even when confirmation not required
 
-    func test_resolve_disabledTakesPriorityOver_requireConfirmation() {
+    func test_confirmationMode_disabledTakesPriorityOver_requireConfirmation() async {
         defer { LSPSettings.resetToDefaults() }
 
         LSPSettings.autoInstallEnabled = false
         LSPSettings.requireInstallConfirmation = false
 
-        let resolution = LSPSettings.resolve(confirmationHandler: { _ in true })
+        let mode = LSPSettings.confirmationMode(confirmationHandler: { _ in true })
 
-        switch resolution {
-        case .disabled:
+        switch mode {
+        case .prompt(let handler):
             // Expected — auto-install off must short-circuit before the
             // requireInstallConfirmation flag is considered.
-            break
+            let decision = await handler("any-step")
+            XCTAssertFalse(decision, "Disabled auto-install must yield a rejecting handler")
         case .silent:
-            XCTFail("Expected .disabled but got .silent — disabled must take priority")
-        case .prompt:
-            XCTFail("Expected .disabled but got .prompt")
+            XCTFail("Expected rejecting .prompt but got .silent — disabled must take priority")
         }
     }
 }

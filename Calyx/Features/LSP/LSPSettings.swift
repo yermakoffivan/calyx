@@ -32,39 +32,6 @@
 
 import Foundation
 
-// MARK: - LSPSettingsResolution
-
-/// Explicit three-state resolution of the two user-facing LSP install knobs,
-/// designed to be routed on by callers (the MCP bridge, `LSPInstaller`, etc.).
-///
-/// Why a separate enum from `ConfirmationMode`?
-///   - `ConfirmationMode` (in `LSPInstaller.swift`) only has `.silent` and
-///     `.prompt(handler:)`. When `autoInstallEnabled == false` we previously
-///     collapsed that state onto `.prompt(handler: { _ in false })`, which
-///     causes `LSPInstaller` to report `failed(reason: "user declined: ...")`
-///     even though no real user ever saw a prompt.
-///   - `LSPSettingsResolution.disabled` lets the caller distinguish "the
-///     master switch is off — surface a clear error to the MCP caller" from
-///     "the user actually saw the prompt and declined".
-///
-/// Truth table:
-///
-///    autoInstallEnabled  requireConfirmation   resolve(handler:)
-///    ------------------  -------------------   ------------------------------
-///          false               (ignored)       .disabled
-///          true                  true          .prompt(handler:)
-///          true                  false         .silent
-///
-enum LSPSettingsResolution: Sendable {
-    /// Master switch is off — installer must not run, caller surfaces an
-    /// explicit "auto-install disabled in Settings" error.
-    case disabled
-    /// Run install steps without prompting.
-    case silent
-    /// Gate each install step on `handler`.
-    case prompt(handler: @Sendable (String) async -> Bool)
-}
-
 struct LSPSettings: Sendable {
 
     // MARK: - UserDefaults keys
@@ -105,36 +72,13 @@ struct LSPSettings: Sendable {
         }
     }
 
-    // MARK: - Resolution
-
-    /// Collapse the two knobs into an explicit three-state resolution.
-    ///
-    /// This is the lower-level primitive `confirmationMode(confirmationHandler:)`
-    /// builds on; use it directly when the caller needs to route on
-    /// `.disabled` itself.
-    ///
-    /// Mapping:
-    ///   - `autoInstallEnabled == false`                              → `.disabled`
-    ///   - `autoInstallEnabled == true && requireInstallConfirmation` → `.prompt(handler:)`
-    ///   - `autoInstallEnabled == true && !requireInstallConfirmation`→ `.silent`
-    static func resolve(
-        confirmationHandler: @Sendable @escaping (String) async -> Bool
-    ) -> LSPSettingsResolution {
-        if !autoInstallEnabled {
-            return .disabled
-        }
-        if requireInstallConfirmation {
-            return .prompt(handler: confirmationHandler)
-        }
-        return .silent
-    }
-
     // MARK: - Mapping into ConfirmationMode
 
-    /// Maps `resolve(confirmationHandler:)` into the `ConfirmationMode`
-    /// that `LSPInstaller.install(...)` takes. `.silent` and
-    /// `.prompt(handler:)` map to themselves; `.disabled` becomes a prompt
-    /// whose handler refuses every step.
+    /// Collapses the two knobs into the `ConfirmationMode` that
+    /// `LSPInstaller.install(...)` takes:
+    ///   - `autoInstallEnabled == false`                              → `.prompt` whose handler refuses every step
+    ///   - `autoInstallEnabled == true && requireInstallConfirmation` → `.prompt(handler:)` with the caller's handler
+    ///   - `autoInstallEnabled == true && !requireInstallConfirmation`→ `.silent`
     ///
     /// Callers still call `install(...)` when auto-install is disabled:
     /// the installer's own `autoInstallEnabled` guard is the source of
@@ -147,14 +91,13 @@ struct LSPSettings: Sendable {
     static func confirmationMode(
         confirmationHandler: @Sendable @escaping (String) async -> Bool
     ) -> ConfirmationMode {
-        switch resolve(confirmationHandler: confirmationHandler) {
-        case .disabled:
+        if !autoInstallEnabled {
             return .prompt(handler: { @Sendable _ in false })
-        case .silent:
-            return .silent
-        case .prompt(let handler):
-            return .prompt(handler: handler)
         }
+        if requireInstallConfirmation {
+            return .prompt(handler: confirmationHandler)
+        }
+        return .silent
     }
 
     // MARK: - Reset

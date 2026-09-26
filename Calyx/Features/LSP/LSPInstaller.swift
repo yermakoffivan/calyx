@@ -252,8 +252,8 @@ enum ConfirmationMode: Sendable {
 actor LSPInstaller {
 
     /// The failure reason `install(...)` reports when
-    /// `LSPSettings.autoInstallEnabled` is `false`. Callers that resolve
-    /// the settings themselves report the same reason on `.disabled`.
+    /// `LSPSettings.autoInstallEnabled` is `false`. Callers that check
+    /// the master switch themselves report the same reason.
     static let autoInstallDisabledReason =
         "auto-install disabled in Settings (LSP Proxy → Auto-install language servers)"
 
