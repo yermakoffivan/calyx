@@ -60,6 +60,9 @@ struct SecureInputOverlay: View {
                         automatically whenever Calyx detects a password prompt in the terminal, \
                         or at all times if Secure Keyboard Entry is enabled in the menu.
                         """)
+                        // Bound the width so the one-line string wraps instead of sizing the popover to its full intrinsic width.
+                        .frame(maxWidth: 320, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                         .padding(.all)
                     }
             }
