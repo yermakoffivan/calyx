@@ -99,7 +99,7 @@ final class DemoRecordingScenario: CalyxUITestCase {
     /// lands somewhere throwaway rather than a shared/fixed domain.
     private var defaultsSuiteName: String?
 
-    override func setUp() {
+    override func setUp() async throws {
         // Deliberately does NOT call super.setUp() -- see this file's
         // header for why CalyxUITestCase's own launch flow conflicts
         // with what this scenario needs. All launch configuration
@@ -114,7 +114,7 @@ final class DemoRecordingScenario: CalyxUITestCase {
         continueAfterFailure = true
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         // Self-contained, and deliberately does NOT call
         // super.tearDown(): CalyxUITestCase.tearDown() force-unwraps
         // `app` (implicitly-unwrapped `XCUIApplication!`) -- safe there
@@ -137,7 +137,8 @@ final class DemoRecordingScenario: CalyxUITestCase {
         if let defaultsSuiteName {
             // Same best-effort cfprefsd-flush caveat as
             // CalyxUITestCase.tearDown()'s own identical cleanup.
-            Thread.sleep(forTimeInterval: 1.0)
+            // `try?`: a cancelled sleep only shortens the flush wait; cleanup below must still run.
+            try? await Task.sleep(for: .seconds(1))
             UserDefaults().removePersistentDomain(forName: defaultsSuiteName)
             let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(defaultsSuiteName).plist"
             try? FileManager.default.removeItem(atPath: suitePlistPath)

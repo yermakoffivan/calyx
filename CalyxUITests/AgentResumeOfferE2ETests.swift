@@ -89,7 +89,7 @@ final class AgentResumeOfferE2ETests: CalyxUITestCase {
     private var sessionDir: String!
     private var execCounter = 0
 
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
         let homeSuffix = String(UUID().uuidString.prefix(8))
         let sessionSuffix = String(UUID().uuidString.prefix(8))
@@ -104,7 +104,7 @@ final class AgentResumeOfferE2ETests: CalyxUITestCase {
         // test method itself via `launchApp(autoExecute:)` below.
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
@@ -112,7 +112,7 @@ final class AgentResumeOfferE2ETests: CalyxUITestCase {
         if let sessionDir {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func launchApp(autoExecute: Bool) {

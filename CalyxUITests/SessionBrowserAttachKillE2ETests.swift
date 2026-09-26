@@ -50,7 +50,7 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
     /// `super.setUp()`, why the root must stay short, and why `HOME`
     /// itself -- not some Calyx-internal setting -- is what redirects
     /// the daemon's on-disk state).
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
 
         let homeSuffix = String(UUID().uuidString.prefix(8))
@@ -63,7 +63,7 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         launchApp()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
@@ -71,7 +71,7 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         if let sessionDir {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func launchApp() {

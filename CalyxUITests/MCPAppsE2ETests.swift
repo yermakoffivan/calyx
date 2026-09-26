@@ -171,21 +171,22 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
             .path
     }()
 
-    override func setUp() {
+    override func setUp() async throws {
         _ = scopedPathRoot
         if preregistersFixture {
             writeMCPServersConfig()
         }
-        super.setUp()
+        try await super.setUp()
     }
 
     override var additionalLaunchArguments: [String] {
         ["--calyx-path-root=\(scopedPathRoot)", "-calyx.ipc.enabled", "YES"]
     }
 
-    override func tearDown() {
-        super.tearDown()
-        try? FileManager.default.removeItem(atPath: scopedPathRoot)
+    override func tearDown() async throws {
+        // `defer`: runs after super.tearDown() even if it throws.
+        defer { try? FileManager.default.removeItem(atPath: scopedPathRoot) }
+        try await super.tearDown()
     }
 
     func writeMCPServersConfig() {

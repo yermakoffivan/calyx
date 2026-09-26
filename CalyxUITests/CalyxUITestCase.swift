@@ -6,6 +6,7 @@
 import AppKit
 import XCTest
 
+@MainActor
 class CalyxUITestCase: XCTestCase {
     var app: XCUIApplication!
     private var sessionTempDir: String?
@@ -87,8 +88,8 @@ class CalyxUITestCase: XCTestCase {
         inputSourceGuard.restore()
     }
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         continueAfterFailure = false
         terminateStaleAppUnderTestInstances()
         app = XCUIApplication()
@@ -110,7 +111,7 @@ class CalyxUITestCase: XCTestCase {
         app.launch()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         restoreInputSource()
         app.terminate()
         if let dir = sessionTempDir {
@@ -125,12 +126,13 @@ class CalyxUITestCase: XCTestCase {
             // is harmless -- `suiteName` is a fresh UUID every run, so it
             // is never read by anything again, and this never touches the
             // real `com.calyx.terminal.e2e` domain.
-            Thread.sleep(forTimeInterval: 1.0)
+            // `try?`: a cancelled sleep only shortens the flush wait; cleanup below must still run.
+            try? await Task.sleep(for: .seconds(1))
             UserDefaults().removePersistentDomain(forName: suiteName)
             let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(suiteName).plist"
             try? FileManager.default.removeItem(atPath: suitePlistPath)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Helpers

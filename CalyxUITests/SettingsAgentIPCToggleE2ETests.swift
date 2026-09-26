@@ -49,7 +49,7 @@ final class SettingsAgentIPCToggleE2ETests: CalyxUITestCase {
     private var scopedPathRoot: String!
     private var defaultsSuiteName: String!
 
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
         let suffix = String(UUID().uuidString.prefix(8))
         scopedPathRoot = NSTemporaryDirectory() + "CalyxUITests-agentipc-\(suffix)"
@@ -62,7 +62,7 @@ final class SettingsAgentIPCToggleE2ETests: CalyxUITestCase {
         launchApp()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let scopedPathRoot {
             try? FileManager.default.removeItem(atPath: scopedPathRoot)
@@ -70,12 +70,13 @@ final class SettingsAgentIPCToggleE2ETests: CalyxUITestCase {
         if let defaultsSuiteName {
             // Best-effort only, mirroring SettingsSessionsToggleE2ETests's
             // own documented cfprefsd-flush caveat.
-            Thread.sleep(forTimeInterval: 1.0)
+            // `try?`: a cancelled sleep only shortens the flush wait; cleanup below must still run.
+            try? await Task.sleep(for: .seconds(1))
             UserDefaults().removePersistentDomain(forName: defaultsSuiteName)
             let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(defaultsSuiteName).plist"
             try? FileManager.default.removeItem(atPath: suitePlistPath)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Launch

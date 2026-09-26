@@ -72,9 +72,10 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
         ["-calyx.cockpit.agentHookApprovalEnabled", "YES", "--calyx-path-root=\(scopedPathRoot)", "-calyx.ipc.enabled", "YES"]
     }
 
-    override func tearDown() {
-        super.tearDown()
-        try? FileManager.default.removeItem(atPath: scopedPathRoot)
+    override func tearDown() async throws {
+        // `defer`: runs after super.tearDown() even if it throws.
+        defer { try? FileManager.default.removeItem(atPath: scopedPathRoot) }
+        try await super.tearDown()
     }
 
     /// Polls for the scoped `agent-endpoint.json`, mirroring

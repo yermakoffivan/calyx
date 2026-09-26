@@ -73,7 +73,7 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
     private var savedLSPAutoInstall: Bool?
     private var savedLSPRequireConfirmation: Bool?
 
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
         let homeSuffix = String(UUID().uuidString.prefix(8))
         let sessionSuffix = String(UUID().uuidString.prefix(8))
@@ -90,7 +90,7 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
         launchApp()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
@@ -101,7 +101,8 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
         if let defaultsSuiteName {
             // Best-effort only, mirroring SettingsSessionsToggleE2ETests's
             // own documented cfprefsd-flush caveat.
-            Thread.sleep(forTimeInterval: 1.0)
+            // `try?`: a cancelled sleep only shortens the flush wait; cleanup below must still run.
+            try? await Task.sleep(for: .seconds(1))
             UserDefaults().removePersistentDomain(forName: defaultsSuiteName)
             let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(defaultsSuiteName).plist"
             try? FileManager.default.removeItem(atPath: suitePlistPath)
@@ -125,7 +126,7 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
             Self.e2eStandardDefaults.removeObject(forKey: Self.lspRequireConfirmationKey)
         }
 
-        super.tearDown()
+        try await super.tearDown()
     }
 
     /// Deliberately NOT `additionalLaunchArguments`-based, mirroring

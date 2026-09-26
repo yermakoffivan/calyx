@@ -81,7 +81,7 @@ final class SessionRecoveryBarE2ETests: CalyxUITestCase {
     /// `sessions.recovery.json` into it first. Mirrors
     /// SessionPersistenceE2ETests.swift's identical reasoning for its
     /// own full setUp() override.
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
 
         sessionDir = NSTemporaryDirectory() + "CalyxUITests-recoverybar-\(UUID().uuidString)"
@@ -97,12 +97,12 @@ final class SessionRecoveryBarE2ETests: CalyxUITestCase {
         app.launch()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let sessionDir {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     /// Path `SessionPersistenceActor`'s `recoverySnapshotPath` resolves

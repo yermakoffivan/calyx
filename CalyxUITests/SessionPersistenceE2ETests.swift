@@ -101,7 +101,7 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     /// on `launchEnvironment` first. This re-implements the base
     /// class's launch, adding the two extra environment overrides this
     /// suite needs.
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
 
         // Short root REQUIRED: the daemon's socket lives at
@@ -127,7 +127,7 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         launchApp()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         // `app?.terminate()`, not `app!.terminate()`: this override's
         // setUp() has no early-bailout path today, but nothing in
         // XCTestCase's contract rules out a future setUp() failure
@@ -144,7 +144,7 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         if let sessionDir {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     /// Path to a pre-built `calyx-session` binary this test points

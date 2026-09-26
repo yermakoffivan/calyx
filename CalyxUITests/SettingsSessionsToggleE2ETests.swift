@@ -80,7 +80,7 @@ final class SettingsSessionsToggleE2ETests: CalyxUITestCase {
     /// domain, for the lifetime of this one test.
     private var defaultsSuiteName: String!
 
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
         let homeSuffix = String(UUID().uuidString.prefix(8))
         let sessionSuffix = String(UUID().uuidString.prefix(8))
@@ -92,7 +92,7 @@ final class SettingsSessionsToggleE2ETests: CalyxUITestCase {
         launchApp()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         app?.terminate()
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
@@ -115,12 +115,13 @@ final class SettingsSessionsToggleE2ETests: CalyxUITestCase {
             // `com.calyx.terminal.e2e` domain, which this suite never
             // writes to at all. Best-effort cleanup, not a correctness
             // requirement, same as the screenshot file write.
-            Thread.sleep(forTimeInterval: 1.0)
+            // `try?`: a cancelled sleep only shortens the flush wait; cleanup below must still run.
+            try? await Task.sleep(for: .seconds(1))
             UserDefaults().removePersistentDomain(forName: defaultsSuiteName)
             let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(defaultsSuiteName).plist"
             try? FileManager.default.removeItem(atPath: suitePlistPath)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     /// Deliberately NOT `additionalLaunchArguments`-based (see this
