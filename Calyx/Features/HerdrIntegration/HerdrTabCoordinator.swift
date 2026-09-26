@@ -619,7 +619,8 @@ final class HerdrTabCoordinator {
     /// and `pruneIfLastPaneClosed` removes once the workspace's last
     /// tracked pane closes). Adds no state of its own and sends herdr
     /// nothing. Backs the herdr workspace row's own "Attach"/"Show"
-    /// button label (`SessionBrowserModel.isHerdrWorkspaceAttachedHere(_:)`),
+    /// button label (`HerdrWorkspaceRow.isAttachedHere`, stored by
+    /// `SessionBrowserModel.refresh()` via `herdrWorkspaceIsAttachedHere`),
     /// the herdr counterpart of `SessionBrowserRow.isAttachedHere` for a
     /// calyx-session row.
     func hasOpenTab(workspaceID: String, socketPath: String) -> Bool {

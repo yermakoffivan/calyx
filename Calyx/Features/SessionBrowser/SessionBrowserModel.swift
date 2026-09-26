@@ -63,8 +63,9 @@ struct SessionBrowserRow: Identifiable, Equatable, Sendable {
 /// `SessionInfo`, so the herdr section has its own row type independent
 /// of whatever UI-only state `SessionBrowserRow` carries for
 /// calyx-session rows (`isOrphan`/`isAttachedHere` have no herdr
-/// equivalent -- herdr identity never enters `SessionSurfaceMap` by
-/// design).
+/// server-level equivalent -- herdr identity never enters
+/// `SessionSurfaceMap` by design; the herdr "attached here" flag lives
+/// per workspace instead, on `HerdrWorkspaceRow.isAttachedHere`).
 struct HerdrSessionRow: Identifiable, Equatable, Sendable {
     var id: String { info.id }
     let info: HerdrSessionInfo
@@ -123,9 +124,35 @@ struct HerdrSessionRow: Identifiable, Equatable, Sendable {
     /// order `session.snapshot` returned them
     /// (`HerdrSessionInfo.workspaces`'s own doc comment) --
     /// `HerdrWorkspaceRowView` nests these under this row in the session
-    /// browser.
-    var workspaces: [HerdrWorkspaceRow] {
-        info.workspaces.map { HerdrWorkspaceRow(socketPath: info.id, info: $0) }
+    /// browser. STORED (built once in `init`), not derived from `info` on
+    /// read, so each workspace's own `isAttachedHere` is part of this
+    /// row's `Equatable` value: flipping it makes `refresh()`'s
+    /// `herdrRows` reassignment unequal to the previous value, which is
+    /// what makes `@Observable` fire and the "Attach"/"Show" label
+    /// re-render.
+    let workspaces: [HerdrWorkspaceRow]
+
+    /// Every workspace row gets `isAttachedHere == false` -- for callers
+    /// with no herdr tab coordinator to ask (tests, and the Command
+    /// Palette's `attachTabTitle` path, which never reads `workspaces`).
+    init(info: HerdrSessionInfo) {
+        self.init(info: info, isAttachedHere: { _, _ in false })
+    }
+
+    /// Builds `workspaces` with each row's `isAttachedHere` answered by
+    /// `isAttachedHere(workspaceID, socketPath)` -- the shape of
+    /// `SessionBrowserModel.herdrWorkspaceIsAttachedHere`, which
+    /// `refresh()` passes straight through. Evaluated once, here, per
+    /// workspace; the result is stored on the row.
+    init(info: HerdrSessionInfo, isAttachedHere: (String, String) -> Bool) {
+        self.info = info
+        self.workspaces = info.workspaces.map { workspace in
+            HerdrWorkspaceRow(
+                socketPath: info.id,
+                info: workspace,
+                isAttachedHere: isAttachedHere(workspace.workspaceID, info.id)
+            )
+        }
     }
 }
 
@@ -139,6 +166,28 @@ struct HerdrSessionRow: Identifiable, Equatable, Sendable {
 struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
     let socketPath: String
     let info: HerdrWorkspaceInfo
+    /// `true` when this workspace currently has an open tab in this
+    /// window -- the herdr counterpart of `SessionBrowserRow
+    /// .isAttachedHere`. Stored on the row (answered once by
+    /// `SessionBrowserModel.herdrWorkspaceIsAttachedHere` inside
+    /// `refresh()`, via `HerdrSessionRow.init(info:isAttachedHere:)`)
+    /// rather than read from that closure at render time: the closure's
+    /// source (`HerdrTabCoordinator.activeTabIDs`) is not observable, so
+    /// only a change to this stored, `Equatable`-participating value
+    /// makes `@Observable` notice an Attach/close.
+    let isAttachedHere: Bool
+
+    init(socketPath: String, info: HerdrWorkspaceInfo, isAttachedHere: Bool) {
+        self.socketPath = socketPath
+        self.info = info
+        self.isAttachedHere = isAttachedHere
+    }
+
+    /// `isAttachedHere` defaults to `false` -- a workspace row built with
+    /// no herdr tab coordinator to ask.
+    init(socketPath: String, info: HerdrWorkspaceInfo) {
+        self.init(socketPath: socketPath, info: info, isAttachedHere: false)
+    }
 
     /// Combines `socketPath` with the workspace id: two different herdr
     /// servers can each report a workspace called e.g. "w1", so the
@@ -163,11 +212,10 @@ struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
     /// already-open workspace still calls the same open path
     /// (`HerdrTabCoordinator.openWorkspace`'s own double-open guard
     /// focuses the existing tab instead of opening a second), so the
-    /// label must read a focus verb instead. `isAttachedHere` is not
-    /// this row's own stored state -- see
-    /// `SessionBrowserModel.isHerdrWorkspaceAttachedHere(_:)` for where
-    /// it comes from.
-    func attachButtonLabel(isAttachedHere: Bool) -> String {
+    /// label must read a focus verb instead. Reads this row's own stored
+    /// `isAttachedHere` (see that property's doc comment for where it
+    /// comes from).
+    var attachButtonLabel: String {
         isAttachedHere ? "Show" : "Attach"
     }
 }
@@ -262,9 +310,10 @@ final class SessionBrowserModel {
     /// Reports whether a herdr workspace (workspace id, socket path)
     /// currently has an open tab in this window -- the herdr counterpart
     /// of `isAttachedHere` on a calyx-session row (`SessionBrowserRow`,
-    /// set in `refresh()` above from `surfaceMap`): backs
-    /// `HerdrWorkspaceRow.attachButtonLabel(isAttachedHere:)`'s own input
-    /// via `isHerdrWorkspaceAttachedHere(_:)` below. Injected the same
+    /// set in `refresh()` below from `surfaceMap`). `refresh()` evaluates
+    /// it once per workspace while building `herdrRows` and stores the
+    /// answer as `HerdrWorkspaceRow.isAttachedHere`, which backs that
+    /// row's `attachButtonLabel`. Injected the same
     /// way every other side-effectful dependency here is: a closure,
     /// default `{ _, _ in false }` so existing tests, and any
     /// construction with no herdr tab coordinator to ask, answer exactly
@@ -287,13 +336,28 @@ final class SessionBrowserModel {
     /// pattern.
     var onRemoteSessionRequested: ((SessionSpawnContext) -> Void)?
 
-    /// Guards against `refresh()`'s 1s
-    /// poll timer stacking an unbounded number of concurrent
-    /// `listAllBounded()` round-trips behind a slow/hung daemon. A
-    /// second `refresh()` issued while one is still in flight is a
-    /// no-op instead of starting its own overlapping daemon call; the
-    /// poll naturally backs off to the bound's own cadence instead.
+    /// Serializes `refresh()` so at most one `listAllBounded()`
+    /// round-trip is ever in flight -- the 1s poll timer must not stack
+    /// an unbounded number of concurrent round-trips behind a slow/hung
+    /// daemon. A `refresh()` issued while one is still in flight is NOT
+    /// dropped: it parks in `refreshWaiters` until the in-flight one
+    /// finishes, then runs its own full round-trip (its caller -- e.g.
+    /// `SessionBrowserWindowController` right after opening a herdr
+    /// workspace -- is owed a result that reflects state at or after
+    /// the time it asked, which the already-running refresh may have
+    /// sampled too early to see).
     private var isRefreshing = false
+
+    /// Continuations of `refresh()` calls parked while another refresh
+    /// is in flight. The finishing refresh resumes ALL of them at once;
+    /// each re-checks `isRefreshing` on wake, so exactly one proceeds
+    /// and the rest park again behind it.
+    ///
+    /// No deinit drain is needed: the model cannot be deallocated while
+    /// any caller is parked here, because the parked `refresh()` is an
+    /// instance method whose suspended frame retains `self`. So no
+    /// continuation in this array can ever be leaked by deinit.
+    private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Invoked by `attach(_:)` with the row to attach to. Actual
     /// surface/window creation is a `SessionBrowserWindowController` /
@@ -437,10 +501,37 @@ final class SessionBrowserModel {
     /// case a handful of sequential `oneShotRequestTimeout` expiries
     /// against a stalled server), so this bound is load-bearing, not
     /// future-proofing: it must never freeze this shared poll loop.
+    ///
+    /// Serialized, not deduplicated: see `isRefreshing`. The wait runs on
+    /// the caller's own task (no unstructured `Task`), so the
+    /// `Task.isCancelled` guards below still observe the caller's
+    /// cancellation.
     func refresh() async {
-        guard !isRefreshing else { return }
+        // Cancellation tradeoff: a parked caller is NOT woken early when
+        // its task is cancelled (`withCheckedContinuation` is not
+        // cancellation-aware). It wakes when the in-flight refresh
+        // finishes -- bounded by the daemon/herdr query time limits --
+        // and the `Task.isCancelled` guard below then returns without a
+        // round-trip. Chosen over `withTaskCancellationHandler`, whose
+        // `onCancel` runs outside this actor and would have to find and
+        // remove one specific continuation from `refreshWaiters` from
+        // there.
+        while isRefreshing {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                refreshWaiters.append(continuation)
+            }
+        }
+        // A caller cancelled while parked must not issue its own round-trip.
+        guard !Task.isCancelled else { return }
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            isRefreshing = false
+            let waiters = refreshWaiters
+            refreshWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
         let sessions = await daemonClient.listAllBounded()
         guard !Task.isCancelled else { return }
         rows = sessions.filter { $0.state == .running }.map { info in
@@ -459,7 +550,7 @@ final class SessionBrowserModel {
         }
         let herdrSessions = await boundedHerdrListSessions()
         guard !Task.isCancelled else { return }
-        herdrRows = herdrSessions.map { HerdrSessionRow(info: $0) }
+        herdrRows = herdrSessions.map { HerdrSessionRow(info: $0, isAttachedHere: herdrWorkspaceIsAttachedHere) }
     }
 
     /// Races `herdrProvider.listSessions()` against the shared
@@ -497,13 +588,6 @@ final class SessionBrowserModel {
     /// same injected-closure seam, just its own closure/row type.
     func attachHerdrWorkspace(_ row: HerdrWorkspaceRow) {
         onHerdrWorkspaceAttachRequested?(row)
-    }
-
-    /// Whether `row`'s workspace currently has an open tab in this
-    /// window -- see `herdrWorkspaceIsAttachedHere`'s own doc comment
-    /// for where the answer comes from.
-    func isHerdrWorkspaceAttachedHere(_ row: HerdrWorkspaceRow) -> Bool {
-        herdrWorkspaceIsAttachedHere(row.info.workspaceID, row.socketPath)
     }
 
     /// Kills `row`'s session via the daemon, then refreshes.

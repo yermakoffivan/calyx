@@ -133,10 +133,13 @@ final class SessionBrowserWindowController: NSWindowController {
     /// (a `workspace.create`, or opening the workspace it created) still
     /// logs exactly as it always has. A `herdrTabCoordinator` that is
     /// `nil` (herdr itself was never resolvable) does nothing, same as
-    /// today.
+    /// today. Refreshes `model` once the flow finishes so the new
+    /// workspace row -- and its "Show" label -- appears immediately
+    /// instead of at the next 1s poll.
     private func createHerdrWorkspace(_ row: HerdrSessionRow) {
         guard let coordinator = (NSApp.delegate as? AppDelegate)?.herdrTabCoordinator else { return }
         let socketPath = row.info.id
+        let model = self.model
 
         Task {
             await HerdrAttachOrCreateFlow.createAndOpen(
@@ -147,6 +150,7 @@ final class SessionBrowserWindowController: NSWindowController {
                     await coordinator.openWorkspace(workspaceID: workspaceID, socketPath: socketPath)
                 }
             )
+            await model.refresh()
         }
     }
 
@@ -157,11 +161,16 @@ final class SessionBrowserWindowController: NSWindowController {
     /// uses for a newly created one -- there is exactly one place that
     /// opens a workspace as a native Calyx tab. A `herdrTabCoordinator`
     /// that is `nil` (herdr itself was never resolvable) does nothing,
-    /// same as today.
+    /// same as today. Refreshes `model` once the open finishes so the
+    /// row's label flips to "Show" immediately instead of at the next 1s
+    /// poll (`HerdrTabCoordinator.activeTabIDs` is not observable; only
+    /// `refresh()` carries the new answer into `herdrRows`).
     private func attachHerdrWorkspace(_ row: HerdrWorkspaceRow) {
         guard let coordinator = (NSApp.delegate as? AppDelegate)?.herdrTabCoordinator else { return }
+        let model = self.model
         Task {
             await coordinator.openWorkspace(workspaceID: row.info.workspaceID, socketPath: row.socketPath)
+            await model.refresh()
         }
     }
 

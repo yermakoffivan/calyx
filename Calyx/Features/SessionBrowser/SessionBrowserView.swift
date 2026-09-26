@@ -119,11 +119,7 @@ struct SessionBrowserView: View {
             ForEach(model.herdrRows) { row in
                 HerdrSessionRowView(row: row, model: model)
                 ForEach(row.workspaces) { workspaceRow in
-                    HerdrWorkspaceRowView(
-                        row: workspaceRow,
-                        isAttachedHere: model.isHerdrWorkspaceAttachedHere(workspaceRow),
-                        model: model
-                    )
+                    HerdrWorkspaceRowView(row: workspaceRow, model: model)
                 }
             }
             .padding(.horizontal, Self.rowListHorizontalInset)
@@ -280,11 +276,11 @@ private struct HerdrSessionRowView: View {
 /// (`SessionBrowserModel.attachHerdrWorkspace(_:)`,
 /// `SessionBrowserWindowController.attachHerdrWorkspace(_:)`, which
 /// focuses the tab instead of opening a second one when it is already
-/// open), with its own label following `row.attachButtonLabel(
-/// isAttachedHere:)` -- "Show" once `isAttachedHere` (computed by the
-/// parent `herdrSection`, not this view, so it rides `herdrRows`' own
-/// per-poll reassignment rather than a stale value from a skipped
-/// re-render), unchanged "Attach" otherwise, mirroring
+/// open), with its own label following `row.attachButtonLabel` --
+/// "Show" once the row's own stored `isAttachedHere` is true (set by
+/// `SessionBrowserModel.refresh()`; because it is part of the row's
+/// `Equatable` value, a flip changes `herdrRows` and re-renders this
+/// view), unchanged "Attach" otherwise, mirroring
 /// `SessionBrowserRowView`'s own calyx-session button exactly; "Kill"
 /// sends `workspace.close` for it, then refreshes
 /// (`SessionBrowserModel.killHerdrWorkspace(_:)`), with no confirmation
@@ -292,7 +288,6 @@ private struct HerdrSessionRowView: View {
 /// button exactly.
 private struct HerdrWorkspaceRowView: View {
     let row: HerdrWorkspaceRow
-    let isAttachedHere: Bool
     let model: SessionBrowserModel
 
     var body: some View {
@@ -313,7 +308,7 @@ private struct HerdrWorkspaceRowView: View {
 
             Spacer()
 
-            Button(row.attachButtonLabel(isAttachedHere: isAttachedHere)) { model.attachHerdrWorkspace(row) }
+            Button(row.attachButtonLabel) { model.attachHerdrWorkspace(row) }
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier(AccessibilityID.SessionBrowser.herdrWorkspaceAttachButton(row.id))
             Button("Kill") { Task { await model.killHerdrWorkspace(row) } }

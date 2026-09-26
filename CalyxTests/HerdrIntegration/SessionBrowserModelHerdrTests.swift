@@ -84,6 +84,7 @@
 //    leaving it nameless
 //
 
+import Observation
 import XCTest
 @testable import Calyx
 
@@ -630,7 +631,35 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
         XCTAssertEqual(row.paneCountText, "2 pane(s)")
     }
 
-    // MARK: - HerdrWorkspaceRow.attachButtonLabel / SessionBrowserModel.isHerdrWorkspaceAttachedHere
+    /// TDD Red (Test 3, see task spec): `paneCountText` must disambiguate
+    /// WHICH workspace the pane count belongs to once more than one
+    /// workspace can appear in the browser at once, by prefixing the
+    /// workspace id whenever `displayLabel` differs from the bare id
+    /// (non-blank label) -- same " · " separator
+    /// `HerdrAttachGate.decide` already uses for its own workspace/pane
+    /// summary line, copied verbatim so a differing dot codepoint can
+    /// never cause a false Red here. When the label IS blank,
+    /// `displayLabel` already equals the workspace id, so prefixing it
+    /// again would just repeat the id -- that branch stays exactly
+    /// "N pane(s)", asserted in the same test function (not a separate
+    /// one) so this whole function is Red today: the non-blank-label
+    /// half fails on `HerdrWorkspaceRow(socketPath:info:)` returning the
+    /// current unprefixed "1 pane(s)" instead of "w2F · 1 pane(s)".
+    func test_paneCountText_prefixesWorkspaceIDWhenLabelIsNonBlank() {
+        let labeled = HerdrWorkspaceRow(
+            socketPath: "test-herdr-socket-1",
+            info: HerdrWorkspaceInfo(workspaceID: "w2F", activeTabID: "w2F:t1", label: "work", paneCount: 1)
+        )
+        XCTAssertEqual(labeled.paneCountText, "w2F · 1 pane(s)")
+
+        let unlabeled = HerdrWorkspaceRow(
+            socketPath: "test-herdr-socket-1",
+            info: HerdrWorkspaceInfo(workspaceID: "w2F", activeTabID: "w2F:t1", label: "   ", paneCount: 1)
+        )
+        XCTAssertEqual(unlabeled.paneCountText, "1 pane(s)")
+    }
+
+    // MARK: - HerdrWorkspaceRow.attachButtonLabel / SessionBrowserModel.herdrWorkspaceIsAttachedHere
     //
     // Mirrors SessionBrowserRowAttachButtonLabelTests' own coverage of
     // SessionBrowserRow.attachButtonLabel, for the herdr workspace row's
@@ -639,24 +668,34 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
     // otherwise -- pressing "Attach" on an already-open workspace still
     // calls the same open path (SessionBrowserWindowController
     // .attachHerdrWorkspace(_:)), which focuses the existing tab rather
-    // than opening a second one.
+    // than opening a second one. The injected herdrWorkspaceIsAttachedHere
+    // closure is evaluated by refresh() and stored on each workspace row,
+    // so these tests drive it through refresh().
 
-    private func makeHerdrWorkspaceRow() -> HerdrWorkspaceRow {
-        HerdrWorkspaceRow(
-            socketPath: "test-herdr-socket-1",
-            info: HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1)
-        )
+    /// One server ("test-herdr-socket-1") reporting one workspace ("w1").
+    private func makeOneWorkspaceProvider() -> FakeHerdrSessionProvider {
+        let provider = FakeHerdrSessionProvider()
+        provider.sessionsToReturn = [
+            HerdrSessionInfo(
+                id: "test-herdr-socket-1", name: "work", workspaceCount: 1, paneCount: 1, agentCount: 0,
+                workspaces: [
+                    HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1)
+                ]
+            )
+        ]
+        return provider
     }
 
-    func test_attachButtonLabel_whenIsHerdrWorkspaceAttachedHereAnswersTrue_isShow() {
+    func test_attachButtonLabel_whenIsHerdrWorkspaceAttachedHereAnswersTrue_isShow() async {
         let model = makeModel(
-            herdrProvider: FakeHerdrSessionProvider(), herdrAvailability: { false },
+            herdrProvider: makeOneWorkspaceProvider(), herdrAvailability: { true },
             herdrWorkspaceIsAttachedHere: { _, _ in true }
         )
-        let row = makeHerdrWorkspaceRow()
+
+        await model.refresh()
 
         XCTAssertEqual(
-            row.attachButtonLabel(isAttachedHere: model.isHerdrWorkspaceAttachedHere(row)), "Show",
+            model.herdrRows[0].workspaces[0].attachButtonLabel, "Show",
             "an already-open workspace's button must read a focus verb (\"Show\"), not \"Attach\""
         )
     }
@@ -665,15 +704,16 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
     /// `SessionBrowserRowAttachButtonLabelTests`' own precedent: passes
     /// already, but catches a future regression that over-broadens the
     /// label (e.g. always "Show").
-    func test_attachButtonLabel_whenIsHerdrWorkspaceAttachedHereAnswersFalse_isAttach() {
+    func test_attachButtonLabel_whenIsHerdrWorkspaceAttachedHereAnswersFalse_isAttach() async {
         let model = makeModel(
-            herdrProvider: FakeHerdrSessionProvider(), herdrAvailability: { false },
+            herdrProvider: makeOneWorkspaceProvider(), herdrAvailability: { true },
             herdrWorkspaceIsAttachedHere: { _, _ in false }
         )
-        let row = makeHerdrWorkspaceRow()
+
+        await model.refresh()
 
         XCTAssertEqual(
-            row.attachButtonLabel(isAttachedHere: model.isHerdrWorkspaceAttachedHere(row)), "Attach",
+            model.herdrRows[0].workspaces[0].attachButtonLabel, "Attach",
             "a not-yet-open workspace's button must keep reading \"Attach\""
         )
     }
@@ -682,29 +722,31 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
     /// supplied at all): must answer exactly like an unopened workspace,
     /// so every construction with no herdr tab coordinator to ask
     /// behaves exactly like today.
-    func test_isHerdrWorkspaceAttachedHere_defaultAnswersFalse() {
+    func test_isHerdrWorkspaceAttachedHere_defaultAnswersFalse() async {
         let model = SessionBrowserModel(
             daemonClient: FakeDaemonClient(), surfaceMap: SessionSurfaceMap(),
-            herdrProvider: FakeHerdrSessionProvider(), herdrAvailability: { false }
+            herdrProvider: makeOneWorkspaceProvider(), herdrAvailability: { true }
         )
 
-        XCTAssertFalse(model.isHerdrWorkspaceAttachedHere(makeHerdrWorkspaceRow()))
+        await model.refresh()
+
+        XCTAssertFalse(model.herdrRows[0].workspaces[0].isAttachedHere)
     }
 
     /// Kills swapped-argument/wrong-field bugs the two boolean tests
     /// above cannot see: the injected closure must receive EXACTLY the
     /// row's own workspace id and socket path, in that order.
-    func test_isHerdrWorkspaceAttachedHere_passesWorkspaceIDAndSocketPath_inOrder() {
+    func test_isHerdrWorkspaceAttachedHere_passesWorkspaceIDAndSocketPath_inOrder() async {
         var received: (workspaceID: String, socketPath: String)?
         let model = makeModel(
-            herdrProvider: FakeHerdrSessionProvider(), herdrAvailability: { false },
+            herdrProvider: makeOneWorkspaceProvider(), herdrAvailability: { true },
             herdrWorkspaceIsAttachedHere: { workspaceID, socketPath in
                 received = (workspaceID: workspaceID, socketPath: socketPath)
                 return false
             }
         )
 
-        _ = model.isHerdrWorkspaceAttachedHere(makeHerdrWorkspaceRow())
+        await model.refresh()
 
         XCTAssertEqual(received?.workspaceID, "w1")
         XCTAssertEqual(received?.socketPath, "test-herdr-socket-1")
@@ -830,6 +872,101 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
             "false -- this is exactly the herdr-rows-but-zero-calyx-rows case where the empty ScrollView " +
             "still renders (SessionBrowserView's friendly emptyState only shows when no sibling section " +
             "is visible either), and a header must never sit above zero rows"
+        )
+    }
+
+    // MARK: - TDD Red (Test 1, see task spec): HerdrWorkspaceRow carries its own
+    // isAttachedHere, and refresh() must produce an OBSERVABLE change when it
+    // flips, even though HerdrWorkspaceRow/HerdrSessionRow are Equatable and
+    // @Observable does not fire for a reassignment that is `==` to the old
+    // value. Today `isAttachedHere` is not a stored property on
+    // `HerdrWorkspaceRow` at all -- the caller reads it via
+    // `SessionBrowserModel.isHerdrWorkspaceAttachedHere(_:)` instead -- so this
+    // test fails to COMPILE (expected failure kind for this test: two unknown
+    // members, `HerdrWorkspaceRow.isAttachedHere` and the zero-argument
+    // `HerdrWorkspaceRow.attachButtonLabel`, plus `attachButtonLabel` no
+    // longer matching the one-argument `attachButtonLabel(isAttachedHere:)`
+    // that exists today).
+
+    /// `withObservationTracking`'s `onChange` closure is `@Sendable`; this
+    /// class's own `@MainActor` isolation cannot be relied on inside it, so
+    /// `fired` is a lock-guarded `@unchecked Sendable` box (mirrors
+    /// `SuspendingCountingDaemonClient`'s own `NSLock`-guarded counter in
+    /// `SessionBrowserModelRefreshDedupeTests.swift`) rather than a
+    /// `@MainActor`-isolated var.
+    private final class ObservationFiredBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _fired = false
+        var fired: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return _fired
+        }
+        func markFired() {
+            lock.lock(); defer { lock.unlock() }
+            _fired = true
+        }
+    }
+
+    /// Plain (non-Sendable) box the injected `herdrWorkspaceIsAttachedHere`
+    /// closure reads -- mirrors this file's existing `received`-capture
+    /// precedent above (`test_isHerdrWorkspaceAttachedHere_passesWorkspaceIDAndSocketPath_inOrder`);
+    /// no isolation crossing, since the closure itself runs on the main
+    /// actor inside `refresh()`.
+    private final class AttachedBox {
+        var attached = false
+    }
+
+    func test_herdrWorkspaceRow_isAttachedHere_isStoredAndObservablyChanges() async {
+        let box = AttachedBox()
+        let provider = FakeHerdrSessionProvider()
+        provider.sessionsToReturn = [
+            HerdrSessionInfo(
+                id: "test-herdr-socket-1", name: "work", workspaceCount: 1, paneCount: 1, agentCount: 0,
+                workspaces: [
+                    HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "work", paneCount: 1)
+                ]
+            )
+        ]
+        let model = makeModel(
+            herdrProvider: provider, herdrAvailability: { true },
+            herdrWorkspaceIsAttachedHere: { _, _ in box.attached }
+        )
+
+        await model.refresh()
+
+        XCTAssertEqual(
+            model.herdrRows[0].workspaces[0].isAttachedHere, false,
+            "before HerdrTabCoordinator has this workspace open, the row's own isAttachedHere must be false"
+        )
+        XCTAssertEqual(
+            model.herdrRows[0].workspaces[0].attachButtonLabel, "Attach",
+            "the zero-argument attachButtonLabel must read the row's own stored isAttachedHere"
+        )
+
+        let firedBox = ObservationFiredBox()
+        withObservationTracking(
+            { _ = model.herdrRows },
+            onChange: { firedBox.markFired() }
+        )
+
+        box.attached = true
+        await model.refresh()
+
+        XCTAssertTrue(
+            firedBox.fired,
+            "flipping isAttachedHere on an otherwise-identical workspace must fire @Observable's own " +
+            "change notification -- Equatable reassignment-to-an-equal-value does NOT fire it, so " +
+            "isAttachedHere must live on the row itself, not be derived from an external closure at " +
+            "read time"
+        )
+        XCTAssertEqual(
+            model.herdrRows[0].workspaces[0].isAttachedHere, true,
+            "after refresh() re-evaluates herdrWorkspaceIsAttachedHere, the row's own isAttachedHere " +
+            "must reflect the new answer"
+        )
+        XCTAssertEqual(
+            model.herdrRows[0].workspaces[0].attachButtonLabel, "Show",
+            "once isAttachedHere is true, the zero-argument attachButtonLabel must read \"Show\""
         )
     }
 }
