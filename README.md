@@ -249,6 +249,8 @@ xcodegen generate
 xcodebuild -project Calyx.xcodeproj -scheme Calyx -configuration Debug build
 ```
 
+Debug builds are signed with the maintainer's Developer ID. If you don't have that certificate, append `CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=` to the `xcodebuild` command to override it.
+
 ## Architecture
 
 Calyx uses AppKit for window, tab, and focus management with SwiftUI for view rendering, bridged via `NSHostingView`.
