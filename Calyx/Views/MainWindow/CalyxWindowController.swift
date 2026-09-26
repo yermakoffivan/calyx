@@ -4595,9 +4595,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         processToggleSplitZoom(surfaceView: surfaceView)
     }
 
+    /// Ownership is resolved with `findTab(for:)`, not
+    /// `belongsToThisWindow(_:)`: `SplitContainerView` detaches the
+    /// SurfaceViews of non-active tabs from the window hierarchy, so a
+    /// background tab's surface has `window == nil` and a
+    /// `view.window === self.window` check would silently drop its title change,
+    /// leaving the background tab's title stale. The owning tab (not
+    /// `activeTab`) gets the title when the surface is its focused leaf;
+    /// the window title is only touched when that tab is the active one.
+    /// Same rule as the "Destination resolution" comment above.
     @objc private func handleSetTitleNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
+        guard let (tab, _) = findTab(for: surfaceView) else { return }
         guard let title = notification.userInfo?["title"] as? String else { return }
 
         // Feed the title-heuristic fallback for every pane's title change,
@@ -4616,13 +4625,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             AgentRegistry.shared.handleTitleChange(surfaceID: surfaceID, title: title)
         }
 
-        guard let tab = activeTab else { return }
-
         if let focusedID = tab.splitTree.focusedLeafID,
            let focusedView = tab.registry.view(for: focusedID),
            focusedView === surfaceView {
             tab.title = title
-            window?.title = tab.titleOverride ?? title
+            if tab === activeTab {
+                window?.title = tab.titleOverride ?? title
+            }
             refreshHostingView()
         }
     }
@@ -4632,9 +4641,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// fallback for every pane, not just the tab's focused surface,
     /// mirroring `handleSetTitleNotification`'s title-heuristic feed
     /// above.
+    ///
+    /// Ownership is resolved with `findTab(for:)`, not
+    /// `belongsToThisWindow(_:)`: `SplitContainerView` detaches the
+    /// SurfaceViews of non-active tabs from the window hierarchy, so a
+    /// background tab's surface has `window == nil` and a
+    /// `view.window === self.window` check would silently drop its progress
+    /// report, so a background tab's agent state would never update.
+    /// Same rule as the "Destination resolution" comment above.
     @objc private func handleProgressReportNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
+        guard findTab(for: surfaceView) != nil else { return }
         guard let isActive = notification.userInfo?["active"] as? Bool else { return }
         guard let surfaceID = surfaceView.surfaceController?.id else { return }
 
@@ -4662,9 +4679,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// Ownership is resolved with `findTab(for:)`, not
+    /// `belongsToThisWindow(_:)`: `SplitContainerView` detaches the
+    /// SurfaceViews of non-active tabs from the window hierarchy, so a
+    /// background tab's surface has `window == nil` and a
+    /// `view.window === self.window` check would silently drop its pwd change,
+    /// leaving the background tab's saved directory stale.
+    /// Same rule as the "Destination resolution" comment above.
     @objc private func handleSetPwdNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
         guard let pwd = notification.userInfo?["pwd"] as? String else { return }
         guard let (owningTab, _) = findTab(for: surfaceView) else { return }
         let changed = owningTab.pwd != pwd
@@ -4698,9 +4721,22 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// Ownership is resolved with `findTab(for:)`, not
+    /// `belongsToThisWindow(_:)`: `SplitContainerView` detaches the
+    /// SurfaceViews of non-active tabs from the window hierarchy, so a
+    /// background tab's surface has `window == nil` and a
+    /// `view.window === self.window` check would silently drop its clipboard
+    /// confirmation request, leaving the paste pending forever.
+    /// Same rule as the "Destination resolution" comment above.
+    ///
+    /// Because the requesting surface may belong to a background tab, the
+    /// owning tab is switched to (and the surface made first responder, as
+    /// `handleFocusSurfaceNotification` does) before the sheet is presented,
+    /// so the sheet appears over the pane that made the request rather than
+    /// over an unrelated tab's content.
     @objc private func handleConfirmClipboardNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
+        guard let (owningTab, _) = findTab(for: surfaceView) else { return }
         guard let userInfo = notification.userInfo else { return }
         guard let contents = userInfo["contents"] as? String else { return }
         guard let surface = userInfo["surface"] as? ghostty_surface_t else { return }
@@ -4723,6 +4759,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: state, confirmed: true)
             }
             return
+        }
+        if owningTab.id != activeTab?.id {
+            switchToTab(id: owningTab.id)
+            parentWindow.makeFirstResponder(surfaceView)
         }
         parentWindow.beginSheet(sheet) { [weak self] _ in
             self?.clipboardConfirmationController = nil

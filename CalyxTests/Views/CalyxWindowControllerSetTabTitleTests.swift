@@ -169,4 +169,132 @@ final class CalyxWindowControllerSetTabTitleTests: XCTestCase {
             "Posting .ghosttySetTabTitle for a surface no window owns must not change any tab's titleOverride"
         )
     }
+
+    // MARK: - Background-tab (detached) surfaces
+
+    /// `SplitContainerView` detaches non-active tabs' SurfaceViews from the
+    /// window, so their `view.window` is nil. The fixture surface is in no
+    /// window -- that state. An OSC 0/2 title for the tab's focused leaf
+    /// must still set `tab.title`; a `view.window === self.window`
+    /// ownership guard silently drops it.
+    func test_setTitleNotification_forSurfaceDetachedFromWindow_isStillHandled() {
+        let fixture = makeSurfaceOwningFixture()
+        XCTAssertNil(fixture.surfaceView.window,
+                     "Precondition: the fixture surface must be detached from any window (background-tab state)")
+        XCTAssertNotEqual(fixture.tab.title, "Detached Title", "Precondition: tab title differs from the posted one")
+
+        NotificationCenter.default.post(
+            name: .ghosttySetTitle,
+            object: fixture.surfaceView,
+            userInfo: ["title": "Detached Title"]
+        )
+
+        XCTAssertEqual(fixture.tab.title, "Detached Title",
+                       ".ghosttySetTitle for a surface owned by this window's tab (but detached from the window) " +
+                       "must still update that tab's title")
+    }
+
+    /// Same detached state for OSC 7: `.ghosttySetPwd` must still update
+    /// the owning tab's `pwd`.
+    func test_setPwdNotification_forSurfaceDetachedFromWindow_isStillHandled() {
+        let fixture = makeSurfaceOwningFixture()
+        XCTAssertNil(fixture.surfaceView.window,
+                     "Precondition: the fixture surface must be detached from any window (background-tab state)")
+        XCTAssertNotEqual(fixture.tab.pwd, "/Users/dev/detached-pwd", "Precondition: tab pwd differs from the posted one")
+
+        NotificationCenter.default.post(
+            name: .ghosttySetPwd,
+            object: fixture.surfaceView,
+            userInfo: ["pwd": "/Users/dev/detached-pwd"]
+        )
+
+        XCTAssertEqual(fixture.tab.pwd, "/Users/dev/detached-pwd",
+                       ".ghosttySetPwd for a surface owned by this window's tab (but detached from the window) " +
+                       "must still update that tab's pwd")
+    }
+
+    // MARK: - Window title vs. background tab
+
+    private struct TwoTabFixture {
+        let controller: CalyxWindowController
+        let window: CalyxWindow
+        let activeTab: Tab
+        let activeSurface: SurfaceView
+        let backgroundTab: Tab
+        let backgroundSurface: SurfaceView
+    }
+
+    /// Two tabs in one group, each owning its own registry-backed surface;
+    /// `activeTabID` is the FIRST tab, so the second is a background tab.
+    private func makeTwoTabFixture() -> TwoTabFixture {
+        let activeRegistry = SurfaceRegistry()
+        let activeLeafID = UUID()
+        let activeSurface = SurfaceView(frame: .zero)
+        activeRegistry._testInsert(view: activeSurface, id: activeLeafID)
+        let activeTab = Tab(splitTree: SplitTree(leafID: activeLeafID), registry: activeRegistry)
+
+        let bgRegistry = SurfaceRegistry()
+        let bgLeafID = UUID()
+        let bgSurface = SurfaceView(frame: .zero)
+        bgRegistry._testInsert(view: bgSurface, id: bgLeafID)
+        let bgTab = Tab(splitTree: SplitTree(leafID: bgLeafID), registry: bgRegistry)
+
+        let group = TabGroup(name: "Default", tabs: [activeTab, bgTab], activeTabID: activeTab.id)
+        let session = WindowSession(groups: [group], activeGroupID: group.id)
+        let window = CalyxWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
+        return TwoTabFixture(controller: controller, window: window, activeTab: activeTab,
+                             activeSurface: activeSurface, backgroundTab: bgTab, backgroundSurface: bgSurface)
+    }
+
+    /// A title for a background tab's focused surface must update that
+    /// tab's `title` but must NOT overwrite the window title (which belongs
+    /// to the active tab).
+    func test_setTitleNotification_forBackgroundTab_updatesThatTabTitleButNotWindowTitle() {
+        let fixture = makeTwoTabFixture()
+        XCTAssertTrue(fixture.controller.window === fixture.window, "Precondition: controller owns the fixture window")
+        fixture.window.title = "Sentinel Window Title"
+        let activeTitleBefore = fixture.activeTab.title
+        XCTAssertNotEqual(activeTitleBefore, "BG Title", "Precondition")
+
+        NotificationCenter.default.post(
+            name: .ghosttySetTitle,
+            object: fixture.backgroundSurface,
+            userInfo: ["title": "BG Title"]
+        )
+
+        XCTAssertEqual(fixture.backgroundTab.title, "BG Title",
+                       "Background tab's title must be updated")
+        XCTAssertEqual(fixture.activeTab.title, activeTitleBefore,
+                       "Active tab's title must be unchanged")
+        XCTAssertEqual(fixture.window.title, "Sentinel Window Title",
+                       "A background tab's title change must not overwrite the window title")
+    }
+
+    /// A title for the active tab's focused surface updates both the tab
+    /// title and the window title (no titleOverride set).
+    func test_setTitleNotification_forActiveTab_updatesWindowTitle() {
+        let fixture = makeTwoTabFixture()
+        XCTAssertTrue(fixture.controller.window === fixture.window, "Precondition: controller owns the fixture window")
+        XCTAssertNil(fixture.activeTab.titleOverride, "Precondition: no titleOverride")
+        fixture.window.title = "Sentinel Window Title"
+        let bgTitleBefore = fixture.backgroundTab.title
+
+        NotificationCenter.default.post(
+            name: .ghosttySetTitle,
+            object: fixture.activeSurface,
+            userInfo: ["title": "FG Title"]
+        )
+
+        XCTAssertEqual(fixture.activeTab.title, "FG Title")
+        XCTAssertEqual(fixture.window.title, "FG Title",
+                       "The active tab's title change must update the window title")
+        XCTAssertEqual(fixture.backgroundTab.title, bgTitleBefore,
+                       "Background tab's title must be unchanged")
+    }
 }
