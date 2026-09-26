@@ -251,14 +251,16 @@ struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
 
     /// "N pane(s)" -- this row's own pane count only, same `"pane(s)"`
     /// vocabulary as the server row's own status line -- prefixed with
-    /// the workspace id ("<id> · N pane(s)") whenever `displayLabel`
-    /// shows a non-blank label rather than the id itself. herdr 0.8
-    /// replaces the last closed workspace with a new one under the same
-    /// label, so the id is what distinguishes them. When the label is
-    /// blank, `displayLabel` already is the id, so it is not repeated.
+    /// the workspace id ("<id> · N pane(s)") whenever the label is
+    /// non-blank after trimming whitespace -- the same rule
+    /// `HerdrTabTitlePolicy` (and so `displayLabel`) uses -- even when
+    /// that label happens to equal the id. herdr 0.8 replaces the last
+    /// closed workspace with a new one under the same label, so the id
+    /// is what distinguishes them. When the label is nil or blank,
+    /// `displayLabel` already is the id, so it is not repeated.
     var paneCountText: String {
         let count = "\(info.paneCount) pane(s)"
-        guard displayLabel != info.workspaceID else { return count }
+        guard HerdrTabTitlePolicy.hasNonBlankLabel(info.label) else { return count }
         return "\(info.workspaceID) · \(count)"
     }
 
@@ -317,7 +319,8 @@ final class SessionBrowserModel {
     /// `.failed` -- `kill(_:)` has no confirmation dialog, so this is
     /// the only user-visible signal that a Kill the daemon rejected did
     /// nothing. Cleared for a row when a later `kill(_:)` of it reports
-    /// `.killed`.
+    /// `.killed`, and pruned by every `refresh()` that assigns `rows`
+    /// to the ids still present in the refreshed `rows`.
     private(set) var killFailures: [String: String] = [:]
 
     /// Populated by `refresh()` from the injected `herdrProvider`, gated
@@ -639,6 +642,8 @@ final class SessionBrowserModel {
                 isAttachedHere: isAttached
             )
         }
+        let rowIDs = Set(rows.map(\.id))
+        killFailures = killFailures.filter { rowIDs.contains($0.key) }
 
         guard await herdrAvailability() else {
             guard !Task.isCancelled else { return }

@@ -681,6 +681,19 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
         XCTAssertEqual(unlabeled.paneCountText, "1 pane(s)")
     }
 
+    /// The id prefix is keyed on the label being non-blank after
+    /// trimming, NOT on `displayLabel != workspaceID`: a user who
+    /// deliberately labels workspace "w2F" as "w2F" still gets the
+    /// prefix, so two rows sharing that label stay distinguishable.
+    func test_paneCountText_prefixesWorkspaceIDEvenWhenLabelEqualsTheID() {
+        let row = HerdrWorkspaceRow(
+            socketPath: "test-herdr-socket-1",
+            info: HerdrWorkspaceInfo(workspaceID: "w2F", activeTabID: "w2F:t1", label: "w2F", paneCount: 1)
+        )
+        XCTAssertEqual(row.paneCountText, "w2F · 1 pane(s)",
+                       "a non-blank label equal to the id must still get the workspace-id prefix")
+    }
+
     // MARK: - HerdrWorkspaceRow.attachButtonLabel / SessionBrowserModel.herdrWorkspaceIsAttachedHere
     //
     // Mirrors SessionBrowserRowAttachButtonLabelTests' own coverage of

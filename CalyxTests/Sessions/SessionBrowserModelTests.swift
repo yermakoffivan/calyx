@@ -260,4 +260,35 @@ final class SessionBrowserModelTests: XCTestCase {
             "a later .killed outcome for the same row must clear its prior killFailures entry"
         )
     }
+
+    // MARK: - refresh() prunes killFailures to rows still present
+
+    /// A failure entry for a row that leaves `rows` for any reason
+    /// (session exited on its own, ledger reconciliation) must be
+    /// dropped by the next refresh(); an entry for a row that is still
+    /// listed must survive it.
+    func test_refresh_prunesKillFailures_forRowsThatDisappeared() async throws {
+        daemonClient.sessionsToReturn = [
+            makeInfo(id: "session-gone", state: .running),
+            makeInfo(id: "session-stays", state: .running),
+        ]
+        await model.refresh()
+        let gone = try XCTUnwrap(model.rows.first { $0.id == "session-gone" })
+        let stays = try XCTUnwrap(model.rows.first { $0.id == "session-stays" })
+
+        daemonClient.killOutcome = .failed(message: "gone failed")
+        await model.kill(gone)
+        daemonClient.killOutcome = .failed(message: "stays failed")
+        await model.kill(stays)
+        XCTAssertEqual(model.killFailures[gone.id], "gone failed", "precondition")
+        XCTAssertEqual(model.killFailures[stays.id], "stays failed", "precondition")
+
+        daemonClient.sessionsToReturn = [makeInfo(id: "session-stays", state: .running)]
+        await model.refresh()
+
+        XCTAssertNil(model.killFailures[gone.id],
+                     "refresh() must prune killFailures entries for rows no longer present")
+        XCTAssertEqual(model.killFailures[stays.id], "stays failed",
+                       "refresh() must keep killFailures entries for rows still present")
+    }
 }

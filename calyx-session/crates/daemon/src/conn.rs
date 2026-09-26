@@ -602,6 +602,13 @@ impl Conn {
         //       still unregistered: nothing owns it, so only then flip
         //       it to `Exited{-1}`, persist, and reply `KillOk`.
         let deadline = Instant::now() + KILL_WAIT;
+        // `killpg` is sent at most once per Kill request. That is
+        // sufficient because session ids are ULIDs generated once per
+        // session and never reused: an entry for `id` that vanishes and
+        // reappears within this wait window can only be the same session
+        // (e.g. re-registered by handoff adoption, handled by the reconcile
+        // at the top of each iteration), never
+        // a different process that would otherwise go unsignalled.
         let mut signalled = false;
         loop {
             crate::handoff::reconcile_adopted_ghost(&self.shared, id);

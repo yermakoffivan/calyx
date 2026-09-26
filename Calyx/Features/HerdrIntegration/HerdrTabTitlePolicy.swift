@@ -26,9 +26,16 @@ enum HerdrTabTitlePolicy {
     /// itself, unmodified (never the trimmed copy). `nil`, or blank
     /// after trimming, -> `workspaceID`, so a tab always has a name.
     static func title(label: String?, workspaceID: String) -> String {
-        guard let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard let label, hasNonBlankLabel(label) else {
             return workspaceID
         }
         return label
+    }
+
+    /// The blank rule `title(label:workspaceID:)` uses: `label` present
+    /// and non-blank after trimming whitespace and newlines.
+    static func hasNonBlankLabel(_ label: String?) -> Bool {
+        guard let label else { return false }
+        return !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
