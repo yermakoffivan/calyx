@@ -23,14 +23,20 @@
 //  quick coordinator path" this test needs, using the coordinator's own
 //  already-documented no-op gate rather than a new injection seam.
 //
-//  Drives `processChildExited(surfaceView:)` directly rather than
-//  posting the real `.ghosttyShowChildExited` notification: that method
-//  is not `private` (mirroring
+//  The task-registry assertions drive `processChildExited(surfaceView:)`
+//  directly rather than posting the real `.ghosttyShowChildExited`
+//  notification: that method is not `private` (mirroring
 //  `handleSessionReconnectDecision`'s own precedent, see its doc
-//  comment) specifically so this test can do so without also having to
-//  attach the fixture's `SurfaceView` into the real window's view
-//  hierarchy to satisfy `handleShowChildExitedNotification`'s
-//  `belongsToThisWindow` guard.
+//  comment) so these tests can observe `childExitedTasks` without also
+//  exercising the notification handler.
+//
+//  The handler's own ownership resolution is covered separately by
+//  `test_showChildExitedNotification_forSurfaceDetachedFromWindow_
+//  stillReachesProcessChildExited`, which posts the real notification.
+//  `handleShowChildExitedNotification` resolves ownership through
+//  `findTab(for:)` (i.e. via `windowSession`), not the surface's view
+//  hierarchy, so a fixture `SurfaceView` detached from any window -- the
+//  same state as a surface in a background tab -- still qualifies.
 //
 
 import XCTest
@@ -92,5 +98,35 @@ final class CalyxWindowControllerChildExitedTasksTests: XCTestCase {
         XCTAssertNil(fixture.controller._childExitedTasksForTesting[fixture.leafID],
                     "childExitedTasks must self-remove its entry once the Task completes, mirroring " +
                     "expandTasks' pattern -- otherwise a completed entry is retained forever")
+    }
+
+    // MARK: - Notification post ("Tactic A")
+
+    /// Background tabs' SurfaceViews are removed from the window hierarchy
+    /// by `SplitContainerView`, so their `view.window` is nil. The fixture's
+    /// `surfaceView` is likewise in no window -- exactly that state. Posting
+    /// the real `.ghosttyShowChildExited` notification must still reach
+    /// `processChildExited` (observable as a `childExitedTasks` entry keyed
+    /// by the surface's leaf id); a `view.window === self.window` ownership
+    /// guard silently drops it, so the background pane never closes.
+    func test_showChildExitedNotification_forSurfaceDetachedFromWindow_stillReachesProcessChildExited() async {
+        let fixture = makeOrdinaryPaneFixture()
+        XCTAssertNil(fixture.surfaceView.window,
+                     "Precondition: the fixture surface must be detached from any window (background-tab state)")
+        XCTAssertNil(fixture.controller._childExitedTasksForTesting[fixture.leafID],
+                     "Precondition: no childExitedTasks entry before the notification")
+
+        NotificationCenter.default.post(Notification(
+            name: .ghosttyShowChildExited,
+            object: fixture.surfaceView,
+            userInfo: ["exit_code": Int32(0), "runtime_ms": UInt64(15000)]
+        ))
+
+        let task = fixture.controller._childExitedTasksForTesting[fixture.leafID]
+        XCTAssertNotNil(task,
+                        "A .ghosttyShowChildExited notification for a surface owned by one of this window's " +
+                        "tabs (but detached from the window, as background tabs are) must reach " +
+                        "processChildExited and insert a childExitedTasks entry")
+        await task?.value
     }
 }

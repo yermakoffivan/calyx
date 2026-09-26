@@ -146,6 +146,40 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         })
     }
 
+    /// Accessibility identifiers (`calyx.sidebar.tab.<UUID>`) of every
+    /// sidebar tab row currently shown, excluding each row's own
+    /// `.closeButton` child. Identifier-based (not title-based like
+    /// `sidebarTabTitles()`), because two tabs sharing one cwd share one
+    /// title, which a title Set would collapse.
+    private func sidebarTabRowIdentifiers() -> Set<String> {
+        let rows = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@ AND NOT identifier ENDSWITH %@", "calyx.sidebar.tab.", ".closeButton"))
+        // Zero matches (sidebar not yet rendered) must yield [] rather than
+        // resolving an element that no longer matches, which XCUITest
+        // reports as a hard "Failed to get matching snapshot" error.
+        guard rows.count > 0 else { return [] }
+        return Set(rows.allElementsBoundByIndex.filter { $0.exists }.map { $0.identifier })
+    }
+
+    /// The first sidebar tab row (any `calyx.sidebar.tab.<UUID>` element
+    /// other than a `.closeButton`), for `waitFor`-style setup waits.
+    private var firstSidebarTabRow: XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@ AND NOT identifier ENDSWITH %@", "calyx.sidebar.tab.", ".closeButton"))
+            .firstMatch
+    }
+
+    /// Polls `sidebarTabRowIdentifiers()` once per second (up to
+    /// `timeout` seconds) until `isDone` accepts it; returns the last read.
+    private func pollSidebarTabRowIdentifiers(timeout: Int, until isDone: (Set<String>) -> Bool) -> Set<String> {
+        var ids = sidebarTabRowIdentifiers()
+        for _ in 0..<timeout where !isDone(ids) {
+            Thread.sleep(forTimeInterval: 1)
+            ids = sidebarTabRowIdentifiers()
+        }
+        return ids
+    }
+
     /// Opens the session browser via the View menu's "Session Browser"
     /// item (added in the same UX round as the attach-as-tab fix). This
     /// deliberately does NOT go through the command palette: the plain
@@ -360,6 +394,15 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // already, so its row is definitely live.
         let mainWindowCountBeforeAttach = countMainWindows()
         let sidebarTitlesBeforeAttach = sidebarTabTitles()
+        // Session A's own tab: the only sidebar row present before the
+        // attach adds B's tab. Captured by identifier so the post-Kill
+        // assertion below can name exactly this row.
+        let sidebarRowIDsBeforeAttach = sidebarTabRowIdentifiers()
+        XCTAssertEqual(
+            sidebarRowIDsBeforeAttach.count, 1,
+            "Expected exactly one sidebar tab row (session A's) before attaching B; got \(sidebarRowIDsBeforeAttach)."
+        )
+        let sessionATabRowID = sidebarRowIDsBeforeAttach.first ?? "<none>"
 
         // Attach B: row-scoped lookup via its own accessibility
         // identifier (AccessibilityID.SessionBrowser.attachButton),
@@ -481,5 +524,179 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // on SessionBrowserView's 1s `.task` poll -- give it a couple
         // of cycles before asserting the row is gone.
         waitForNonExistence(rowAText, timeout: 8)
+
+        // D2: killing A must also close A's TAB. A's tab is in the
+        // BACKGROUND here (attaching B made B's tab active), so its
+        // SurfaceView is detached from the window hierarchy by
+        // SplitContainerView; the show_child_exited notification for
+        // A's pane must still reach processChildExited -> .closePane.
+        let rowIDsAfterKill = pollSidebarTabRowIdentifiers(timeout: 10) { !$0.contains(sessionATabRowID) }
+        XCTAssertFalse(
+            rowIDsAfterKill.contains(sessionATabRowID),
+            "killed session's background tab must close: session A (\(sessionAID)) was killed " +
+            "from the Session Browser and is Exited in the ledger, but its tab " +
+            "(\(sessionATabRowID)) is still in the sidebar ~10s later. Rows: \(rowIDsAfterKill)"
+        )
+    }
+
+    /// D2 (active-tab variant): from the initial single-tab window, open
+    /// a second tab (File > New Tab), which stays the ACTIVE tab; kill
+    /// its session from the Session Browser and assert that tab closes,
+    /// leaving exactly one tab.
+    func test_sessionBrowser_killActiveTabSession_closesThatTab() {
+        XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after launch.")
+
+        let initialPoll = ledger.poll(
+            timeoutAttempts: 15, sleepInterval: 2,
+            transform: { sessions in sessions.filter(self.ledger.isRunning) },
+            until: { !$0.isEmpty }
+        )
+        guard let sessionARow = initialPoll.value.first, let sessionAID = ledger.id(of: sessionARow) else {
+            XCTFail("Initial window's persistent pane never registered a Running session. Ledger: \(initialPoll.raw)")
+            return
+        }
+
+        XCTAssertTrue(
+            waitFor(firstSidebarTabRow, timeout: 15),
+            "The initial tab's sidebar row never appeared (sidebar not visible or not yet rendered)."
+        )
+        let rowIDsBefore = pollSidebarTabRowIdentifiers(timeout: 8) { $0.count == 1 }
+        XCTAssertEqual(rowIDsBefore.count, 1, "Expected exactly one sidebar tab row at launch; got \(rowIDsBefore).")
+
+        createNewTabViaMenu()
+
+        let rowIDsAfterNewTab = pollSidebarTabRowIdentifiers(timeout: 8) { $0.count == 2 }
+        let newTabRowIDs = rowIDsAfterNewTab.subtracting(rowIDsBefore)
+        XCTAssertEqual(newTabRowIDs.count, 1, "File > New Tab did not add exactly one sidebar tab row. Before: \(rowIDsBefore), after: \(rowIDsAfterNewTab)")
+        let newTabRowID = newTabRowIDs.first ?? "<none>"
+
+        let newSessionPoll = ledger.poll(
+            timeoutAttempts: 15, sleepInterval: 1,
+            transform: { sessions in
+                sessions.first { self.ledger.isRunning($0) && self.ledger.id(of: $0) != sessionAID
+                    && (self.ledger.attachedClients(of: $0) ?? 0) >= 1 }
+            },
+            until: { $0 != nil }
+        )
+        guard let newSessionRow = newSessionPoll.value, let newSessionID = ledger.id(of: newSessionRow) else {
+            XCTFail("The new tab's pane never registered an attached Running session. Ledger: \(newSessionPoll.raw)")
+            return
+        }
+
+        openSessionBrowserViaMenu()
+        let browserWindow = app.windows["Sessions"]
+        XCTAssertTrue(waitFor(browserWindow, timeout: 10), "Session browser window (\"Sessions\") did not open.")
+        XCTAssertTrue(
+            waitFor(app.staticTexts[newSessionID], timeout: 10),
+            "The new (active) tab's session row (\(newSessionID)) did not appear in the browser."
+        )
+
+        let killButton = app.buttons["calyx.sessionBrowser.row.\(newSessionID).killButton"]
+        XCTAssertTrue(waitFor(killButton), "Kill button for session \(newSessionID) did not appear.")
+        killButton.click()
+
+        let afterKillPoll = ledger.poll(
+            timeoutAttempts: 10, sleepInterval: 1,
+            transform: { sessions in self.ledger.session(withID: newSessionID, in: sessions) },
+            until: { $0.map(self.ledger.isExited) ?? false }
+        )
+        XCTAssertTrue(
+            afterKillPoll.value.map(ledger.isExited) ?? false,
+            "Session \(newSessionID) never flipped to Exited within ~10s of Kill. Ledger: \(afterKillPoll.raw)"
+        )
+
+        let rowIDsAfterKill = pollSidebarTabRowIdentifiers(timeout: 10) { !$0.contains(newTabRowID) && $0.count == 1 }
+        XCTAssertFalse(
+            rowIDsAfterKill.contains(newTabRowID),
+            "killed session's active tab must close: session \(newSessionID) is Exited but its " +
+            "tab (\(newTabRowID)) is still in the sidebar ~10s later. Rows: \(rowIDsAfterKill)"
+        )
+        XCTAssertEqual(
+            rowIDsAfterKill.count, 1,
+            "Window should be back to exactly one tab after killing the active tab's session. Rows: \(rowIDsAfterKill)"
+        )
+    }
+
+    /// D1: a tab restored from a snapshot whose `sessionRefs` point at a
+    /// session the daemon's ledger now holds as Exited must come back
+    /// daemon-backed (its pane's `attach --create` respawns a session),
+    /// and that session's row must appear in the Session Browser.
+    ///
+    /// Approach (NOT ledger pre-seeding): the sandboxed runner cannot
+    /// create `<homeDir>/.calyx/state/` itself (see this file's own
+    /// `sessionBCwd` comment on Code=513), so the Exited record is
+    /// produced for real: session A's own pane schedules a delayed
+    /// `calyx-session kill A` (nohup, backgrounded -- it runs inside the
+    /// daemon-held shell, so it outlives Calyx.app), the app is quit via
+    /// its menu so the snapshot is saved with A's sessionRef intact (the
+    /// kill lands only after the app is gone, so no child-exit close can
+    /// remove the tab from the snapshot), the ledger is polled until A
+    /// is Exited, and the app is relaunched with the same HOME/session dir.
+    func test_restoredTabWhoseSessionExited_isDaemonBackedAfterRelaunch() {
+        XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after launch.")
+        let sessionBinaryPath = CalyxUITestCase.builtSessionBinaryPath
+        XCTAssertFalse(sessionBinaryPath.isEmpty, "CALYX_SESSION_BIN is empty in the test runner's environment.")
+
+        let initialPoll = ledger.poll(
+            timeoutAttempts: 15, sleepInterval: 2,
+            transform: { sessions in
+                sessions.first { self.ledger.isRunning($0) && (self.ledger.attachedClients(of: $0) ?? 0) >= 1 }
+            },
+            until: { $0 != nil }
+        )
+        guard let sessionARow = initialPoll.value, let sessionAID = ledger.id(of: sessionARow) else {
+            XCTFail("Initial window's persistent pane never registered an attached Running session. Ledger: \(initialPoll.raw)")
+            return
+        }
+
+        panePasteAndReturn(
+            "nohup sh -c \"sleep 8; '\(sessionBinaryPath)' \(calyxSessionRootFlags(homeDir: homeDir)) kill \(sessionAID)\" >/dev/null 2>&1 &"
+        )
+        // Let the pane's shell actually fork the background job before quitting.
+        Thread.sleep(forTimeInterval: 2)
+
+        menuAction("Calyx", item: "Quit Calyx")
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10), "App did not terminate within 10s of Quit.")
+
+        let exitedPoll = ledger.poll(
+            timeoutAttempts: 20, sleepInterval: 1,
+            transform: { sessions in self.ledger.session(withID: sessionAID, in: sessions) },
+            until: { $0.map(self.ledger.isExited) ?? false }
+        )
+        XCTAssertTrue(
+            exitedPoll.value.map(ledger.isExited) ?? false,
+            "Setup: session A (\(sessionAID)) never became Exited after the delayed kill. Ledger: \(exitedPoll.raw)"
+        )
+
+        launchApp()
+        XCTAssertTrue(waitFor(app.windows.firstMatch, timeout: 10), "App window did not reappear after relaunch.")
+
+        // Expected: the restored tab's pane runs `attach <A> --create`,
+        // which respawns a Running session (same id expected; any
+        // Running+attached session is accepted in case the daemon
+        // assigns a fresh id) with a client attached.
+        let restoredPoll = ledger.poll(
+            timeoutAttempts: 15, sleepInterval: 2,
+            transform: { sessions in
+                sessions.first { self.ledger.isRunning($0) && (self.ledger.attachedClients(of: $0) ?? 0) >= 1 }
+            },
+            until: { $0 != nil }
+        )
+        guard let restoredRow = restoredPoll.value, let restoredID = ledger.id(of: restoredRow) else {
+            XCTFail(
+                "restored tab must be daemon-backed: after relaunching with a snapshot whose tab " +
+                "referenced Exited session \(sessionAID), no Running session with an attached " +
+                "client appeared in the ledger within ~30s. Ledger: \(restoredPoll.raw)"
+            )
+            return
+        }
+
+        openSessionBrowserViaMenu()
+        XCTAssertTrue(waitFor(app.windows["Sessions"], timeout: 10), "Session browser window did not open.")
+        XCTAssertTrue(
+            waitFor(app.staticTexts[restoredID], timeout: 10),
+            "restored tab's session row must appear in the Session Browser: Running session " +
+            "\(restoredID) (restored from Exited \(sessionAID)) has no row."
+        )
     }
 }

@@ -3060,9 +3060,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// own entry guard covers the shutdown-suppression
     /// case, so this method itself only needs
     /// `deferOrRun`'s isConfirmingQuit choke point.
+    ///
+    /// Ownership is resolved with `findTab(for:)`, not
+    /// `belongsToThisWindow(_:)`: `SplitContainerView` detaches the
+    /// SurfaceViews of non-active tabs from the window hierarchy, so a
+    /// background tab's surface has `window == nil` and a
+    /// `view.window === self.window` check would silently drop its
+    /// child-exit event, leaving the pane open after its daemon session
+    /// dies. Same rule as the "Destination resolution" comment below.
     @objc private func handleShowChildExitedNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
+        guard findTab(for: surfaceView) != nil else { return }
         deferOrRun(.childExited(surfaceView: surfaceView)) { [weak self] in
             self?.processChildExited(surfaceView: surfaceView)
         }
