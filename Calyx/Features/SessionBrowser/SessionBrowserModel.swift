@@ -250,8 +250,17 @@ struct HerdrWorkspaceRow: Identifiable, Equatable, Sendable {
     }
 
     /// "N pane(s)" -- this row's own pane count only, same `"pane(s)"`
-    /// vocabulary as the server row's own status line.
-    var paneCountText: String { "\(info.paneCount) pane(s)" }
+    /// vocabulary as the server row's own status line -- prefixed with
+    /// the workspace id ("<id> · N pane(s)") whenever `displayLabel`
+    /// shows a non-blank label rather than the id itself. herdr 0.8
+    /// replaces the last closed workspace with a new one under the same
+    /// label, so the id is what distinguishes them. When the label is
+    /// blank, `displayLabel` already is the id, so it is not repeated.
+    var paneCountText: String {
+        let count = "\(info.paneCount) pane(s)"
+        guard displayLabel != info.workspaceID else { return count }
+        return "\(info.workspaceID) · \(count)"
+    }
 
     /// Mirrors `SessionBrowserRow.attachButtonLabel`'s exact ternary and
     /// wording: "Show" once this workspace is already displayed in this

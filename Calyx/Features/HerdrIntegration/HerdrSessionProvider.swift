@@ -25,6 +25,9 @@
 // they are attached to (`HerdrSessionInfo.tuiClients`).
 
 import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.calyx.terminal", category: "HerdrCLISessionProvider")
 
 protocol HerdrSessionProviderProtocol: Sendable {
     func listSessions() async -> [HerdrSessionInfo]
@@ -230,8 +233,9 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
     /// that accepts the connection and never answers must not hang this
     /// call, and therefore the caller's own unconditional refresh,
     /// forever. Any failure -- an RPC error, a transport EOF/failure, or
-    /// `oneShotRequestTimeout` expiry -- is swallowed: there is no result
-    /// to report (unlike `SessionDaemonClient.kill(id:)`, whose
+    /// `oneShotRequestTimeout` expiry -- is logged at `.error` and
+    /// otherwise swallowed: there is no result
+    /// to report beyond an `.error` log line (unlike `SessionDaemonClient.kill(id:)`, whose
     /// `SessionKillOutcome` the calyx-session Kill button surfaces).
     /// `SessionBrowserModel.killHerdrWorkspace(_:)` refreshes
     /// unconditionally right after calling this, succeeded or not.
@@ -252,7 +256,8 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
             )
         } catch {
             // See this method's own doc comment: best-effort, the caller
-            // refreshes regardless.
+            // refreshes regardless. Logged so a failed close is diagnosable.
+            logger.error("workspace.close failed for workspace \(workspaceID, privacy: .public) on socket \(socketPath, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -266,7 +271,7 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
     /// server that accepts the connection and never answers must not hang
     /// the session browser's "Show" forever. Any failure -- an RPC error,
     /// a transport EOF/failure, or `oneShotRequestTimeout` expiry -- is
-    /// swallowed, exactly like `closeWorkspace`: there is no result to
+    /// logged and swallowed, exactly like `closeWorkspace`: there is no result to
     /// report, and the caller focuses the TUI pane regardless.
     func focusWorkspace(workspaceID: String, socketPath: String) async {
         let transport = await transportFactory.makeTransport()
@@ -285,7 +290,9 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
             )
         } catch {
             // See this method's own doc comment: best-effort, the caller
-            // focuses the pane regardless.
+            // focuses the pane regardless. Logged so a failed focus is
+            // diagnosable.
+            logger.error("workspace.focus failed for workspace \(workspaceID, privacy: .public) on socket \(socketPath, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 

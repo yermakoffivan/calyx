@@ -644,29 +644,29 @@ final class SessionBrowserModelHerdrTests: XCTestCase {
 
     // MARK: - HerdrWorkspaceRow.paneCountText (HerdrWorkspaceRowView line 2)
 
+    /// States this workspace's own pane count. With a non-blank label the
+    /// workspace id is prefixed ("w1 · ") because herdr 0.8 can reuse a
+    /// label for a replacement workspace; the id is what tells them apart.
     func test_paneCountText_statesThisWorkspacesOwnPaneCount() {
         let row = HerdrWorkspaceRow(
             socketPath: "test-herdr-socket-1",
             info: HerdrWorkspaceInfo(workspaceID: "w1", activeTabID: "w1:t1", label: "Calyx", paneCount: 2)
         )
 
-        XCTAssertEqual(row.paneCountText, "2 pane(s)")
+        XCTAssertEqual(row.paneCountText, "w1 · 2 pane(s)",
+                       "non-blank label: pane count is prefixed with the workspace id")
     }
 
-    /// TDD Red (Test 3, see task spec): `paneCountText` must disambiguate
-    /// WHICH workspace the pane count belongs to once more than one
-    /// workspace can appear in the browser at once, by prefixing the
-    /// workspace id whenever `displayLabel` differs from the bare id
-    /// (non-blank label) -- same " · " separator
-    /// `HerdrAttachGate.decide` already uses for its own workspace/pane
-    /// summary line, copied verbatim so a differing dot codepoint can
-    /// never cause a false Red here. When the label IS blank,
-    /// `displayLabel` already equals the workspace id, so prefixing it
-    /// again would just repeat the id -- that branch stays exactly
-    /// "N pane(s)", asserted in the same test function (not a separate
-    /// one) so this whole function is Red today: the non-blank-label
-    /// half fails on `HerdrWorkspaceRow(socketPath:info:)` returning the
-    /// current unprefixed "1 pane(s)" instead of "w2F · 1 pane(s)".
+    /// `paneCountText` must disambiguate WHICH workspace the pane count
+    /// belongs to, because herdr 0.8 can reuse a label for a replacement
+    /// workspace: whenever `displayLabel` differs from the bare id
+    /// (non-blank label), the workspace id is prefixed -- same " · "
+    /// separator `HerdrAttachGate.decide` already uses for its own
+    /// workspace/pane summary line, copied verbatim so a differing dot
+    /// codepoint can never cause a false failure here. When the label IS
+    /// blank, `displayLabel` already equals the workspace id, so prefixing
+    /// it again would just repeat the id -- that branch stays exactly
+    /// "N pane(s)", asserted in the same test function.
     func test_paneCountText_prefixesWorkspaceIDWhenLabelIsNonBlank() {
         let labeled = HerdrWorkspaceRow(
             socketPath: "test-herdr-socket-1",
