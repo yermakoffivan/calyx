@@ -556,7 +556,7 @@ impl Conn {
             // the right move, and if its session thread has already
             // returned (a still-alive-at-poll-bound ghost, S1) the wait
             // loop below reconciles it once the signal takes effect.
-            let state = self.shared.lock_state();
+            let mut state = self.shared.lock_state();
             match state.sessions.get(id) {
                 Some(entry) => {
                     // The child is a session leader (setsid in
@@ -606,8 +606,32 @@ impl Conn {
                             ),
                         });
                     }
-                    drop(state);
-                    return self.reply(&err_no_session(id));
+                    // Not mid-handoff, but the ledger still says
+                    // `Running`: a prior daemon generation died without
+                    // flipping this record (`reconcile_unowned_running`'s
+                    // doc comment), so its backing process, if it still
+                    // exists at all, is unreachable and unverifiable by
+                    // this daemon. There is nothing left to signal, so
+                    // flip the ledger record directly and persist it,
+                    // then fall through to the wait loop below, which
+                    // already treats an unregistered id whose ledger
+                    // state is `Exited` as gone and replies `KillOk` --
+                    // reusing that path rather than duplicating its
+                    // reply.
+                    if matches!(
+                        state.ledger.get(id).map(|info| info.state),
+                        Some(SessionState::Running)
+                    ) {
+                        if let Some(info) = state.ledger.get_mut(id) {
+                            info.state = SessionState::Exited { code: -1 };
+                            info.exited_at_ms = Some(crate::ledger::now_unix_ms());
+                        }
+                        state.touch();
+                        self.shared.persist_ledger(&state);
+                    } else {
+                        drop(state);
+                        return self.reply(&err_no_session(id));
+                    }
                 }
             }
         }
@@ -1140,5 +1164,128 @@ mod tests {
         );
 
         reaper.join().expect("reaper thread should join");
+    }
+
+    /// RED (post-migration ghost-row cleanup): a `Kill` for an id that
+    /// is absent from the live registry AND not mid-handoff, but whose
+    /// ledger record still says `Running` (the defect under fix — a
+    /// prior daemon generation died without flipping its records, so
+    /// the new daemon's registry starts empty while the ledger still
+    /// carries ~34 stale `Running` rows with dead pids), must not be
+    /// swallowed as `no-such-session`: the daemon should flip that
+    /// ledger record to `Exited { code: -1 }`, persist it, and reply
+    /// with the normal kill-success reply (`KillOk`) exactly as if a
+    /// live process had actually been signalled.
+    ///
+    /// `-1` and `now_ms` (not any value read from a real process) are
+    /// hand-picked here per the spec: there is no real exit code to
+    /// report for a session whose backing process is already long
+    /// gone, and `exited_at_ms` must record when the daemon *noticed*
+    /// the record was stale, not any earlier real exit time (which is
+    /// unknowable — the pid is already dead by the time this path
+    /// runs).
+    #[test]
+    fn kill_of_a_ledger_only_running_record_flips_it_to_exited_and_replies_kill_ok() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let id = "01J-ghost-row-kill-ledger-only-test".to_string();
+
+        // No entry in `state.sessions` at all -- this is the case a
+        // dead daemon generation's abandoned `Running` record produces:
+        // the *new* daemon's live registry never knew about it.
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(
+                id.clone(),
+                proto::SessionInfo {
+                    id: id.clone(),
+                    name: None,
+                    cwd: None,
+                    state: SessionState::Running,
+                    created_at_ms: 1_700_000_000_000,
+                    attached_clients: 0,
+                    pid: 999_999, // a pid that is certainly not this daemon's
+                    meta: std::collections::BTreeMap::new(),
+                    exited_at_ms: None,
+                },
+            );
+        }
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 11);
+        let keep_going = conn.kill(&id);
+        assert!(
+            keep_going,
+            "kill of a ledger-only stale Running record should reply normally, not drop \
+             the connection"
+        );
+
+        let frame = reader.read_frame().expect("read the Kill reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Kill reply");
+        assert!(
+            matches!(msg, ControlMsg::KillOk),
+            "Kill of an unregistered but ledger-Running id must reply KillOk (the same \
+             success reply a real live kill gets), not no-such-session, got {msg:?}"
+        );
+
+        let ledger_info = {
+            let state = shared.lock_state();
+            state
+                .ledger
+                .get(&id)
+                .cloned()
+                .expect("the ledger record must still exist after Kill")
+        };
+        assert_eq!(
+            ledger_info.state,
+            SessionState::Exited { code: -1 },
+            "a ledger-only stale Running record must be flipped to Exited{{ code: -1 }} by \
+             Kill, got {:?}",
+            ledger_info.state
+        );
+        assert!(
+            ledger_info.exited_at_ms.is_some(),
+            "Kill must stamp exited_at_ms on the record it flips to Exited"
+        );
+
+        // Persistence: the flip must have been written through to disk,
+        // not just held in memory -- a later daemon restart reads from
+        // `sessions.json`, not this process's live `State`. The actual
+        // write happens asynchronously on the persister thread
+        // (`Shared::persist_ledger` only enqueues a snapshot), so
+        // `shutdown_persister` flushes and joins it first; without this,
+        // reading the file right after `kill()` returns would race the
+        // persister thread and be flaky even against a correct fix.
+        shared.shutdown_persister();
+        let on_disk = crate::ledger::load(tmp.path());
+        let persisted = on_disk
+            .get(&id)
+            .expect("the ledger flip must be persisted to sessions.json, not only in-memory");
+        assert_eq!(
+            persisted.state,
+            SessionState::Exited { code: -1 },
+            "the on-disk ledger must also show Exited{{ code: -1 }} after Kill persists it, \
+             got {:?}",
+            persisted.state
+        );
+
+        // An id absent from BOTH the registry and the ledger entirely
+        // must still be a genuine no-such-session -- this fix must not
+        // widen Kill into "success for literally any id".
+        let (mut other_conn, mut other_reader) = make_test_conn(&shared, 12);
+        let other_keep_going = other_conn.kill("01J-truly-unknown-id-test");
+        assert!(other_keep_going, "kill of an unknown id should reply normally too");
+        let other_frame = other_reader
+            .read_frame()
+            .expect("read the second Kill reply frame");
+        let other_msg =
+            decode_control(&other_frame.payload).expect("decode the second Kill reply");
+        assert!(
+            matches!(
+                other_msg,
+                ControlMsg::Err { ref code, .. } if code == "no-such-session"
+            ),
+            "an id present in neither the registry nor the ledger must still get \
+             no-such-session, got {other_msg:?}"
+        );
     }
 }

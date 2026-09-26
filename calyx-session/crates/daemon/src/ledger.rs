@@ -91,6 +91,37 @@ pub(crate) fn load_and_gc(state_dir: &Path, now_ms: u64) -> BTreeMap<String, Ses
     kept
 }
 
+/// Flips every `Running` ledger record whose id is not `owned` (i.e.
+/// not present in the caller's live registry) to `Exited { code: -1 }`,
+/// stamping `exited_at_ms` to `now_ms`. Returns the count changed.
+///
+/// A `Running` record this daemon generation does not own can never be
+/// attached to or killed again: its backing process, if it still
+/// exists at all, belongs to a pid this daemon has no PTY master for
+/// and no session thread watching, so nothing here will ever flip it
+/// on its own. Left alone, such a record is a permanent lie — "Running"
+/// forever, with no affordance to remove it (`ls --all` shows a dead
+/// row, `Kill` cannot reach it because it is absent from the registry).
+/// This function deliberately does not signal the recorded pid: pid
+/// reuse by the OS since the record was written makes that unsafe, and
+/// this daemon holds no PTY master for the session regardless, so a
+/// signal would accomplish nothing even when safe.
+pub(crate) fn reconcile_unowned_running(
+    sessions: &mut BTreeMap<String, SessionInfo>,
+    owned: impl Fn(&str) -> bool,
+    now_ms: u64,
+) -> usize {
+    let mut changed = 0;
+    for (id, info) in sessions.iter_mut() {
+        if matches!(info.state, SessionState::Running) && !owned(id) {
+            info.state = SessionState::Exited { code: -1 };
+            info.exited_at_ms = Some(now_ms);
+            changed += 1;
+        }
+    }
+    changed
+}
+
 pub(crate) fn load(state_dir: &Path) -> BTreeMap<String, SessionInfo> {
     let path = state_dir.join(LEDGER_FILE);
     let bytes = match fs::read(&path) {
@@ -368,6 +399,122 @@ mod tests {
         assert!(
             rewritten.contains("01J-gc-rewrite-running"),
             "sessions.json must still retain the untouched Running entry, got: {rewritten}"
+        );
+    }
+
+    // ==================== `reconcile_unowned_running` (RED: ghost-row cleanup) ====================
+    //
+    // Bug under fix: the daemon's live registry starts empty on a fresh
+    // bind, but the on-disk ledger keeps every `Running` record a prior
+    // daemon generation left behind when it died without flipping them
+    // to `Exited` -- ~34 such records observed in production, each
+    // still carrying a now-dead pid, surfacing forever as "Detached ·
+    // Running · 0 client(s)" rows the session browser's Kill can't
+    // touch (Kill only reaches ids present in the *live* registry).
+    // `reconcile_unowned_running` is the fix: any `Running` ledger
+    // record whose id the caller does NOT currently own (i.e. is not in
+    // the live registry) gets flipped to `Exited { code: -1 }` -- there
+    // is no real exit code to report since the record's backing process
+    // is already gone by the time this runs, so `-1` is a hand-picked
+    // sentinel, not anything derived from an actual `wait()`.
+
+    /// RED: a `Running` record whose id is not `owned` must become
+    /// `Exited { code: -1 }` with `exited_at_ms` stamped to exactly
+    /// `now_ms` (the time the daemon noticed the record was stale, not
+    /// any unknowable real exit time), and the call must report exactly
+    /// one record changed.
+    #[test]
+    fn reconcile_unowned_running_marks_unowned_running_as_exited() {
+        let now_ms: u64 = 1_800_000_000_000;
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "01J-reconcile-unowned".to_string(),
+            make_info("01J-reconcile-unowned", SessionState::Running, None),
+        );
+
+        let changed = reconcile_unowned_running(&mut sessions, |_id| false, now_ms);
+
+        assert_eq!(
+            changed, 1,
+            "exactly one unowned Running record was reconciled, must return 1"
+        );
+        let info = sessions
+            .get("01J-reconcile-unowned")
+            .expect("reconcile_unowned_running must not remove the record, only flip its state");
+        assert_eq!(
+            info.state,
+            SessionState::Exited { code: -1 },
+            "an unowned Running record must be flipped to Exited{{ code: -1 }}, got {:?}",
+            info.state
+        );
+        assert_eq!(
+            info.exited_at_ms,
+            Some(now_ms),
+            "exited_at_ms must be stamped to exactly now_ms, got {:?}",
+            info.exited_at_ms
+        );
+    }
+
+    /// RED: an owned `Running` record must be left completely untouched,
+    /// and a pre-existing `Exited` record's own state/exited_at_ms must
+    /// survive unchanged too -- this function only ever reconciles
+    /// *unowned Running* records, nothing else. Both records here would
+    /// be corrupted by a naive `|_| true` owned-closure test, so the
+    /// owned predicate below only recognizes the Running id, and the
+    /// Exited record carries distinguishable values (a non-sentinel
+    /// code and an exited_at_ms far from now_ms) so a clobber is
+    /// detectable.
+    #[test]
+    fn reconcile_unowned_running_keeps_owned_running_and_exited_records() {
+        let now_ms: u64 = 1_800_000_000_000;
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "01J-reconcile-owned".to_string(),
+            make_info("01J-reconcile-owned", SessionState::Running, None),
+        );
+        sessions.insert(
+            "01J-reconcile-already-exited".to_string(),
+            make_info(
+                "01J-reconcile-already-exited",
+                SessionState::Exited { code: 137 },
+                Some(1_750_000_000_000),
+            ),
+        );
+
+        let changed = reconcile_unowned_running(
+            &mut sessions,
+            |id| id == "01J-reconcile-owned",
+            now_ms,
+        );
+
+        assert_eq!(
+            changed, 0,
+            "no record should be reconciled: the Running record is owned and the other is \
+             already Exited, must return 0"
+        );
+        let owned_info = sessions
+            .get("01J-reconcile-owned")
+            .expect("the owned record must still be present");
+        assert_eq!(
+            owned_info.state,
+            SessionState::Running,
+            "an owned Running record must never be touched, got {:?}",
+            owned_info.state
+        );
+        let exited_info = sessions
+            .get("01J-reconcile-already-exited")
+            .expect("the already-Exited record must still be present");
+        assert_eq!(
+            exited_info.state,
+            SessionState::Exited { code: 137 },
+            "an already-Exited record's code must be left untouched, got {:?}",
+            exited_info.state
+        );
+        assert_eq!(
+            exited_info.exited_at_ms,
+            Some(1_750_000_000_000),
+            "an already-Exited record's exited_at_ms must be left untouched, got {:?}",
+            exited_info.exited_at_ms
         );
     }
 }

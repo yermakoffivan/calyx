@@ -90,7 +90,7 @@ private final class SuspendingInstallDaemonClient: SessionDaemonClientProtocol, 
     }
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
 
@@ -117,7 +117,7 @@ private final class FixedInstallResultDaemonClient: SessionDaemonClientProtocol,
     var result: CommandResult?
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
     func installRemote(host: String) async -> CommandResult? { result }

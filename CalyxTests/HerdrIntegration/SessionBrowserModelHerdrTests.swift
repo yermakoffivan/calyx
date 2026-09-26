@@ -100,7 +100,7 @@ import XCTest
 private final class FakeDaemonClient: SessionDaemonClientProtocol, @unchecked Sendable {
     var sessionsToReturn: [SessionInfo] = []
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
     func listAll() async -> [SessionInfo] { sessionsToReturn }
     func setMeta(id: String, key: String, value: String) async {}
 }

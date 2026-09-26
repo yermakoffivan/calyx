@@ -61,7 +61,7 @@ final class AppDelegateFetchSessionsForAgentResumeTests: XCTestCase {
     private final class NeverRespondingDaemonClient: SessionDaemonClientProtocol, @unchecked Sendable {
         func sessionState(id: String) async -> SessionQueryResult { .unreachable }
 
-        func kill(id: String) async {}
+        func kill(id: String) async -> SessionKillOutcome { .killed }
 
         func listAll() async -> [SessionInfo] {
             await withCheckedContinuation { (_: CheckedContinuation<[SessionInfo], Never>) in

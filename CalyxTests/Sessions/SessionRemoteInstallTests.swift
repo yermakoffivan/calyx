@@ -117,7 +117,7 @@ private final class FakeInstallRemoteDaemonClient: SessionDaemonClientProtocol, 
     private(set) var installRemoteHosts: [String] = []
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
 

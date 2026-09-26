@@ -136,7 +136,7 @@ private final class FakeRunningSessionDaemonClient: SessionDaemonClientProtocol,
     var sessionsToReturn: [SessionInfo] = []
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
     func listAll() async -> [SessionInfo] { sessionsToReturn }
 }
 

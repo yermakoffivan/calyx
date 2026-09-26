@@ -90,7 +90,7 @@ final class SessionDaemonClientRuntimeDirArgsTests: XCTestCase {
 
         _ = await client.listAll()
         _ = await client.sessionState(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
-        await client.kill(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        _ = await client.kill(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
         await client.setMeta(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", key: "k", value: "v")
 
         let recorded = await runner.recordedCalls

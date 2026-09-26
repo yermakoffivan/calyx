@@ -22,6 +22,10 @@
 //    Exited sessions mixed into the same listAll() result
 //  - attach(_:) invokes `onAttachRequested` with the row
 //  - kill(_:) calls `daemonClient.kill(id:)` with the row's session id
+//  - kill(_:) records a `killFailures` entry keyed by row id when the
+//    daemon reports `.failed(message:)`
+//  - kill(_:) clears any existing `killFailures` entry when the daemon
+//    reports `.killed`
 //
 
 import XCTest
@@ -34,11 +38,15 @@ private final class FakeBrowserDaemonClient: SessionDaemonClientProtocol, @unche
     var sessionsToReturn: [SessionInfo] = []
     private(set) var killedIDs: [String] = []
     private(set) var metaSetCalls: [(id: String, key: String, value: String)] = []
+    /// What `kill(id:)` returns; defaults to `.killed` so every
+    /// existing test (which never sets this) keeps its prior behavior.
+    var killOutcome: SessionKillOutcome = .killed
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
 
-    func kill(id: String) async {
+    func kill(id: String) async -> SessionKillOutcome {
         killedIDs.append(id)
+        return killOutcome
     }
 
     func listAll() async -> [SessionInfo] {
@@ -204,5 +212,52 @@ final class SessionBrowserModelTests: XCTestCase {
 
         XCTAssertEqual(daemonClient.killedIDs, ["session-to-kill"],
                        "kill(_:) must call daemonClient.kill(id:) with exactly the row's session id")
+    }
+
+    // MARK: - kill(_:) records/clears killFailures based on the daemon's outcome
+
+    /// A `.failed(message:)` outcome from the daemon must be surfaced
+    /// to the browser via `killFailures`, keyed by the row's session
+    /// id -- with no confirmation dialog anywhere in `kill(_:)`
+    /// (per that method's own doc comment), this dictionary is the
+    /// only place a user-visible "why didn't Kill do anything" signal
+    /// can come from.
+    func test_kill_recordsFailureMessage_whenDaemonReportsFailure() async throws {
+        daemonClient.sessionsToReturn = [makeInfo(id: "session-to-fail", state: .running)]
+        await model.refresh()
+        let row = try XCTUnwrap(model.rows.first, "refresh() must have populated at least one row")
+        daemonClient.killOutcome = .failed(message: "no session with id \"session-to-fail\"")
+
+        await model.kill(row)
+
+        XCTAssertEqual(
+            model.killFailures[row.id],
+            "no session with id \"session-to-fail\"",
+            "kill(_:) must record the daemon's failure message in killFailures, keyed by the row's id"
+        )
+    }
+
+    /// A subsequent `.killed` outcome for the same row must clear any
+    /// failure message a prior kill attempt recorded -- a stale
+    /// failure banner must not survive a kill that later succeeds.
+    func test_kill_clearsFailureMessage_whenDaemonReportsKilled() async throws {
+        daemonClient.sessionsToReturn = [makeInfo(id: "session-retry", state: .running)]
+        await model.refresh()
+        let row = try XCTUnwrap(model.rows.first, "refresh() must have populated at least one row")
+
+        daemonClient.killOutcome = .failed(message: "first attempt failed")
+        await model.kill(row)
+        XCTAssertEqual(
+            model.killFailures[row.id], "first attempt failed",
+            "precondition: the first, failing kill attempt must have recorded a failure message"
+        )
+
+        daemonClient.killOutcome = .killed
+        await model.kill(row)
+
+        XCTAssertNil(
+            model.killFailures[row.id],
+            "a later .killed outcome for the same row must clear its prior killFailures entry"
+        )
     }
 }

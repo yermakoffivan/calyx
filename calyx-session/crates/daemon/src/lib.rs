@@ -173,8 +173,26 @@ impl Daemon {
             self.config.state_dir.clone(),
             self.config.history_enabled,
         ));
-        shared.lock_state().ledger =
-            ledger::load_and_gc(&self.config.state_dir, ledger::now_unix_ms());
+        {
+            let mut state = shared.lock_state();
+            state.ledger = ledger::load_and_gc(&self.config.state_dir, ledger::now_unix_ms());
+            // Fresh bind: the live registry is empty, so every `Running`
+            // record the previous daemon generation left behind is
+            // unowned (see `reconcile_unowned_running`'s doc comment for
+            // why such a record must not be trusted as "Running").
+            let changed = ledger::reconcile_unowned_running(
+                &mut state.ledger,
+                |_id| false,
+                ledger::now_unix_ms(),
+            );
+            if changed > 0 {
+                eprintln!(
+                    "calyx-sessiond: reconciled {changed} unowned Running ledger record(s) to \
+                     Exited on fresh bind"
+                );
+                shared.persist_ledger(&state);
+            }
+        }
         install_handoff_env(
             &shared,
             &self.config.runtime_dir,
@@ -336,6 +354,24 @@ pub fn run_handoff_receiver(
             state.sessions.insert(entry.id.clone(), entry);
         }
         state.touch();
+        // Only after every adopted session is registered: anything
+        // still `Running` in the ledger but not in `state.sessions` at
+        // this point was never part of the manifest at all (a record a
+        // still-earlier daemon generation left behind that even the
+        // handing-off daemon did not own), so it is unowned here too
+        // and gets the same treatment as a fresh bind's stale records.
+        let registered: std::collections::HashSet<String> = state.sessions.keys().cloned().collect();
+        let changed = ledger::reconcile_unowned_running(
+            &mut state.ledger,
+            |id| registered.contains(id),
+            ledger::now_unix_ms(),
+        );
+        if changed > 0 {
+            eprintln!(
+                "calyx-sessiond: reconciled {changed} unowned Running ledger record(s) to \
+                 Exited on handoff receive"
+            );
+        }
         shared.persist_ledger(&state);
     }
     // Arm PrepareHandoff on this generation too, so the next upgrade

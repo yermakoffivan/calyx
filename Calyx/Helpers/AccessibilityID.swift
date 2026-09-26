@@ -122,6 +122,7 @@ enum AccessibilityID {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
         static func attachButton(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).attachButton" }
         static func killButton(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).killButton" }
+        static func killFailure(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).killFailure" }
         static func remoteHostRow(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host)" }
         static func remoteHostAttachButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).attachButton" }
         static func remoteHostInstallButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).installButton" }

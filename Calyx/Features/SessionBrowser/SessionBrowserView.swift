@@ -390,6 +390,13 @@ private struct SessionBrowserRowView: View {
                 Text(detailLine)
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
+                if let killFailure = model.killFailures[row.id] {
+                    Text(killFailure)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                        .accessibilityIdentifier(AccessibilityID.SessionBrowser.killFailure(row.id))
+                }
             }
 
             Spacer()

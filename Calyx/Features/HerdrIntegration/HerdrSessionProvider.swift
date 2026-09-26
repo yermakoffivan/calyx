@@ -31,9 +31,9 @@ protocol HerdrSessionProviderProtocol: Sendable {
 
     /// Closes one herdr workspace via `workspace.close` -- the session
     /// browser's Kill action for a herdr workspace row
-    /// (`SessionBrowserModel.killHerdrWorkspace(_:)`). Mirrors
-    /// `SessionDaemonClientProtocol.kill(id:)`'s own fire-and-forget
-    /// shape: nothing to return, any failure swallowed -- see
+    /// (`SessionBrowserModel.killHerdrWorkspace(_:)`). Fire-and-forget,
+    /// unlike `SessionDaemonClientProtocol.kill(id:)` (which reports a
+    /// `SessionKillOutcome`): nothing to return, any failure swallowed -- see
     /// `HerdrCLISessionProvider.closeWorkspace(workspaceID:socketPath:)`'s
     /// own doc comment for why.
     func closeWorkspace(workspaceID: String, socketPath: String) async
@@ -231,8 +231,8 @@ final class HerdrCLISessionProvider: HerdrSessionProviderProtocol, Sendable {
     /// call, and therefore the caller's own unconditional refresh,
     /// forever. Any failure -- an RPC error, a transport EOF/failure, or
     /// `oneShotRequestTimeout` expiry -- is swallowed: there is no result
-    /// to report, mirroring `SessionDaemonClient.kill(id:)`'s own
-    /// `try?`-and-discard contract for the calyx-session Kill button.
+    /// to report (unlike `SessionDaemonClient.kill(id:)`, whose
+    /// `SessionKillOutcome` the calyx-session Kill button surfaces).
     /// `SessionBrowserModel.killHerdrWorkspace(_:)` refreshes
     /// unconditionally right after calling this, succeeded or not.
     func closeWorkspace(workspaceID: String, socketPath: String) async {

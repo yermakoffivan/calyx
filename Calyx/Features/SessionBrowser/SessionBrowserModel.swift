@@ -303,6 +303,14 @@ final class SessionBrowserModel {
 
     private(set) var rows: [SessionBrowserRow] = []
 
+    /// Daemon-reported failure message per row id (`SessionBrowserRow
+    /// .id`) from the most recent `kill(_:)` of that row that came back
+    /// `.failed` -- `kill(_:)` has no confirmation dialog, so this is
+    /// the only user-visible signal that a Kill the daemon rejected did
+    /// nothing. Cleared for a row when a later `kill(_:)` of it reports
+    /// `.killed`.
+    private(set) var killFailures: [String: String] = [:]
+
     /// Populated by `refresh()` from the injected `herdrProvider`, gated
     /// on `herdrAvailability()` (binary resolution only -- see that
     /// property's own doc comment for why "is any session actually
@@ -684,9 +692,16 @@ final class SessionBrowserModel {
         onHerdrWorkspaceAttachRequested?(row)
     }
 
-    /// Kills `row`'s session via the daemon, then refreshes.
+    /// Kills `row`'s session via the daemon, records the outcome in
+    /// `killFailures` (the daemon's message on `.failed`, the row's
+    /// entry removed on `.killed`), then refreshes.
     func kill(_ row: SessionBrowserRow) async {
-        await daemonClient.kill(id: row.info.id)
+        switch await daemonClient.kill(id: row.info.id) {
+        case .killed:
+            killFailures.removeValue(forKey: row.id)
+        case .failed(let message):
+            killFailures[row.id] = message
+        }
         await refresh()
     }
 

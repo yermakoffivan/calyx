@@ -352,7 +352,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
                 // purely so that never-kill invariant is provable rather
                 // than papered over with a no-op closure.
                 guard let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID) else { return }
-                SessionKillTracker.track { await SessionDaemonClient.shared.kill(id: sessionID) }
+                SessionKillTracker.track { _ = await SessionDaemonClient.shared.kill(id: sessionID) }
             }
         )
 

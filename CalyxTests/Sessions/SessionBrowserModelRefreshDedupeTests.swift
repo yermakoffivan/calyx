@@ -53,7 +53,7 @@ private final class SuspendingCountingDaemonClient: SessionDaemonClientProtocol,
     }
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
 
     /// `NSLock.lock()`/`unlock()` are unavailable at the top level of an
     /// `async` function body under this toolchain's Swift 6 diagnostics

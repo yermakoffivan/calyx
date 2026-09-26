@@ -52,7 +52,7 @@ private final class SuspendingSessionDaemonClient: SessionDaemonClientProtocol, 
     }
 
     func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
 
     func listAll() async -> [SessionInfo] {
         await withCheckedContinuation { (continuation: CheckedContinuation<[SessionInfo], Never>) in

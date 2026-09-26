@@ -36,12 +36,26 @@ enum SessionQueryResult: Sendable, Equatable {
     case unreachable
 }
 
+/// Result of a local `SessionDaemonClientProtocol.kill(id:)` call, so
+/// callers that surface kill outcomes (the session browser's Kill
+/// button) can tell a real kill apart from one the daemon rejected or
+/// that never ran. `.failed`'s `message` is user-visible text: the
+/// `calyx-session kill` process's trimmed stderr, a synthesized
+/// exit-status line when stderr is empty, or the spawn error's
+/// description when the process could not be run at all.
+enum SessionKillOutcome: Equatable, Sendable {
+    case killed
+    case failed(message: String)
+}
+
 /// Abstraction over the daemon query/kill operations so
 /// `SessionReconnectCoordinator` can be tested with a fake, without
 /// spawning a real `calyx-session` process.
 protocol SessionDaemonClientProtocol: Sendable {
     func sessionState(id: String) async -> SessionQueryResult
-    func kill(id: String) async
+    /// Kills the LOCAL daemon's session `id` and reports whether the
+    /// daemon accepted the kill -- see `SessionKillOutcome`.
+    func kill(id: String) async -> SessionKillOutcome
     /// The full ledger view (`ls --all --json`) -- every session the
     /// daemon has ever recorded, running or exited, with `meta`. Added
     /// for `SessionBrowserModel`.
@@ -487,14 +501,36 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// cancellation is never inherited from its creating context, so
     /// ambient cancellation of any future caller's Task can no longer
     /// reach it.
-    func kill(id: String) async {
-        guard let binaryPath else { return }
+    ///
+    /// The command's result is mapped to a `SessionKillOutcome` rather
+    /// than discarded: exit status 0 is `.killed`; a nonzero exit is
+    /// `.failed` carrying the trimmed stderr (or, when stderr is empty,
+    /// `"calyx-session kill exited with status N"`); a thrown spawn
+    /// error is `.failed` carrying that error's `localizedDescription`;
+    /// and an unresolvable local binary is `.failed` without ever
+    /// invoking the command runner.
+    func kill(id: String) async -> SessionKillOutcome {
+        guard let binaryPath else {
+            return .failed(message: "calyx-session binary not found")
+        }
         let commandRunner = self.commandRunner
         let runtimeDirArgument = self.runtimeDirArgument
-        await Task {
-            _ = try? await commandRunner.run(
-                executable: binaryPath, arguments: runtimeDirArgument + ["kill", id], workingDirectory: nil, environment: nil
-            )
+        return await Task {
+            let result: CommandResult
+            do {
+                result = try await commandRunner.run(
+                    executable: binaryPath, arguments: runtimeDirArgument + ["kill", id], workingDirectory: nil, environment: nil
+                )
+            } catch {
+                return .failed(message: error.localizedDescription)
+            }
+            guard result.exitCode == 0 else {
+                let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                return .failed(
+                    message: stderr.isEmpty ? "calyx-session kill exited with status \(result.exitCode)" : stderr
+                )
+            }
+            return .killed
         }.value
     }
 
@@ -516,8 +552,10 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         return sessions
     }
 
-    /// Shells out to `meta set <id> <key>=<value>` exactly like
-    /// `kill(id:)` above, ignoring the result the same way — a failed
+    /// Shells out to `meta set <id> <key>=<value>` with the same
+    /// `--runtime-dir`-prefixed argv shape as `kill(id:)` above, but
+    /// ignoring the result (unlike `kill(id:)`, which reports a
+    /// `SessionKillOutcome`) — a failed
     /// meta write is not user-visible, it just means resume won't be
     /// offered next time. Left unbounded: a WRITE, so bounding it would
     /// need an abandon-style wrapper that resumes the caller without

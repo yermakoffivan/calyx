@@ -1469,7 +1469,7 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
     private final class FakeAgentEventDaemonClient: SessionDaemonClientProtocol, @unchecked Sendable {
         private(set) var metaSetCalls: [(id: String, key: String, value: String)] = []
         func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-        func kill(id: String) async {}
+        func kill(id: String) async -> SessionKillOutcome { .killed }
         func listAll() async -> [SessionInfo] { [] }
         func setMeta(id: String, key: String, value: String) async {
             metaSetCalls.append((id, key, value))

@@ -112,7 +112,7 @@ private final class FakeSessionDaemonClient: SessionDaemonClientProtocol, @unche
         return result
     }
 
-    func kill(id: String) async {}
+    func kill(id: String) async -> SessionKillOutcome { .killed }
 }
 
 @MainActor

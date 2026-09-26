@@ -1223,7 +1223,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let host {
                 await SessionDaemonClient.shared.killRemote(host: host, sessionID: sessionID)
             } else {
-                await SessionDaemonClient.shared.kill(id: sessionID)
+                _ = await SessionDaemonClient.shared.kill(id: sessionID)
             }
         }
     }

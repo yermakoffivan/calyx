@@ -67,7 +67,7 @@ final class HistoryPersistenceToggleCoordinatorTests: XCTestCase {
         }
 
         func sessionState(id: String) async -> SessionQueryResult { .unreachable }
-        func kill(id: String) async {}
+        func kill(id: String) async -> SessionKillOutcome { .killed }
         func setHistoryEnabled(_ enabled: Bool) async {
             record(enabled)
         }
