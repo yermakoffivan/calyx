@@ -545,93 +545,31 @@ impl Conn {
 
     fn kill(&mut self, id: &str) -> bool {
         {
-            // killpg under the registry lock on purpose: a forked
-            // session removes its entry *before* reaping (see the
-            // teardown ordering in session.rs), so for it "entry
-            // present" here proves the child is not yet reaped and its
-            // pid cannot have been reused. An adopted session this
-            // daemon never forked has no such guarantee (init may have
-            // reaped it and recycled the pid, the handoff module doc's
-            // experimental known limitation); signalling it is still
-            // the right move, and if its session thread has already
-            // returned (a still-alive-at-poll-bound ghost, S1) the wait
-            // loop below reconciles it once the signal takes effect.
-            let mut state = self.shared.lock_state();
-            match state.sessions.get(id) {
-                Some(entry) => {
-                    // The child is a session leader (setsid in
-                    // pre_exec), so its process group id is its pid;
-                    // killpg reaches that group. For a default macOS
-                    // session the child is login(1), whose shell runs
-                    // as login's own child in its own process group:
-                    // an interactive shell with job control makes
-                    // itself a process group leader (observed for
-                    // zsh: login pgid == login pid, zsh pgid == zsh
-                    // pid), so killpg does not reach the shell
-                    // directly. What terminates it is the kernel:
-                    // when the session leader dies, the foreground
-                    // process group of its controlling terminal gets
-                    // SIGHUP, and closing the PTY master hangs the
-                    // line up as well, the same termination ordinary
-                    // terminal panes and tmux rely on, and a process
-                    // that ignores SIGHUP outlives the session by
-                    // design (nohup). ESRCH means it beat us to
-                    // exiting.
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(entry.pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+            // Up-front classification of an id with no registry entry.
+            // A registered id is signalled inside the wait loop below.
+            let state = self.shared.lock_state();
+            if !state.sessions.contains_key(id) {
+                let ledger_running = matches!(
+                    state.ledger.get(id).map(|info| info.state),
+                    Some(SessionState::Running)
+                );
+                // A session detached for an in-progress Live Handoff
+                // is out of the live registry but still `Running` in
+                // the ledger (handoff module doc): it is paused, not
+                // gone, and will resume on this daemon or migrate to
+                // the new one. Reply retryably rather than silently
+                // swallowing the kill as no-such-session (P6 review
+                // H4 / E#3).
+                if ledger_running && self.shared.handoff_in_progress.load(Ordering::SeqCst) {
+                    drop(state);
+                    return self.reply(&err_handoff_in_progress(id));
                 }
-                None => {
-                    // A session detached for an in-progress Live Handoff
-                    // is out of the live registry but still `Running` in
-                    // the ledger (handoff module doc): it is paused, not
-                    // gone, and will resume on this daemon or migrate to
-                    // the new one. Reply retryably rather than silently
-                    // swallowing the kill as no-such-session (P6 review
-                    // H4 / E#3). Any other missing id is a genuine
-                    // no-such-session.
-                    if self.shared.handoff_in_progress.load(Ordering::SeqCst)
-                        && matches!(
-                            state.ledger.get(id).map(|info| info.state),
-                            Some(SessionState::Running)
-                        )
-                    {
-                        drop(state);
-                        return self.reply(&ControlMsg::Err {
-                            code: "handoff-in-progress".to_string(),
-                            msg: format!(
-                                "session {id:?} is paused for a live handoff; retry the kill \
-                                 shortly"
-                            ),
-                        });
-                    }
-                    // Not mid-handoff, but the ledger still says
-                    // `Running`: a prior daemon generation died without
-                    // flipping this record (`reconcile_unowned_running`'s
-                    // doc comment), so its backing process, if it still
-                    // exists at all, is unreachable and unverifiable by
-                    // this daemon. There is nothing left to signal, so
-                    // flip the ledger record directly and persist it,
-                    // then fall through to the wait loop below, which
-                    // already treats an unregistered id whose ledger
-                    // state is `Exited` as gone and replies `KillOk` --
-                    // reusing that path rather than duplicating its
-                    // reply.
-                    if matches!(
-                        state.ledger.get(id).map(|info| info.state),
-                        Some(SessionState::Running)
-                    ) {
-                        if let Some(info) = state.ledger.get_mut(id) {
-                            info.state = SessionState::Exited { code: -1 };
-                            info.exited_at_ms = Some(crate::ledger::now_unix_ms());
-                        }
-                        state.touch();
-                        self.shared.persist_ledger(&state);
-                    } else {
-                        drop(state);
-                        return self.reply(&err_no_session(id));
-                    }
+                // Any other missing id without a `Running` record is a
+                // genuine no-such-session. An unregistered `Running`
+                // record is NOT judged here: see the wait loop.
+                if !ledger_running {
+                    drop(state);
+                    return self.reply(&err_no_session(id));
                 }
             }
         }
@@ -642,29 +580,112 @@ impl Conn {
         // deterministic. A live session's own thread does that flip and
         // wakes the condvar; a dead-thread adopted ghost has no such
         // thread, so this loop drives `reconcile_adopted_ghost` itself
-        // once the signal above has taken effect (P6 fix-batch S1). It
-        // no-ops for a live session, so it never races that session's
-        // own teardown.
+        // once the signal has taken effect (P6 fix-batch S1). It no-ops
+        // for a live session, so it never races that session's own
+        // teardown.
+        //
+        // An unregistered id whose ledger record is still `Running`
+        // (no handoff in progress) is almost always a forked session
+        // mid-teardown: session.rs removes the registry entry BEFORE
+        // `child.reap` and flips the ledger to the real exit code only
+        // after it. True ghosts left by a dead daemon generation are
+        // already flipped at startup by `ledger::reconcile_unowned_running`
+        // (lib.rs), so flipping such a record to `Exited{-1}` on first
+        // sight would reply `KillOk` before the reap and write a bogus
+        // `-1` the teardown then overwrites. Instead this one loop waits
+        // on `shared.cond` with three outcomes:
+        //   (a) the record leaves `Running` (the teardown's real flip):
+        //       the id is gone, reply `KillOk`;
+        //   (b) a registry entry (re)appears: signal it as a live
+        //       session and keep waiting for its reap;
+        //   (c) `KILL_WAIT` expires with the record still `Running` and
+        //       still unregistered: nothing owns it, so only then flip
+        //       it to `Exited{-1}`, persist, and reply `KillOk`.
         let deadline = Instant::now() + KILL_WAIT;
+        let mut signalled = false;
         loop {
             crate::handoff::reconcile_adopted_ghost(&self.shared, id);
 
-            let state = self.shared.lock_state();
-            let gone = !state.sessions.contains_key(id)
-                && state
-                    .ledger
-                    .get(id)
-                    .is_none_or(|info| matches!(info.state, SessionState::Exited { .. }));
-            if gone {
+            let mut state = self.shared.lock_state();
+            let registered = match state.sessions.get(id) {
+                Some(entry) => {
+                    if !signalled {
+                        // killpg under the registry lock on purpose: a
+                        // forked session removes its entry *before*
+                        // reaping (see the teardown ordering in
+                        // session.rs), so for it "entry present" here
+                        // proves the child is not yet reaped and its
+                        // pid cannot have been reused. An adopted
+                        // session this daemon never forked has no such
+                        // guarantee (init may have reaped it and
+                        // recycled the pid, the handoff module doc's
+                        // experimental known limitation); signalling it
+                        // is still the right move, and if its session
+                        // thread has already returned (a
+                        // still-alive-at-poll-bound ghost, S1)
+                        // `reconcile_adopted_ghost` above reconciles it
+                        // once the signal takes effect.
+                        //
+                        // The child is a session leader (setsid in
+                        // pre_exec), so its process group id is its
+                        // pid; killpg reaches that group. For a default
+                        // macOS session the child is login(1), whose
+                        // shell runs as login's own child in its own
+                        // process group: an interactive shell with job
+                        // control makes itself a process group leader
+                        // (observed for zsh: login pgid == login pid,
+                        // zsh pgid == zsh pid), so killpg does not
+                        // reach the shell directly. What terminates it
+                        // is the kernel: when the session leader dies,
+                        // the foreground process group of its
+                        // controlling terminal gets SIGHUP, and closing
+                        // the PTY master hangs the line up as well, the
+                        // same termination ordinary terminal panes and
+                        // tmux rely on, and a process that ignores
+                        // SIGHUP outlives the session by design
+                        // (nohup). ESRCH means it beat us to exiting.
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(entry.pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        signalled = true;
+                    }
+                    true
+                }
+                None => false,
+            };
+            let ledger_running = matches!(
+                state.ledger.get(id).map(|info| info.state),
+                Some(SessionState::Running)
+            );
+            if !registered && !ledger_running {
+                // (a): gone (ledger `Exited`, or the record vanished).
                 break;
             }
             let now = Instant::now();
             if now >= deadline {
-                drop(state);
-                return self.reply(&ControlMsg::Err {
-                    code: "kill-timeout".to_string(),
-                    msg: format!("session {id:?} did not exit within {KILL_WAIT:?}"),
-                });
+                if registered {
+                    drop(state);
+                    return self.reply(&ControlMsg::Err {
+                        code: "kill-timeout".to_string(),
+                        msg: format!("session {id:?} did not exit within {KILL_WAIT:?}"),
+                    });
+                }
+                // (c): still unregistered and `Running`. A handoff that
+                // began during the wait pauses sessions the same way;
+                // such a record is not unowned, so reply retryably.
+                if self.shared.handoff_in_progress.load(Ordering::SeqCst) {
+                    drop(state);
+                    return self.reply(&err_handoff_in_progress(id));
+                }
+                if let Some(info) = state.ledger.get_mut(id) {
+                    info.state = SessionState::Exited { code: -1 };
+                    info.exited_at_ms = Some(crate::ledger::now_unix_ms());
+                }
+                state.touch();
+                self.shared.persist_ledger(&state);
+                self.shared.cond.notify_all();
+                break;
             }
             // Cap the wait so a ghost's liveness is re-polled promptly:
             // nothing wakes the condvar for a dead-thread ghost, so an
@@ -780,6 +801,13 @@ impl Conn {
             Ok(payload) => self.queue.push(FrameType::Control, payload),
             Err(_) => false,
         }
+    }
+}
+
+fn err_handoff_in_progress(id: &str) -> ControlMsg {
+    ControlMsg::Err {
+        code: "handoff-in-progress".to_string(),
+        msg: format!("session {id:?} is paused for a live handoff; retry the kill shortly"),
     }
 }
 
@@ -1286,6 +1314,101 @@ mod tests {
             ),
             "an id present in neither the registry nor the ledger must still get \
              no-such-session, got {other_msg:?}"
+        );
+    }
+
+    /// A forked session's teardown removes its registry entry BEFORE
+    /// `child.reap` and flips the ledger to `Exited{real code}` only
+    /// after the reap (session.rs teardown). A `Kill` landing in that
+    /// window sees "unregistered + ledger Running + no handoff", the
+    /// same shape as a dead-generation ghost, but it must NOT flip the
+    /// record to `Exited{-1}` and reply immediately: it must wait on
+    /// `shared.cond` (as `attach_exited` does with `TEARDOWN_WAIT`) for
+    /// the teardown's real flip, and reply `KillOk` only after it.
+    #[test]
+    fn kill_during_teardown_window_waits_for_the_real_exit_code_instead_of_flipping_to_minus_one()
+    {
+        use std::sync::atomic::AtomicBool;
+
+        const TEARDOWN_DELAY: Duration = Duration::from_millis(200);
+
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let id = "01J-kill-mid-teardown-window-test".to_string();
+
+        // Mid-teardown state: registry entry already removed, ledger
+        // still `Running`, no handoff in progress.
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(
+                id.clone(),
+                proto::SessionInfo {
+                    id: id.clone(),
+                    name: None,
+                    cwd: None,
+                    state: SessionState::Running,
+                    created_at_ms: 1_700_000_000_000,
+                    attached_clients: 0,
+                    pid: 999_999,
+                    meta: std::collections::BTreeMap::new(),
+                    exited_at_ms: None,
+                },
+            );
+        }
+        assert!(!shared.handoff_in_progress.load(Ordering::SeqCst));
+
+        let flipped = Arc::new(AtomicBool::new(false));
+        // Simulates session.rs's post-reap block.
+        let teardown = {
+            let shared = Arc::clone(&shared);
+            let id = id.clone();
+            let flipped = Arc::clone(&flipped);
+            thread::spawn(move || {
+                thread::sleep(TEARDOWN_DELAY);
+                let mut state = shared.lock_state();
+                // Flag set under the lock, before the flip becomes visible.
+                flipped.store(true, Ordering::SeqCst);
+                if let Some(info) = state.ledger.get_mut(&id) {
+                    info.state = SessionState::Exited { code: 7 };
+                    info.pid = 0;
+                    info.attached_clients = 0;
+                    info.exited_at_ms = Some(crate::ledger::now_unix_ms());
+                }
+                state.touch();
+                shared.persist_ledger(&state);
+                shared.cond.notify_all();
+            })
+        };
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 21);
+        let started = Instant::now();
+        let keep_going = conn.kill(&id);
+        let elapsed = started.elapsed();
+        let flipped_before_reply = flipped.load(Ordering::SeqCst);
+        teardown.join().expect("teardown helper thread");
+
+        assert!(keep_going, "kill must reply normally, not drop the connection");
+        let frame = reader.read_frame().expect("read the Kill reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Kill reply");
+        assert!(
+            matches!(msg, ControlMsg::KillOk),
+            "Kill during the teardown window must reply KillOk, got {msg:?}"
+        );
+        assert!(
+            flipped_before_reply,
+            "Kill replied before the teardown recorded the real exit (elapsed {elapsed:?}); \
+             KillOk must only follow the reap's ledger flip"
+        );
+        assert!(
+            elapsed >= TEARDOWN_DELAY,
+            "Kill returned after {elapsed:?}, before the {TEARDOWN_DELAY:?} teardown flip"
+        );
+
+        let final_state = shared.lock_state().ledger.get(&id).map(|i| i.state);
+        assert_eq!(
+            final_state,
+            Some(SessionState::Exited { code: 7 }),
+            "the ledger must hold the teardown's real exit code, never a Kill-written -1"
         );
     }
 }
