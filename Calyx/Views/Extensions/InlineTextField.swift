@@ -57,7 +57,9 @@ struct InlineTextField: NSViewRepresentable {
         context.coordinator.textField = textField
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            context.coordinator.installClickMonitor()
+            MainActor.assumeIsolated {
+                context.coordinator.installClickMonitor()
+            }
         }
 
         return textField
@@ -68,6 +70,7 @@ struct InlineTextField: NSViewRepresentable {
         context.coordinator.onCancel = onCancel
     }
 
+    @MainActor
     class Coordinator: NSObject, NSTextFieldDelegate {
         weak var textField: NSTextField?
         var onCommit: (String) -> Void
@@ -92,7 +95,7 @@ struct InlineTextField: NSViewRepresentable {
                     if textField.bounds.contains(point) {
                         return event
                     }
-                    if let editor = textField.currentEditor() as? NSView {
+                    if let editor = textField.currentEditor() {
                         let editorPoint = editor.convert(event.locationInWindow, from: nil)
                         if editor.bounds.contains(editorPoint) {
                             return event
@@ -138,7 +141,7 @@ struct InlineTextField: NSViewRepresentable {
             finish(commit: true)
         }
 
-        deinit {
+        isolated deinit {
             removeClickMonitor()
         }
     }

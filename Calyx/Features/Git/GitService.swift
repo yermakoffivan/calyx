@@ -4,6 +4,7 @@
 // Executes git commands and parses output. All methods run off-main-thread.
 
 import Foundation
+import os
 
 /// One record of `git worktree list --porcelain`. `path` is the only
 /// attribute the porcelain schema guarantees; everything else is optional
@@ -640,20 +641,24 @@ enum GitService {
                     DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: timeoutItem)
 
                     // Read both pipes concurrently to avoid deadlock
-                    var stdoutData = Data()
-                    var stderrData = Data()
+                    let stdoutBox = OSAllocatedUnfairLock(initialState: Data())
+                    let stderrBox = OSAllocatedUnfairLock(initialState: Data())
                     let readGroup = DispatchGroup()
                     readGroup.enter()
                     DispatchQueue.global().async {
-                        stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                        stdoutBox.withLock { $0 = data }
                         readGroup.leave()
                     }
                     readGroup.enter()
                     DispatchQueue.global().async {
-                        stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        stderrBox.withLock { $0 = data }
                         readGroup.leave()
                     }
                     readGroup.wait()
+                    let stdoutData = stdoutBox.withLock { $0 }
+                    let stderrData = stderrBox.withLock { $0 }
 
                     process.waitUntilExit()
                     timeoutItem.cancel()

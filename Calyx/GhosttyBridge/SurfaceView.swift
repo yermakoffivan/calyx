@@ -151,13 +151,11 @@ class SurfaceView: NSView {
         fatalError("init(coder:) is not supported for this view")
     }
 
-    deinit {
-        MainActor.assumeIsolated {
-            smoothScrollResetTimer?.invalidate()
-            virtualMomentumTimer?.invalidate()
-            if let obs = smoothScrollSettingObserver {
-                NotificationCenter.default.removeObserver(obs)
-            }
+    isolated deinit {
+        smoothScrollResetTimer?.invalidate()
+        virtualMomentumTimer?.invalidate()
+        if let obs = smoothScrollSettingObserver {
+            NotificationCenter.default.removeObserver(obs)
         }
         trackingAreas.forEach { removeTrackingArea($0) }
         if _hasSecureInput {

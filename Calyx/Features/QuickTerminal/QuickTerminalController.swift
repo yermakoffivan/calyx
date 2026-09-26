@@ -211,20 +211,22 @@ class QuickTerminalController: NSObject, NSWindowDelegate {
             context.timingFunction = .init(name: .easeIn)
             position.setFinal(in: window.animator(), on: screen, terminalSize: terminalSize)
         }, completionHandler: {
-            guard self.visible else {
-                self.hiddenDock = nil
-                return
-            }
-            window.level = .floating
+            MainActor.assumeIsolated {
+                guard self.visible else {
+                    self.hiddenDock = nil
+                    return
+                }
+                window.level = .floating
 
-            if let tab = self.tab,
-               let surfaceID = tab.registry.allIDs.first,
-               let surfaceView = tab.registry.view(for: surfaceID) {
-                window.makeFirstResponder(surfaceView)
-            }
+                if let tab = self.tab,
+                   let surfaceID = tab.registry.allIDs.first,
+                   let surfaceView = tab.registry.view(for: surfaceID) {
+                    window.makeFirstResponder(surfaceView)
+                }
 
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
+                if !NSApp.isActive {
+                    NSApp.activate(ignoringOtherApps: true)
+                }
             }
         })
     }
@@ -255,7 +257,9 @@ class QuickTerminalController: NSObject, NSWindowDelegate {
             context.timingFunction = .init(name: .easeIn)
             position.setInitial(in: window.animator(), on: screen, terminalSize: terminalSize)
         }, completionHandler: {
-            window.orderOut(self)
+            MainActor.assumeIsolated {
+                window.orderOut(self)
+            }
         })
     }
 

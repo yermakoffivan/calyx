@@ -6,6 +6,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import os
 
 struct MainContentView: View {
     @Bindable var windowSession: WindowSession
@@ -533,8 +534,7 @@ struct TerminalDropDelegate: DropDelegate {
         guard !providers.isEmpty else { return false }
 
         let group = DispatchGroup()
-        var paths: [(Int, String)] = []
-        let lock = NSLock()
+        let paths = OSAllocatedUnfairLock<[(Int, String)]>(initialState: [])
 
         for (i, provider) in providers.enumerated() {
             group.enter()
@@ -543,14 +543,12 @@ struct TerminalDropDelegate: DropDelegate {
                 guard let data = data as? Data,
                       let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 let escaped = ShellEscape.escape(url.path)
-                lock.lock()
-                paths.append((i, escaped))
-                lock.unlock()
+                paths.withLock { $0.append((i, escaped)) }
             }
         }
 
         group.notify(queue: .main) {
-            let joined = paths.sorted { $0.0 < $1.0 }.map(\.1).joined(separator: " ")
+            let joined = paths.withLock { $0 }.sorted { $0.0 < $1.0 }.map(\.1).joined(separator: " ")
             if !joined.isEmpty {
                 surfaceController.sendText(joined)
             }

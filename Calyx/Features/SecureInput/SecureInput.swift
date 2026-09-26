@@ -2,7 +2,8 @@ import Carbon
 import Cocoa
 import OSLog
 
-class SecureInput: ObservableObject, @unchecked Sendable {
+@MainActor
+final class SecureInput: ObservableObject {
     static let shared = SecureInput()
 
     private static let logger = Logger(
@@ -36,7 +37,7 @@ class SecureInput: ObservableObject, @unchecked Sendable {
                           name: NSApplication.didBecomeActiveNotification, object: nil)
     }
 
-    deinit {
+    isolated deinit {
         NotificationCenter.default.removeObserver(self)
         scoped.removeAll()
         global = false

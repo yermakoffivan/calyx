@@ -509,9 +509,9 @@ class SurfaceScrollView: NSView {
             object: surfaceView,
             queue: .main
         ) { [weak self] notification in
+            let needle = notification.userInfo?["needle"] as? String ?? ""
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let needle = notification.userInfo?["needle"] as? String ?? ""
                 self.showSearchBar(needle: needle)
             }
         }
@@ -531,8 +531,9 @@ class SurfaceScrollView: NSView {
             object: surfaceView,
             queue: .main
         ) { [weak self] notification in
+            guard let total = notification.userInfo?["total"] as? Int else { return }
             MainActor.assumeIsolated {
-                guard let self, let total = notification.userInfo?["total"] as? Int else { return }
+                guard let self else { return }
                 self.searchBar?.updateMatchTotal(total)
             }
         }
@@ -542,8 +543,9 @@ class SurfaceScrollView: NSView {
             object: surfaceView,
             queue: .main
         ) { [weak self] notification in
+            guard let selected = notification.userInfo?["selected"] as? Int else { return }
             MainActor.assumeIsolated {
-                guard let self, let selected = notification.userInfo?["selected"] as? Int else { return }
+                guard let self else { return }
                 self.searchBar?.updateMatchSelected(selected)
             }
         }

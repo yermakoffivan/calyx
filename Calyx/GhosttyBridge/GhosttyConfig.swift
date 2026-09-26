@@ -441,7 +441,7 @@ final class GhosttyConfigManager {
     ///   - key: The configuration key.
     ///   - value: Pointer to the value to populate.
     /// - Returns: `true` if the value was found.
-    func get<T>(_ key: String, value: inout T) -> Bool {
+    func get<T: BitwiseCopyable>(_ key: String, value: inout T) -> Bool {
         guard let cfg = config else { return false }
         return key.withCString { ptr in
             GhosttyFFI.configGet(cfg, &value, ptr, UInt(key.utf8.count))

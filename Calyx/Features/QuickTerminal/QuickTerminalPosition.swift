@@ -1,5 +1,6 @@
 import Cocoa
 
+@MainActor
 enum QuickTerminalPosition: String {
     case top
     case bottom
