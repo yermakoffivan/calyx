@@ -8,9 +8,9 @@ Calyx is a native macOS terminal for running and supervising coding agents (Clau
 
 ## Demo
 
-Three Claude Code agents run in parallel while Calyx keeps approvals and command output in one control surface (36s):
+Every agent pane on the Mission Map, approvals from one inbox, per-line diff comments sent straight to the agent, tab groups, and every command in the palette (30s):
 
-https://github.com/user-attachments/assets/a04e1161-e296-4791-9b7c-3ef84d990089
+https://github.com/user-attachments/assets/bcc425c6-2115-46d9-970a-87063818ded7
 
 ## Install
 
