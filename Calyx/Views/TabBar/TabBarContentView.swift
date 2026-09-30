@@ -379,20 +379,16 @@ private struct TabBarBackgroundModifier: ViewModifier {
     }
 
     private var chromeScheme: ColorScheme {
-        let tint = GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+        let tint = reduceTransparency ? GlassTheme.reducedTransparencyFill(for: themeColor) : GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
         return ColorLuminance.prefersDarkText(for: tint) ? .light : .dark
     }
 
     func body(content: Content) -> some View {
-        if reduceTransparency {
-            content.background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea(.all, edges: .top))
-        } else {
-            content
-                .environment(\.colorScheme, chromeScheme)
-                .foregroundStyle(themePreset == "ghostty"
-                    ? AnyShapeStyle(Color(nsColor: ghosttyProvider.ghosttyForeground))
-                    : AnyShapeStyle(.primary))
-        }
+        content
+            .environment(\.colorScheme, chromeScheme)
+            .foregroundStyle(themePreset == "ghostty"
+                ? AnyShapeStyle(Color(nsColor: ghosttyProvider.ghosttyForeground))
+                : AnyShapeStyle(.primary))
     }
 }
 

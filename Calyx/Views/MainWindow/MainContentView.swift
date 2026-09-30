@@ -337,7 +337,7 @@ struct MainContentView: View {
         .background {
             Group {
                 if reduceTransparency {
-                    Color(nsColor: .windowBackgroundColor)
+                    Color(nsColor: GlassTheme.reducedTransparencyFill(for: themeColor))
                 } else {
                     Color.clear
                         .modifier(GlassInactiveTintModifier(themeColor: themeColor, glassOpacity: glassOpacity))
@@ -493,12 +493,6 @@ private final class TerminalGlassHostView: NSView {
     }
 
     func update(splitContainerView: SplitContainerView, reduceTransparency: Bool, glassOpacity: Double) {
-        if reduceTransparency {
-            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
-        }
-
         if splitContainerView.superview !== self {
             splitContainerView.removeFromSuperview()
             splitContainerView.translatesAutoresizingMaskIntoConstraints = false

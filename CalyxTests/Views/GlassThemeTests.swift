@@ -155,3 +155,86 @@ struct GlassThemeColorDerivationTests {
         )
     }
 }
+
+// MARK: - Reduce Transparency Fill Tests
+
+@Suite("GlassTheme reducedTransparencyFill")
+struct GlassThemeReducedTransparencyFillTests {
+
+    private let tolerance: CGFloat = 0.005
+
+    private func hsba(of color: NSColor) -> (h: CGFloat, s: CGFloat, b: CGFloat, a: CGFloat) {
+        let c = color.usingColorSpace(.sRGB) ?? color
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return (h, s, b, a)
+    }
+
+    private func rgba(of color: NSColor) -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
+        let c = color.usingColorSpace(.sRGB) ?? color
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return (r, g, b, a)
+    }
+
+    @Test("fill is fully opaque")
+    func fillIsOpaque() {
+        let input = NSColor(srgbRed: 0.1, green: 0.2, blue: 0.4, alpha: 0.3)
+        let fill = GlassTheme.reducedTransparencyFill(for: input)
+        #expect(abs(rgba(of: fill).a - 1.0) < tolerance)
+    }
+
+    @Test("saturated input preserves hue, saturation, brightness")
+    func saturatedPreservesHSB() {
+        // sRGB(0.1, 0.2, 0.4): max=0.4, min=0.1 -> s=0.75, b=0.4,
+        // hue=(4 + (0.1-0.2)/0.3)/6 = 0.6111
+        let input = NSColor(srgbRed: 0.1, green: 0.2, blue: 0.4, alpha: 1.0)
+        let out = hsba(of: GlassTheme.reducedTransparencyFill(for: input))
+        #expect(abs(out.h - 0.6111) < tolerance)
+        #expect(abs(out.s - 0.75) < tolerance)
+        #expect(abs(out.b - 0.4) < tolerance)
+        #expect(abs(out.a - 1.0) < tolerance)
+    }
+
+    @Test("neutral input yields zero saturation with brightness preserved")
+    func neutralDesaturates() {
+        // sRGB(0.5, 0.5, 0.51): s = 0.01/0.51 ~ 0.0196 (< 0.05), b = 0.51
+        let input = NSColor(srgbRed: 0.5, green: 0.5, blue: 0.51, alpha: 1.0)
+        let fill = GlassTheme.reducedTransparencyFill(for: input)
+        let out = hsba(of: fill)
+        #expect(out.s < tolerance)
+        #expect(abs(out.b - 0.51) < tolerance)
+        let (r, g, b, a) = rgba(of: fill)
+        #expect(abs(r - 0.51) < tolerance)
+        #expect(abs(g - 0.51) < tolerance)
+        #expect(abs(b - 0.51) < tolerance)
+        #expect(abs(a - 1.0) < tolerance)
+    }
+
+    @Test("fill equals chromeTint at glassOpacity 1.0", arguments: [
+        NSColor(srgbRed: 0.1, green: 0.2, blue: 0.4, alpha: 1.0),
+        NSColor(srgbRed: 0.5, green: 0.5, blue: 0.51, alpha: 1.0),
+        NSColor(srgbRed: 0.3, green: 0.02, blue: 0.02, alpha: 0.5),
+        ThemeColorPreset.original.color,
+    ])
+    func matchesChromeTintAtFullOpacity(input: NSColor) {
+        let fill = rgba(of: GlassTheme.reducedTransparencyFill(for: input))
+        let tint = rgba(of: GlassTheme.chromeTint(for: input, glassOpacity: 1.0))
+        #expect(abs(fill.r - tint.r) < tolerance)
+        #expect(abs(fill.g - tint.g) < tolerance)
+        #expect(abs(fill.b - tint.b) < tolerance)
+        #expect(abs(fill.a - tint.a) < tolerance)
+    }
+
+    @Test("Original preset fill does not prefer dark text")
+    func originalPresetPrefersLightText() {
+        let fill = GlassTheme.reducedTransparencyFill(for: ThemeColorPreset.original.color)
+        #expect(ColorLuminance.prefersDarkText(for: fill) == false)
+        let (r, g, b, a) = rgba(of: fill)
+        // #050D1C = (5, 13, 28) / 255
+        #expect(abs(r - 5.0 / 255.0) < tolerance)
+        #expect(abs(g - 13.0 / 255.0) < tolerance)
+        #expect(abs(b - 28.0 / 255.0) < tolerance)
+        #expect(abs(a - 1.0) < tolerance)
+    }
+}

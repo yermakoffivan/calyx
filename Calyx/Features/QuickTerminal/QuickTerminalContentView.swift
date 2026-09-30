@@ -38,7 +38,7 @@ struct QuickTerminalContentView: View {
         .background {
             Group {
                 if reduceTransparency {
-                    Color(nsColor: .windowBackgroundColor)
+                    Color(nsColor: GlassTheme.reducedTransparencyFill(for: themeColor))
                 } else {
                     Color.clear
                         .modifier(GlassInactiveTintModifier(themeColor: themeColor, glassOpacity: glassOpacity))

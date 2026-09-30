@@ -23,6 +23,11 @@ enum GlassTheme {
         return NSColor(hue: hsb.hue, saturation: hsb.saturation, brightness: hsb.brightness, alpha: opacity)
     }
 
+    /// Opaque root-sheet fill used in place of the glass while Reduce Transparency is on.
+    static func reducedTransparencyFill(for themeColor: NSColor) -> NSColor {
+        chromeTint(for: themeColor, glassOpacity: 1.0)
+    }
+
     /// Derive atmosphere top gradient color from theme color.
     static func atmosphereTop(for themeColor: NSColor, glassOpacity: Double) -> NSColor {
         let hsb = toHSB(themeColor)
