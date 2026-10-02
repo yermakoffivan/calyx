@@ -9,12 +9,33 @@
 // nothing is created on disk.
 
 import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.calyx.terminal", category: "UsageLedger")
 
 // MARK: - Diagnostics
 
 enum UsageLedgerDiagnostic: Sendable, Equatable {
+    /// What failed, in two parts: text that may name a path (log it
+    /// private) and the error's domain and code, which never do (log
+    /// them public).
+    struct Failure: Sendable, Equatable {
+        /// `String(describing:)` of the error.
+        let description: String
+        /// The domain and code the error has as an `NSError`.
+        let domain: String
+        let code: Int
+
+        init(_ error: any Error) {
+            description = String(describing: error)
+            let bridged = error as NSError
+            domain = bridged.domain
+            code = bridged.code
+        }
+    }
+
     /// An ingest, or a store call around it, threw.
-    case ingestFailed(sessionID: String, error: String)
+    case ingestFailed(sessionID: String, error: Failure)
     /// The main transcript was there but could not be used:
     /// `.notARegularFile` or `.redirected`. Never reported for `.missing`.
     case mainTranscriptUnusable(sessionID: String, status: UsageIngestFileResult.Status)
@@ -22,7 +43,7 @@ enum UsageLedgerDiagnostic: Sendable, Equatable {
     case subagentFileNotRead(path: String, status: UsageIngestFileResult.Status)
     case projectRootResolutionFailed(sessionID: String)
     /// The store could not be opened or read outside an ingest.
-    case storeUnavailable(error: String)
+    case storeUnavailable(error: Failure)
 }
 
 // MARK: - UsageLedger
@@ -170,7 +191,7 @@ actor UsageLedger {
             let store = try openedStore()
             sessions = try await storeCall { try await store.sessions() }
         } catch {
-            onDiagnostic(.storeUnavailable(error: String(describing: error)))
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
             return
         }
         for session in sessions {
@@ -396,7 +417,7 @@ actor UsageLedger {
         do {
             store = try openedStore()
         } catch {
-            onDiagnostic(.storeUnavailable(error: String(describing: error)))
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
             return
         }
 
@@ -431,7 +452,7 @@ actor UsageLedger {
             }
             row = try await store.report(UsageQuery(sessionID: sessionID), calendar: Self.totalRowCalendar).first
         } catch {
-            onDiagnostic(.ingestFailed(sessionID: sessionID, error: String(describing: error)))
+            onDiagnostic(.ingestFailed(sessionID: sessionID, error: UsageLedgerDiagnostic.Failure(error)))
             return
         }
         // The flight is still registered, so a `deleteAll` that began
@@ -455,6 +476,106 @@ actor UsageLedger {
         changeWaiters = []
         for waiter in waiters {
             waiter.resume()
+        }
+    }
+}
+
+// MARK: - Production composition
+
+extension UsageLedger {
+    /// Whether the app's ledger tracks usage: the user's setting, and
+    /// only in a launch that may touch the real agent paths. A
+    /// `--uitesting` launch without a scoped path root resolves
+    /// `~/.claude` and the Application Support directory to the
+    /// developer's real ones, so tracking stays off there whatever the
+    /// setting says.
+    static func isTrackingEnabled(setting: Bool, launchMayTouchAgentPaths: Bool) -> Bool {
+        setting && launchMayTouchAgentPaths
+    }
+
+    /// The ledger the app runs: the real ingestor and git resolver, the
+    /// given setting, roots and summaries. Each session's total is
+    /// published into `summaries` on the main actor, and diagnostics go
+    /// to the unified log. Touches no file.
+    static func makeProduction(
+        isEnabled: @escaping @Sendable () -> Bool,
+        projectsRoot: @escaping @Sendable () -> String,
+        storeDirectory: URL,
+        summaries: UsageLiveSummaries
+    ) -> UsageLedger {
+        UsageLedger(
+            isEnabled: isEnabled,
+            projectsRoot: projectsRoot,
+            storeDirectory: storeDirectory,
+            ingest: { location, store in
+                try await UsageIngestor(store: store, resolver: GitProjectRootResolver()).ingest(location)
+            },
+            publish: { sessionID, row in
+                await summaries.set(row, forSession: sessionID)
+            },
+            onDiagnostic: { log($0) }
+        )
+    }
+
+    /// The app's ledger, over Claude Code's projects directory and the
+    /// usage directory in Application Support. Created at its first use,
+    /// on whichever thread that is; creating it only computes paths. The
+    /// setting and the launch policy are read at every call of
+    /// `isEnabled`, so a change of the setting applies to the next event.
+    static let shared = makeProduction(
+        isEnabled: {
+            isTrackingEnabled(
+                setting: UsageTrackingSettings.enabled,
+                launchMayTouchAgentPaths: LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()
+            )
+        },
+        projectsRoot: { AgentToolPaths.claudeProjectsDirectory },
+        storeDirectory: URL(fileURLWithPath: AppSupportDirectory.usagePath, isDirectory: true),
+        summaries: .shared
+    )
+
+    /// One log line per diagnostic. Session ids, paths and a failure's
+    /// description (which may name a path) keep the default private
+    /// privacy; a failure's domain and code, errno values and status
+    /// names are public, so a log that hides the text still tells a full
+    /// disk from a permission error. Nothing here comes from a
+    /// transcript's content.
+    private static func log(_ diagnostic: UsageLedgerDiagnostic) {
+        switch diagnostic {
+        case .ingestFailed(let sessionID, let error):
+            logger.error("""
+                Usage ingest failed for session \(sessionID): \
+                \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
+                """)
+        case .mainTranscriptUnusable(let sessionID, let status):
+            logger.warning(
+                "Main transcript of session \(sessionID) was not read: \(statusName(status), privacy: .public)")
+        case .subagentFileNotRead(let path, let status):
+            if case .failed(let code) = status {
+                logger.warning("""
+                    Subagent transcript \(path) was not read: \
+                    \(statusName(status), privacy: .public), errno \(code, privacy: .public)
+                    """)
+            } else {
+                logger.warning("Subagent transcript \(path) was not read: \(statusName(status), privacy: .public)")
+            }
+        case .projectRootResolutionFailed(let sessionID):
+            logger.warning("Project root of session \(sessionID) could not be resolved; its working directory is used")
+        case .storeUnavailable(let error):
+            logger.error("""
+                Usage store is unavailable: \
+                \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
+                """)
+        }
+    }
+
+    private static func statusName(_ status: UsageIngestFileResult.Status) -> String {
+        switch status {
+        case .read: return "read"
+        case .missing: return "missing"
+        case .notARegularFile: return "notARegularFile"
+        case .redirected: return "redirected"
+        case .failed: return "failed"
         }
     }
 }

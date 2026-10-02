@@ -42,6 +42,10 @@ class SettingsWindowController: NSWindowController {
     /// as `AppDelegate._shellIntegrationRootForTesting`. DO NOT use from
     /// production code.
     var _shellIntegrationRootForTesting: URL?
+
+    /// Test seam: the ledger `usageTrackingDidChange(_:)` reconciles,
+    /// instead of `UsageLedger.shared`. DO NOT use from production code.
+    var _usageLedgerForTesting: UsageLedger?
     #endif
 
     private init() {
@@ -158,6 +162,12 @@ class SettingsWindowController: NSWindowController {
                 title: "Agent Hook Approval",
                 subtitle: "Routes Claude Code and Codex permission prompts, all always-approve Grok tool calls, and every pi tool call to the Calyx approval banner. Off = agents decide alone, and pi, which has no prompt of its own, just runs the call."
             )
+        case .usageTracking:
+            return SectionHeading(
+                title: "Usage Tracking",
+                subtitle: "Records Claude Code token usage per model and effort from its transcripts. Only numbers "
+                    + "and labels are stored, never conversation text. Needs AI Agent IPC."
+            )
         case .mcpServers:
             return SectionHeading(
                 title: "MCP Apps",
@@ -228,6 +238,8 @@ class SettingsWindowController: NSWindowController {
             return commandTrackingRow()
         case .agentHookApproval:
             return agentHookApprovalRow()
+        case .usageTracking:
+            return usageTrackingRow()
         case .mcpServers:
             return mcpServersRow()
         case .openSessionBrowserButton:
@@ -322,6 +334,7 @@ class SettingsWindowController: NSWindowController {
     /// across multiple panes, each backed by its own store: SessionSettings
     /// for the session rows, CockpitSettings for cockpitAutoApprove and
     /// agentHookApproval, CommandTrackingSettings for commandTracking,
+    /// UsageTrackingSettings for usageTracking,
     /// and UserDefaults.standard directly for
     /// glassOpacityCells (it has no dedicated settings type). Extracted as its own function (rather than
     /// reading each backing store directly inline in each row builder)
@@ -341,6 +354,7 @@ class SettingsWindowController: NSWindowController {
         case .cockpitAutoApprove: return CockpitSettings.autoApproveEnabled
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
         case .agentHookApproval: return CockpitSettings.agentHookApprovalEnabled
+        case .usageTracking: return UsageTrackingSettings.enabled
         case .glassOpacityCells: return UserDefaults.standard.bool(forKey: "terminalGlassOpacityCells")
         default: return false
         }
@@ -440,6 +454,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(agentHookApprovalDidChange(_:))
         return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
+    }
+
+    private func usageTrackingRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.usageTrackingSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .usageTracking) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(usageTrackingDidChange(_:))
+        return controlRow(label: "Track Claude Code usage", control: toggleSwitch)
     }
 
     /// The whole MCP Apps pane below its heading, built from the same
@@ -608,6 +631,27 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
+    }
+
+    /// Writes the setting first, so the ledger already finds tracking on
+    /// when the reconcile below asks. Flipping ON reads what the known
+    /// sessions' transcripts gained while tracking was off; that runs in
+    /// a task on the ledger, never on the main thread, and at utility
+    /// priority, since catch-up work must not compete with the UI.
+    /// Flipping OFF does nothing else: stored data stays, and an ingest
+    /// that is already reading finishes.
+    @objc private func usageTrackingDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        UsageTrackingSettings.enabled = enabled
+        guard enabled else { return }
+        #if DEBUG
+        let ledger = _usageLedgerForTesting ?? UsageLedger.shared
+        #else
+        let ledger = UsageLedger.shared
+        #endif
+        Task(priority: .utility) {
+            await ledger.reconcileKnown()
+        }
     }
 
     /// Writes the setting and refreshes the row unconditionally -- the

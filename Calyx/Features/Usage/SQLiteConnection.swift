@@ -20,6 +20,14 @@ struct SQLiteError: Error, Equatable {
     var primaryCode: Int32 { code & 0xFF }
 }
 
+/// As an `NSError`: domain `SQLite` and the result code, extended part
+/// included. Neither can name a path, so a log may show them where the
+/// message has to stay hidden.
+extension SQLiteError: CustomNSError {
+    static var errorDomain: String { "SQLite" }
+    var errorCode: Int { Int(code) }
+}
+
 /// A prepared statement, valid only inside the `withStatement` /
 /// `withTransientStatement` closure that provided it. It does not own the
 /// handle; the connection finalizes it.

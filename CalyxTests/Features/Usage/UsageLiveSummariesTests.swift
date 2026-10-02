@@ -5,10 +5,14 @@
 //  Pins UsageLiveSummaries, the observable map from a session id to that
 //  session's total usage row (the row of `UsageQuery(sessionID:)` with an
 //  empty groupBy, so its key is []): set stores or replaces, nil removes,
-//  removeAll empties, and a change is visible to Observation.
+//  removeAll empties, and a change is visible to Observation -- while a
+//  `set` that changes nothing is NOT a change: the ledger publishes every
+//  session's row again after each re-read, and an observer must not be
+//  invalidated once per session for rows that stayed the same.
 //
 
 import Observation
+import os
 import XCTest
 @testable import Calyx
 
@@ -106,5 +110,74 @@ final class UsageLiveSummariesTests: XCTestCase {
         summaries.removeAll()
 
         wait(for: [changed], timeout: 5)
+    }
+
+    // MARK: - A set that changes nothing does not notify
+
+    /// Observes `bySession` once. `onChange` runs synchronously inside
+    /// the mutation, so the flag can be read right after a call returns.
+    private func observeBySession(of summaries: UsageLiveSummaries) -> OSAllocatedUnfairLock<Bool> {
+        let notified = OSAllocatedUnfairLock(initialState: false)
+        withObservationTracking {
+            _ = summaries.bySession
+        } onChange: {
+            notified.withLock { $0 = true }
+        }
+        return notified
+    }
+
+    func test_set_rowEqualToTheStoredOne_doesNotNotify_andADifferentRowDoes() {
+        let summaries = UsageLiveSummaries()
+        summaries.set(row(responses: 1, output: 420), forSession: "session-a")
+        summaries.set(row(responses: 2, output: 840), forSession: "session-b")
+        let notified = observeBySession(of: summaries)
+
+        summaries.set(row(responses: 1, output: 420), forSession: "session-a")
+        summaries.set(row(responses: 2, output: 840), forSession: "session-b")
+
+        XCTAssertFalse(notified.withLock { $0 }, "an equal row was reported as a change")
+        XCTAssertEqual(summaries.bySession, [
+            "session-a": row(responses: 1, output: 420), "session-b": row(responses: 2, output: 840),
+        ])
+
+        // The same observation does fire for a row that differs.
+        summaries.set(row(responses: 2, output: 841), forSession: "session-a")
+
+        XCTAssertTrue(notified.withLock { $0 })
+        XCTAssertEqual(summaries.bySession["session-a"], row(responses: 2, output: 841))
+    }
+
+    func test_setNil_forAnAbsentSession_doesNotNotify_andRemovingAStoredOneDoes() {
+        let summaries = UsageLiveSummaries()
+        summaries.set(row(responses: 1, output: 420), forSession: "session-a")
+        let notified = observeBySession(of: summaries)
+
+        summaries.set(nil, forSession: "session-unknown")
+
+        XCTAssertFalse(notified.withLock { $0 }, "removing a session that is not there was reported as a change")
+
+        summaries.set(nil, forSession: "session-a")
+
+        XCTAssertTrue(notified.withLock { $0 })
+        XCTAssertEqual(summaries.bySession, [:])
+    }
+
+    func test_setNil_onAnEmptyMap_doesNotNotify() {
+        let summaries = UsageLiveSummaries()
+        let notified = observeBySession(of: summaries)
+
+        summaries.set(nil, forSession: "session-a")
+
+        XCTAssertFalse(notified.withLock { $0 })
+    }
+
+    func test_set_firstRowOfASession_notifies() {
+        let summaries = UsageLiveSummaries()
+        summaries.set(row(responses: 1, output: 420), forSession: "session-a")
+        let notified = observeBySession(of: summaries)
+
+        summaries.set(row(responses: 1, output: 420), forSession: "session-b")
+
+        XCTAssertTrue(notified.withLock { $0 }, "the same row under a session that had none is a change")
     }
 }

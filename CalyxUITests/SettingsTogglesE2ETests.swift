@@ -303,4 +303,27 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
         toggleElement.click()
         XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
     }
+
+    /// Pins the Agents pane's "Usage Tracking" toggle, the last row of
+    /// the tallest Settings pane, as reachable and operable in the same
+    /// way as the "Agent Hook Approval" toggle above it: a row below the
+    /// window's bottom edge would exist in the AX tree and still be
+    /// unusable.
+    ///
+    /// The click turns the setting on only in this test's own defaults
+    /// suite (`CALYX_UITEST_DEFAULTS_SUITE`), and the app was launched
+    /// with `--uitesting` and no scoped path root, where the usage ledger
+    /// stays off whatever the setting says: no transcript is read and no
+    /// database is created.
+    func test_usageTrackingSwitch_isReachableAndTogglesOnAgentsPane() {
+        waitForMenuBarAndWindow()
+        openSettingsPane("Agents")
+
+        let toggleElement = toggle(identifier: "calyx.settings.agents.usageTrackingSwitch")
+        XCTAssertTrue(waitFor(toggleElement, timeout: 5), "usageTracking switch not found on Agents pane.")
+        XCTAssertTrue(toggleElement.isHittable, "usageTracking switch is present but not hittable — it is clipped outside the Settings window (no scroll).")
+        let before = toggleElement.value as? Int
+        toggleElement.click()
+        XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
+    }
 }

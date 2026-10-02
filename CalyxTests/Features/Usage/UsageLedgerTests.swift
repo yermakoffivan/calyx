@@ -960,11 +960,14 @@ final class UsageLedgerTests: XCTestCase {
         XCTAssertEqual(countAfterFailure, 1, "Nothing retries on its own")
         XCTAssertEqual(publishedAfterFailure, [])
         XCTAssertEqual(diagnostics.count, 1)
-        guard case .ingestFailed(let failedSession, let description)? = diagnostics.first else {
+        guard case .ingestFailed(let failedSession, let failure)? = diagnostics.first else {
             return XCTFail("Expected .ingestFailed, got \(diagnostics)")
         }
         XCTAssertEqual(failedSession, sessionA)
-        XCTAssertFalse(description.isEmpty)
+        XCTAssertEqual(failure.description, "InjectedIngestFailure()")
+        // A Swift error without a domain of its own carries whatever it
+        // bridges to.
+        XCTAssertEqual(failure, UsageLedgerDiagnostic.Failure(InjectedIngestFailure()))
 
         await noteAndSettle(ledger, "PreToolUse")
         let count = await ingestCount()
@@ -978,7 +981,7 @@ final class UsageLedgerTests: XCTestCase {
         // An I/O failure of the main file: the real ingestor throws for
         // it, so a result carrying it is reported the same way.
         try makeMainFile()
-        await script.setOutcome(.main(.failed(errno: EIO)), forCall: 1)
+        await script.setOutcome(.main(.failed(errno: ENOSPC)), forCall: 1)
         let ledger = makeLedger()
 
         await noteAndSettle(ledger, "Stop")
@@ -986,15 +989,68 @@ final class UsageLedgerTests: XCTestCase {
         let diagnostics = diagnosticLog.all
         XCTAssertEqual(publishedAfterFailure, [])
         XCTAssertEqual(diagnostics.count, 1)
-        guard case .ingestFailed(let failedSession, let description)? = diagnostics.first else {
+        guard case .ingestFailed(let failedSession, let failure)? = diagnostics.first else {
             return XCTFail("Expected .ingestFailed, got \(diagnostics)")
         }
         XCTAssertEqual(failedSession, sessionA)
-        XCTAssertFalse(description.isEmpty)
+        // The errno stays readable next to a text that may name a path.
+        XCTAssertEqual(failure.domain, NSPOSIXErrorDomain)
+        XCTAssertEqual(failure.code, Int(ENOSPC))
+        XCTAssertEqual(
+            failure.description, String(describing: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))))
 
         await noteAndSettle(ledger, "PreToolUse")
         let count = await ingestCount()
         XCTAssertEqual(count, 2, "A failed transcript is not marked ingested")
+    }
+
+    func test_storeFailureDuringAnIngest_isReportedWithSQLitesDomainAndResultCode() async throws {
+        try makeMainFile()
+        await script.setOutcome(stores([record("msg_m1")]), forCall: 1)
+        await script.setOutcome(stores([record("msg_m2")]), forCall: 2)
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+        assertDiagnostics([])
+
+        // Another connection holds the database's write lock, so the
+        // second ingest's write fails at once (there is no busy timeout).
+        var holder: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(databasePath, &holder, SQLITE_OPEN_READWRITE, nil), SQLITE_OK,
+                       "Fixture error: could not open the lock holder")
+        defer {
+            sqlite3_exec(holder, "ROLLBACK", nil, nil, nil)
+            sqlite3_close(holder)
+        }
+        XCTAssertEqual(sqlite3_exec(holder, "BEGIN IMMEDIATE", nil, nil, nil), SQLITE_OK,
+                       "Fixture error: could not take the write lock")
+
+        await noteAndSettle(ledger, "Stop")
+
+        let diagnostics = diagnosticLog.all
+        XCTAssertEqual(diagnostics.count, 1)
+        guard case .ingestFailed(let failedSession, let failure)? = diagnostics.first else {
+            return XCTFail("Expected .ingestFailed, got \(diagnostics)")
+        }
+        XCTAssertEqual(failedSession, sessionA)
+        XCTAssertEqual(failure.domain, "SQLite")
+        XCTAssertEqual(failure.code, Int(SQLITE_BUSY))
+        XCTAssertEqual(
+            failure.description, String(describing: SQLiteError(code: SQLITE_BUSY, message: "database is locked")))
+        let published = await publishLog.entries
+        XCTAssertEqual(published, [Published(sessionID: sessionA, row: totalRow(1))])
+    }
+
+    /// What opening a store in `directory` fails with, as a diagnostic's
+    /// failure. The directory must be one that cannot be opened.
+    private func storeOpenFailure(_ directory: String) async throws -> UsageLedgerDiagnostic.Failure {
+        do {
+            let store = try UsageStore(directory: URL(fileURLWithPath: directory, isDirectory: true))
+            await store.close()
+        } catch {
+            return UsageLedgerDiagnostic.Failure(error)
+        }
+        XCTFail("Fixture error: \(directory) could be opened")
+        throw InjectedIngestFailure()
     }
 
     func test_resultWithoutAMainEntry_isNotMarkedAndNotPublished() async throws {
@@ -1261,10 +1317,16 @@ final class UsageLedgerTests: XCTestCase {
         let count = await ingestCount()
         XCTAssertEqual(count, 0)
         XCTAssertEqual(diagnosticLog.all.count, 1)
-        guard case .storeUnavailable(let description)? = diagnosticLog.all.first else {
+        guard case .storeUnavailable(let failure)? = diagnosticLog.all.first else {
             return XCTFail("Expected .storeUnavailable, got \(diagnosticLog.all)")
         }
-        XCTAssertFalse(description.isEmpty)
+        // The domain and code of what opening that directory fails with.
+        // The text is not compared whole: Foundation prints an address in
+        // it that differs from one failure to the next.
+        let expected = try await storeOpenFailure(blocker + "/usage")
+        XCTAssertEqual(failure.domain, expected.domain)
+        XCTAssertEqual(failure.code, expected.code)
+        XCTAssertTrue(failure.description.contains(blocker), failure.description)
     }
 
     func test_note_storeCannotBeOpened_reportsStoreUnavailableOnce_andNothingIsPublished() async throws {
@@ -1280,10 +1342,16 @@ final class UsageLedgerTests: XCTestCase {
         XCTAssertEqual(count, 0, "There is no store to hand to the seam")
         XCTAssertEqual(published, [])
         XCTAssertEqual(diagnosticLog.all.count, 1)
-        guard case .storeUnavailable(let description)? = diagnosticLog.all.first else {
+        guard case .storeUnavailable(let failure)? = diagnosticLog.all.first else {
             return XCTFail("Expected .storeUnavailable, got \(diagnosticLog.all)")
         }
-        XCTAssertFalse(description.isEmpty)
+        // The domain and code of what opening that directory fails with.
+        // The text is not compared whole: Foundation prints an address in
+        // it that differs from one failure to the next.
+        let expected = try await storeOpenFailure(blocker + "/usage")
+        XCTAssertEqual(failure.domain, expected.domain)
+        XCTAssertEqual(failure.code, expected.code)
+        XCTAssertTrue(failure.description.contains(blocker), failure.description)
     }
 
     func test_reconcileKnown_cancellingItsCaller_doesNotCancelTheIngest() async throws {
