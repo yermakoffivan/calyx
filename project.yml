@@ -212,6 +212,7 @@ targets:
       - sdk: Carbon.framework
       - sdk: WebKit.framework
       - sdk: UserNotifications.framework
+      - sdk: libsqlite3.tbd
       - package: Sparkle
       - target: CalyxCLI
         embed: false

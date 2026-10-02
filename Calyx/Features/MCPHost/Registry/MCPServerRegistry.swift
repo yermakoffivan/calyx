@@ -293,7 +293,7 @@ final class MCPServerRegistry {
         do {
             return (try decodeServers(from: data), nil)
         } catch {
-            let movedToPath = filePath + ".corrupt-" + corruptSuffix()
+            let movedToPath = filePath + ".corrupt-" + CorruptFileSuffix.make()
             do {
                 try fileManager.moveItem(atPath: filePath, toPath: movedToPath)
             } catch {
@@ -314,12 +314,6 @@ final class MCPServerRegistry {
             throw DocumentInvariantError.duplicateAlias
         }
         return document.servers
-    }
-
-    /// `<unix seconds>-<8 hex digits>`.
-    private static func corruptSuffix() -> String {
-        let seconds = Int(Date().timeIntervalSince1970)
-        return "\(seconds)-\(UUID().uuidString.prefix(8).lowercased())"
     }
 
     private static func secretValues(of server: MCPImportedServer, serverID: MCPServerID) -> [(key: MCPSecretKey, value: String)] {
