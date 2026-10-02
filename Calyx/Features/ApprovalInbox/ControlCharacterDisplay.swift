@@ -150,7 +150,16 @@ enum ControlCharacterDisplay {
     /// reflow the banner like a real newline), `.privateUse`, or
     /// `.surrogate` (never valid in well-formed text; escaped
     /// defensively).
-    private static func isEscapedCategory(_ scalar: Unicode.Scalar) -> Bool {
+    ///
+    /// Not `private`: this is the single definition of "a scalar that is
+    /// unsafe to show or hand on", shared with
+    /// `ClaudeTranscriptParser.label`, which REJECTS a transcript-derived
+    /// label containing any such scalar (those labels later reach other
+    /// agents through an MCP tool, where the same bidi / zero-width /
+    /// Tag-block payloads are the threat). Note it is also `true` for C0
+    /// controls and DEL (they are `.control` too); only `renderedUnit`
+    /// gives those caret notation before asking here.
+    static func isEscapedCategory(_ scalar: Unicode.Scalar) -> Bool {
         switch scalar.properties.generalCategory {
         case .control, .format, .lineSeparator, .paragraphSeparator, .privateUse, .surrogate:
             return true
