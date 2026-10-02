@@ -177,6 +177,18 @@ actor UsageStore {
         }
     }
 
+    /// The stored metadata of one session; nil if no batch carried any.
+    func session(_ sessionID: String) throws -> UsageSessionMeta? {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectSessionSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            guard try statement.step() else { return nil }
+            guard let storedID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+            return UsageSessionMeta(
+                sessionID: storedID, transcriptPath: statement.text(at: 1), projectRoot: statement.text(at: 2))
+        }
+    }
+
     /// Where the last applied read of `path` stopped; nil if never read.
     func checkpoint(forPath path: String) throws -> TranscriptCheckpoint? {
         let connection = try openConnection()
@@ -279,7 +291,7 @@ actor UsageStore {
     /// the same columns) depends on.
     private static let fixedStatements = [
         selectRecordSQL, selectSessionRecordsSQL, writeRecordSQL,
-        upsertSessionSQL, selectSessionsSQL, upsertFileSQL, selectFileSQL,
+        upsertSessionSQL, selectSessionsSQL, selectSessionSQL, upsertFileSQL, selectFileSQL,
     ]
 
     /// Migrates, then proves the result is the schema this build uses by
@@ -491,6 +503,9 @@ actor UsageStore {
     private static let selectSessionsSQL =
         "SELECT session_id, transcript_path, project_root FROM usage_sessions ORDER BY session_id"
 
+    private static let selectSessionSQL =
+        "SELECT session_id, transcript_path, project_root FROM usage_sessions WHERE session_id = ?1"
+
     private static let upsertFileSQL = """
         INSERT INTO usage_files (path, inode, offset) VALUES (?1, ?2, ?3) \
         ON CONFLICT (path) DO UPDATE SET inode = excluded.inode, offset = excluded.offset
@@ -559,3 +574,9 @@ actor UsageStore {
         )
     }
 }
+
+// MARK: - UsageBatchStoring
+
+/// The actor's synchronous methods satisfy the protocol's `async`
+/// requirements as they are; the ingestor reaches the store through this.
+extension UsageStore: UsageBatchStoring {}

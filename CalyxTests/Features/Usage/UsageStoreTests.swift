@@ -1116,4 +1116,129 @@ final class UsageStoreTests: XCTestCase {
         let afterReopen = try await second.checkpoint(forPath: "/t/a.jsonl")
         XCTAssertEqual(afterReopen, extreme)
     }
+
+    // MARK: - session(_:)
+
+    func test_session_unknownID_isNil() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/a")))
+
+        let unknown = try await store.session("session-zzz")
+
+        XCTAssertNil(unknown)
+    }
+
+    func test_session_freshStore_isNil() async throws {
+        let store = try openStore()
+
+        let session = try await store.session("session-a")
+
+        XCTAssertNil(session)
+    }
+
+    func test_session_recordsAppliedWithoutSessionMeta_isNil() async throws {
+        let store = try openStore()
+        try await store.apply(batch([finalLine], session: nil))
+
+        let session = try await store.session("session-a")
+
+        XCTAssertNil(session, "Records alone create no session row")
+    }
+
+    func test_session_afterBatchWithSessionMeta_returnsThatMeta() async throws {
+        let store = try openStore()
+        let meta = UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/a")
+        try await store.apply(batch(session: meta))
+
+        let session = try await store.session("session-a")
+
+        XCTAssertEqual(session, meta)
+    }
+
+    func test_session_metaWithAllNil_returnsRowWithNilFields() async throws {
+        let store = try openStore()
+        let meta = UsageSessionMeta(sessionID: "session-a", transcriptPath: nil, projectRoot: nil)
+        try await store.apply(batch(session: meta))
+
+        let session = try await store.session("session-a")
+
+        XCTAssertEqual(session, meta)
+    }
+
+    func test_session_returnsOnlyTheRequestedSession() async throws {
+        let store = try openStore()
+        let metaA = UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/a")
+        let metaB = UsageSessionMeta(sessionID: "session-b", transcriptPath: "/t/b.jsonl", projectRoot: "/r/b")
+        try await store.apply(batch(session: metaA))
+        try await store.apply(batch(session: metaB))
+
+        let sessionA = try await store.session("session-a")
+        let sessionB = try await store.session("session-b")
+
+        XCTAssertEqual(sessionA, metaA)
+        XCTAssertEqual(sessionB, metaB)
+    }
+
+    func test_session_secondNonNilProjectRoot_stillReturnsTheFirst() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/first")))
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: nil, projectRoot: "/r/second")))
+
+        let session = try await store.session("session-a")
+
+        XCTAssertEqual(
+            session, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/first"))
+    }
+
+    func test_session_projectRootArrivingLater_isReturnedOnceSet() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: nil)))
+        let before = try await store.session("session-a")
+        XCTAssertEqual(
+            before, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: nil))
+
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: nil, projectRoot: "/r/late")))
+
+        let after = try await store.session("session-a")
+        XCTAssertEqual(
+            after, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/late"))
+    }
+
+    func test_session_nonNilTranscriptPath_returnsTheReplacedPath() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/old.jsonl", projectRoot: "/r/a")))
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/new.jsonl", projectRoot: nil)))
+
+        let session = try await store.session("session-a")
+
+        XCTAssertEqual(
+            session, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/new.jsonl", projectRoot: "/r/a"))
+    }
+
+    func test_session_afterDeleteAll_isNil() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/a")))
+        try await store.deleteAll()
+
+        let session = try await store.session("session-a")
+
+        XCTAssertNil(session)
+    }
+
+    func test_session_afterClose_throwsClosed() async throws {
+        let store = try openStore()
+        try await store.apply(batch(
+            session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t/a.jsonl", projectRoot: "/r/a")))
+        await store.close()
+
+        await assertThrows(.closed, "session") { try await store.session("session-a") }
+    }
 }

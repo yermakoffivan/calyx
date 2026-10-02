@@ -52,6 +52,16 @@ enum AgentToolPaths {
         claudeSettingsPath(testRoot: CalyxPathRoot.testRoot)
     }
 
+    /// Claude Code's per-project transcripts: `~/.claude/projects`, one
+    /// directory per working directory holding `<session id>.jsonl`.
+    static func claudeProjectsDirectory(testRoot: String?) -> String {
+        claudeConfigDirectory(testRoot: testRoot) + "/projects"
+    }
+
+    static var claudeProjectsDirectory: String {
+        claudeProjectsDirectory(testRoot: CalyxPathRoot.testRoot)
+    }
+
     // MARK: - Codex
 
     /// Codex's config root: `~/.codex`.
