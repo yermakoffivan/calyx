@@ -541,6 +541,73 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
         XCTAssertNil(locate(mainPath + "\u{0}"))
     }
 
+    // MARK: - locate: the session id is a label
+
+    /// Creates "<project dir>/<id>.jsonl" for real and asserts that
+    /// locating it under that id is refused.
+    private func assertSessionIDIsRejected(
+        _ id: String, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let path = projectDirectory + "/" + id + ".jsonl"
+        try makeFile(path)
+        var info = stat()
+        XCTAssertEqual(lstat(path, &info), 0, "Fixture error: the file must exist under that name",
+                       file: file, line: line)
+
+        XCTAssertNil(locate(path, sessionID: id), file: file, line: line)
+    }
+
+    private func assertSessionIDIsLocated(
+        _ id: String, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let path = projectDirectory + "/" + id + ".jsonl"
+        try makeFile(path)
+
+        XCTAssertEqual(
+            locate(path, sessionID: id),
+            ClaudeTranscriptLocation(
+                mainPath: realProjectDirectory + "/" + id + ".jsonl",
+                sessionID: id,
+                subagentsDirectory: realProjectDirectory + "/" + id + "/subagents"),
+            file: file, line: line)
+    }
+
+    func test_locate_sessionIDWithBidiOverride_returnsNil() throws {
+        try assertSessionIDIsRejected("abc\u{202E}def")
+    }
+
+    func test_locate_sessionIDWithZeroWidthSpace_returnsNil() throws {
+        try assertSessionIDIsRejected("abc\u{200B}def")
+    }
+
+    func test_locate_sessionIDWithEscapeCharacter_returnsNil() throws {
+        try assertSessionIDIsRejected("abc\u{1B}[31mdef")
+    }
+
+    func test_locate_sessionIDOf129Scalars_returnsNil() throws {
+        let id = String(repeating: "a", count: 129)
+        XCTAssertEqual(id.unicodeScalars.count, 129, "Fixture error")
+        try assertSessionIDIsRejected(id)
+    }
+
+    func test_locate_sessionIDWithLeadingSpace_returnsNil() throws {
+        try assertSessionIDIsRejected(" abc-123")
+    }
+
+    func test_locate_sessionIDWithTrailingSpace_returnsNil() throws {
+        try assertSessionIDIsRejected("abc-123 ")
+    }
+
+    func test_locate_sessionIDOfExactly128Scalars_isLocated() throws {
+        let id = String(repeating: "a", count: 128)
+        XCTAssertEqual(id.unicodeScalars.count, 128, "Fixture error")
+        try assertSessionIDIsLocated(id)
+    }
+
+    func test_locate_sessionIDWithNonASCIILetters_isLocated() throws {
+        try assertSessionIDIsLocated("セッション-日本語-01")
+    }
+
     // MARK: - locate: no case aliasing
 
     func test_locate_fileNameDifferingOnlyInLetterCase_returnsNil() throws {

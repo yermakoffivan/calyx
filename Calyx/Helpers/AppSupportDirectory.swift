@@ -42,4 +42,11 @@ enum AppSupportDirectory {
     static var locksPath: String {
         (path as NSString).appendingPathComponent("locks")
     }
+
+    /// `<path>/usage`: the directory holding the usage ledger's
+    /// database (`UsageStore`). Carries `path`'s own
+    /// `CalyxPathRoot.testRoot` redirect, like `locksPath`.
+    static var usagePath: String {
+        (path as NSString).appendingPathComponent("usage")
+    }
 }

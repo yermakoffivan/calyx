@@ -1007,6 +1007,117 @@ final class UsageIngestorTests: XCTestCase {
         ])
     }
 
+    // MARK: - The resolved root is a label like any other
+
+    /// Ingests one main line whose cwd is "/work/repo/sub" with a resolver
+    /// answering `answer`, and asserts the stored root and the flag.
+    private func assertResolverAnswer(
+        _ answer: String, isStoredAs expectedRoot: String, resolutionFailed: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let store = try openStore()
+        let resolver = FakeProjectRootResolver(.returns(answer))
+        try write([assistantLine("msg_m1", cwd: "/work/repo/sub")], to: mainPath)
+
+        let result = try await ingest(into: store, resolver: resolver)
+
+        XCTAssertEqual(result, UsageIngestResult(
+            files: [fileResult(mainPath, linesRead: 1, recordsEmitted: 1, batchesApplied: 1)],
+            projectRootResolutionFailed: resolutionFailed), file: file, line: line)
+        let asked = await resolver.askedCWDs
+        let sessions = try await store.sessions()
+        let records = try await store.records(forSession: sessionID)
+        XCTAssertEqual(asked, ["/work/repo/sub"], file: file, line: line)
+        XCTAssertEqual(
+            sessions, [UsageSessionMeta(sessionID: sessionID, transcriptPath: mainPath, projectRoot: expectedRoot)],
+            file: file, line: line)
+        XCTAssertEqual(records, [record("msg_m1", cwd: "/work/repo/sub")], file: file, line: line)
+    }
+
+    func test_ingest_resolverAnswerWithBidiOverride_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer(
+            "/work/re\u{202E}po", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithEscapeCharacter_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer(
+            "/work/re\u{1B}[31mpo", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithZeroWidthSpace_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer(
+            "/work/re\u{200B}po", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithZeroWidthSpaceAtTheEdges_isNotTrimmedIntoAValidRoot() async throws {
+        try await assertResolverAnswer(
+            "\u{200B}/work/repo\u{200B}", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithNewline_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer(
+            "/work/repo\n/etc", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerOf1025Scalars_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        let answer = "/" + String(repeating: "a", count: 1_024)
+        XCTAssertEqual(answer.unicodeScalars.count, 1_025, "Fixture error")
+        try await assertResolverAnswer(answer, isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerOfExactly1024Scalars_isStoredVerbatim() async throws {
+        let answer = "/" + String(repeating: "a", count: 1_023)
+        XCTAssertEqual(answer.unicodeScalars.count, 1_024, "Fixture error")
+        try await assertResolverAnswer(answer, isStoredAs: answer, resolutionFailed: false)
+    }
+
+    func test_ingest_resolverAnswerLengthIsCountedInScalarsNotCharacters() async throws {
+        // 513 Characters but 1,025 scalars: "e" + U+0301 is one Character.
+        let answer = "/" + String(repeating: "e\u{301}", count: 512)
+        XCTAssertEqual(answer.unicodeScalars.count, 1_025, "Fixture error")
+        XCTAssertEqual(answer.count, 513, "Fixture error")
+        try await assertResolverAnswer(answer, isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerIsEmpty_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer("", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithLeadingSpace_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer(" /work/repo", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithTrailingSpace_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer("/work/repo ", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithTrailingTab_fallsBackToTheCWDAndReportsTheFailure() async throws {
+        try await assertResolverAnswer("/work/repo\t", isStoredAs: "/work/repo/sub", resolutionFailed: true)
+    }
+
+    func test_ingest_resolverAnswerWithNonASCIILettersAndAnInnerSpace_isStoredVerbatim() async throws {
+        let answer = "/work/日本語 プロジェクト/répo"
+        try await assertResolverAnswer(answer, isStoredAs: answer, resolutionFailed: false)
+    }
+
+    func test_ingest_invalidResolverAnswer_isNotAskedForAgainOnceTheCWDIsStored() async throws {
+        // The fallback root is stored like any other root, so the next
+        // ingest finds it and does not consult the resolver again.
+        let store = try openStore()
+        let resolver = FakeProjectRootResolver(.returns("/work/re\u{202E}po"))
+        try write([assistantLine("msg_m1", cwd: "/work/repo/sub")], to: mainPath)
+        try await ingest(into: store, resolver: resolver)
+        try append(assistantLine("msg_m2", cwd: "/work/repo/other") + "\n", to: mainPath)
+
+        let second = try await ingest(into: store, resolver: resolver)
+
+        let asked = await resolver.askedCWDs
+        let stored = try await store.session(sessionID)
+        XCTAssertEqual(asked, ["/work/repo/sub"])
+        XCTAssertEqual(stored?.projectRoot, "/work/repo/sub")
+        XCTAssertFalse(second.projectRootResolutionFailed)
+    }
+
     // MARK: - Missing or non-regular main file
 
     func test_ingest_missingMainFile_reportsMissingAndStoresNothing() async throws {

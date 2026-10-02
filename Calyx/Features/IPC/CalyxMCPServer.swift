@@ -229,6 +229,14 @@ final class CalyxMCPServer {
     /// instance the same way as `agentRegistry`/`sessionSurfaceMap`.
     var agentSessionMetaBridge = AgentSessionMetaBridge()
 
+    /// Told about every accepted Claude Code hook event that names its
+    /// session and transcript (`routeAgentEvent`), so the usage ledger
+    /// can read what the transcript gained. A synchronous closure the
+    /// route never awaits: the hook's HTTP response must not wait for an
+    /// ingest. The server does not consult the usage-tracking setting;
+    /// the receiver does. nil (the default) drops the activity.
+    var usageSink: ((UsageActivity) -> Void)?
+
     /// Directory `agent-endpoint.json` is written to (by `finishStart`)
     /// and removed from (by `stop()`). Required at construction, not
     /// defaulted: a caller that forgets to wire this fails to build
@@ -517,6 +525,14 @@ final class CalyxMCPServer {
             await agentSessionMetaBridge.recordAgentSession(
                 surfaceID: surfaceID, agentKind: kind, agentSessionID: agentSessionID
             )
+        }
+        // Outside the subagent guard above on purpose: a subagent's
+        // event carries the SESSION's transcript path, and its usage is
+        // part of that session's.
+        if kind == AgentEntry.claudeCodeKind, let sessionID = event.sessionID,
+           let transcriptPath = event.transcriptPath {
+            usageSink?(UsageActivity(
+                sessionID: sessionID, transcriptPath: transcriptPath, hookEventName: event.hookEventName))
         }
         return HTTPParser.response(statusCode: 204, body: nil)
     }

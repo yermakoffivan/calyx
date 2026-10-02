@@ -40,7 +40,7 @@ enum ClaudeTranscriptParser {
         let agentID = label(object["agentId"], maxLength: identifierMaxLength)
         let agentType = label(object["attributionAgent"], maxLength: identifierMaxLength)
         let gitBranch = label(object["gitBranch"], maxLength: gitBranchMaxLength)
-        let cwd = label(object["cwd"], maxLength: cwdMaxLength)
+        let cwd = cwdLabel(object["cwd"])
         // A null stop_reason marks a line written mid-response, whose
         // output-side numbers are not final yet.
         let isFinal = message["stop_reason"] is String
@@ -171,6 +171,37 @@ enum ClaudeTranscriptParser {
         }
         guard scalarCount > 0 else { return nil }
         return String(scalars)
+    }
+
+    /// The label rule for a working directory or project root: `label`
+    /// at `cwdMaxLength` scalars. The one definition of what a stored
+    /// path may be, for the transcript's `cwd` and for a root resolved
+    /// from it alike.
+    private static func cwdLabel(_ value: Any?) -> String? {
+        label(value, maxLength: cwdMaxLength)
+    }
+
+    /// Whether `path` is a cwd label exactly as it stands: `cwdLabel`
+    /// accepts it and trims nothing from it.
+    static func isCWDLabel(_ path: String) -> Bool {
+        isVerbatim(path, cwdLabel(path))
+    }
+
+    /// Whether `identifier` is an identifier label exactly as it stands:
+    /// the rule a transcript's `sessionId`, message id and agent id pass
+    /// (`label` at `identifierMaxLength` scalars), with nothing trimmed.
+    /// For an identifier that reaches the store from somewhere other
+    /// than a transcript line.
+    static func isIdentifierLabel(_ identifier: String) -> Bool {
+        isVerbatim(identifier, label(identifier, maxLength: identifierMaxLength))
+    }
+
+    /// Whether `label` (what the label rule made of `raw`) is `raw`
+    /// itself. Compared scalar by scalar, because `String`'s `==` is
+    /// canonical equivalence and "verbatim" means the same scalars.
+    private static func isVerbatim(_ raw: String, _ label: String?) -> Bool {
+        guard let label else { return false }
+        return label.unicodeScalars.elementsEqual(raw.unicodeScalars)
     }
 
     /// Whitespace that is trimmed from a label's edges: a space separator

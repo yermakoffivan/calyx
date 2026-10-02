@@ -61,7 +61,8 @@ struct UsageIngestResult: Sendable, Equatable {
     /// One entry per file processed: the main transcript first, then the
     /// subagent transcripts in name order.
     let files: [UsageIngestFileResult]
-    /// The resolver threw; the session's root fell back to the cwd.
+    /// The resolver threw, or answered with a path that is not a valid
+    /// cwd label; the session's root fell back to the cwd.
     let projectRootResolutionFailed: Bool
 }
 
@@ -151,6 +152,15 @@ struct UsageIngestor: Sendable {
     /// to that directory, and losing the attribution, or failing the
     /// whole ingest, over a failed git call would be worse. The throw is
     /// reported through `UsageIngestResult.projectRootResolutionFailed`.
+    ///
+    /// A root the resolver returns is stored only when it is, verbatim,
+    /// a valid cwd label (`ClaudeTranscriptParser.isCWDLabel`). Every
+    /// other string in the store passed the parser's label rule, because
+    /// these strings later reach other agents over MCP and the UI; git's
+    /// answer is a path of its own (links resolved, whatever bytes the
+    /// directory names hold) and gets no exemption. An answer that fails
+    /// the rule is treated exactly like a throw: the cwd is the root and
+    /// the failure is reported.
     private func decideProjectRoot(
         from records: [UsageRecord], sessionID: String, decision: inout ProjectRootDecision
     ) async throws {
@@ -167,9 +177,21 @@ struct UsageIngestor: Sendable {
             decision.root = stored
             return
         }
+        let resolved: String?
         do {
-            decision.root = try await resolver.projectRoot(forCWD: cwd) ?? cwd
+            resolved = try await resolver.projectRoot(forCWD: cwd)
         } catch {
+            decision.root = cwd
+            decision.resolutionFailed = true
+            return
+        }
+        guard let resolved else {
+            decision.root = cwd
+            return
+        }
+        if ClaudeTranscriptParser.isCWDLabel(resolved) {
+            decision.root = resolved
+        } else {
             decision.root = cwd
             decision.resolutionFailed = true
         }

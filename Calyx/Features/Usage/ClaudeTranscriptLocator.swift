@@ -34,6 +34,13 @@ enum ClaudeTranscriptLocator {
     ///   another directory. A NUL in either input is rejected because a
     ///   system call would stop reading the path there and examine some
     ///   other item than the string names.
+    /// - `sessionID` must also be, verbatim, a valid identifier label
+    ///   (`ClaudeTranscriptParser.isIdentifierLabel`): it becomes the
+    ///   stored session's id and the key its usage is published under,
+    ///   and every other string in the store passed the parser's label
+    ///   rule. A file that really exists under an id the rule rejects
+    ///   (a bidi override, a zero-width or control character, more than
+    ///   128 scalars, whitespace at an edge) is not located.
     /// - The path must be absolute: a hook payload has no working
     ///   directory worth trusting, and "~" is never expanded.
     /// - The final component must be "<sessionID>.jsonl" and a regular
@@ -72,6 +79,7 @@ enum ClaudeTranscriptLocator {
     static func locate(transcriptPath: String, sessionID: String, root: String) -> ClaudeTranscriptLocation? {
         guard !sessionID.isEmpty, sessionID != ".", sessionID != "..",
               !sessionID.utf8.contains(where: { $0 == UInt8(ascii: "/") || $0 == 0 }),
+              ClaudeTranscriptParser.isIdentifierLabel(sessionID),
               !transcriptPath.utf8.contains(0) else { return nil }
         guard transcriptPath.hasPrefix("/"),
               let lastSlash = transcriptPath.lastIndex(of: "/") else { return nil }
