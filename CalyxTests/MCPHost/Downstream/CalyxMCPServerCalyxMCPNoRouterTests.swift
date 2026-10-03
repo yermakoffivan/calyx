@@ -66,7 +66,7 @@ final class CalyxMCPServerCalyxMCPNoRouterTests: XCTestCase {
     }
 
     func test_postMCP_unaffectedByMissingCalyxMCPRouter() async throws {
-        // /mcp (calyx-ipc, 85 tools) must never depend on the /calyx-mcp
+        // /mcp (calyx-ipc, 86 tools) must never depend on the /calyx-mcp
         // router's presence at all.
         let body = try! JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "method": "tools/list"])
         let req = HTTPRequest(

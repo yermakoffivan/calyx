@@ -6,7 +6,11 @@
 //  usage ledger is connected to the app: it installs the usage sink on
 //  the server it was GIVEN, forwarding to the ledger it was GIVEN, and
 //  starts one reconcile of the sessions that ledger already knows, at a
-//  priority no higher than utility.
+//  priority no higher than utility. It also installs the server's usage
+//  bridge, so a `usage_report` call through /mcp reads that ledger,
+//  answers "tracking is off" exactly while the ledger's own switch is
+//  off, and resolves `session_id: "current"` through the registry the
+//  server holds at call time.
 //
 //  The whole path is driven for real: an authenticated POST /agent-event
 //  is routed by a test server, and the transcript it names is read into
@@ -88,14 +92,20 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     }
 
     /// A Claude-shaped hook event naming `sessionID`'s synthetic transcript.
-    private func eventRequest(_ event: String, _ sessionID: String, kind: String? = nil) throws -> HTTPRequest {
+    /// `surfaceID` names the pane the event comes from; a new one each
+    /// time when nil.
+    private func eventRequest(
+        _ event: String, _ sessionID: String, kind: String? = nil, surfaceID: UUID? = nil
+    ) throws -> HTTPRequest {
         let body = try JSONSerialization.data(withJSONObject: [
             "hook_event_name": event,
             "cwd": "/work/repo/sub",
             "session_id": sessionID,
             "transcript_path": fixture.mainPath(sessionID),
         ])
-        var headers = ["Authorization": "Bearer \(testToken)", "X-Calyx-Surface-ID": UUID().uuidString]
+        var headers = [
+            "Authorization": "Bearer \(testToken)", "X-Calyx-Surface-ID": (surfaceID ?? UUID()).uuidString,
+        ]
         if let kind { headers["X-Calyx-Agent-Kind"] = kind }
         return HTTPRequest(method: "POST", path: "/agent-event", headers: headers, body: body)
     }
@@ -299,5 +309,162 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         await waitForPublishes(1)
         await settle(ledger)
         XCTAssertEqual(publishedRows, rows(entry(sessionA, 1)))
+    }
+
+    // MARK: - The usage_report tool
+
+    /// Calls `usage_report` through the server's /mcp route from `surfaceID`.
+    private func usageReport(
+        _ arguments: [String: Any], from surfaceID: UUID? = nil, file: StaticString = #filePath, line: UInt = #line
+    ) async throws -> (text: String, isError: Bool) {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": ["name": "usage_report", "arguments": arguments],
+        ] as [String: Any])
+        var headers = ["Authorization": "Bearer \(testToken)", "Content-Type": "application/json"]
+        if let surfaceID { headers["X-Calyx-Surface-ID"] = surfaceID.uuidString }
+        let response = await server.route(
+            request: HTTPRequest(method: "POST", path: "/mcp", headers: headers, body: body))
+        XCTAssertEqual(response.statusCode, 200, file: file, line: line)
+        let json = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: XCTUnwrap(response.body, file: file, line: line))
+                as? [String: Any], file: file, line: line)
+        let result = try XCTUnwrap(json["result"] as? [String: Any], "\(json)", file: file, line: line)
+        let text = try XCTUnwrap(
+            (result["content"] as? [[String: Any]])?.first?["text"] as? String, file: file, line: line)
+        return (text, try XCTUnwrap(result["isError"] as? Bool, file: file, line: line))
+    }
+
+    private func object(_ text: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], text, file: file, line: line)
+    }
+
+    private func number(_ value: Any?) -> Int64? {
+        (value as? NSNumber)?.int64Value
+    }
+
+    // Tracking is off, so nothing is read whatever the schedule.
+    func test_startUsageLedger_installsAUsageBridgeOnTheGivenServer() {
+        XCTAssertNil(server.usageBridge, "Fixture error: a new server has no usage bridge")
+        fixture.tracking.set(false)
+
+        start(makeLedger())
+
+        XCTAssertNotNil(server.usageBridge)
+    }
+
+    // Two panes, each running its own session. Both events are read and
+    // `settle` closes the ledger behind every read they started, so the
+    // store holds both sessions before the tool is called; the tool's own
+    // reconcile then re-reads fixed transcripts and changes nothing.
+    //
+    // The registry is replaced AFTER `startUsageLedger`: `current` must be
+    // looked up in whatever registry the server holds at call time. The
+    // usage setting in the test suite is never written (so it reads off):
+    // only the ledger's own switch decides.
+    func test_usageReport_trackingOn_reportsTheStoredRows_andCurrentIsTheCallingPanesSession() async throws {
+        try fixture.write(
+            [Fixture.assistantLine("msg_a1"), Fixture.assistantLine("msg_a2")], to: fixture.mainPath(sessionA))
+        try fixture.write([Fixture.assistantLine("msg_b1", sessionID: sessionB)], to: fixture.mainPath(sessionB))
+        let ledger = makeLedger()
+        start(ledger)
+        server.agentRegistry = AgentRegistry()
+        let paneA = UUID()
+        let paneB = UUID()
+
+        let eventA = await server.route(request: try eventRequest("Stop", sessionA, surfaceID: paneA))
+        let eventB = await server.route(request: try eventRequest("Stop", sessionB, surfaceID: paneB))
+        XCTAssertEqual(eventA.statusCode, 204)
+        XCTAssertEqual(eventB.statusCode, 204)
+        await settle(ledger)
+        XCTAssertEqual(publishedRows, rows(entry(sessionA, 2), entry(sessionB, 1)), "Fixture error")
+        XCTAssertFalse(UsageTrackingSettings.enabled, "Fixture error: the suite's setting is off")
+
+        let bySession = try await usageReport(["group_by": ["session"]])
+        let fromPaneA = try await usageReport(["session_id": "current", "group_by": ["model"]], from: paneA)
+        let fromPaneB = try await usageReport(["session_id": "current", "group_by": [String]()], from: paneB)
+
+        XCTAssertFalse(bySession.isError, bySession.text)
+        let all = try object(bySession.text)
+        let allRows = try XCTUnwrap(all["rows"] as? [[String: Any]])
+        XCTAssertEqual(allRows.map { ($0["key"] as? [String: Any])?["session"] as? String }, [sessionA, sessionB])
+        XCTAssertEqual(allRows.map { number($0["responses"]) }, [2, 1])
+        XCTAssertEqual(number((all["totals"] as? [String: Any])?["responses"]), 3)
+        XCTAssertEqual(all["time_zone"] as? String, Calendar.current.timeZone.identifier)
+
+        XCTAssertFalse(fromPaneA.isError, fromPaneA.text)
+        let a = try object(fromPaneA.text)
+        let aRows = try XCTUnwrap(a["rows"] as? [[String: Any]])
+        XCTAssertEqual(aRows.count, 1)
+        XCTAssertEqual((aRows.first?["key"] as? [String: Any])?["model"] as? String, "claude-opus-5-5")
+        // By hand: two final responses of input 3, output 420, thinking
+        // 150, cache read 90,000, cache creation 1,200 (1,000 of it 1h).
+        let row = try XCTUnwrap(aRows.first)
+        XCTAssertEqual(number(row["responses"]), 2)
+        XCTAssertEqual(number(row["final_responses"]), 2)
+        XCTAssertEqual(number(row["input_tokens"]), 6)
+        XCTAssertEqual(number(row["cache_read_tokens"]), 180_000)
+        XCTAssertEqual(number(row["cache_creation_tokens"]), 2_400)
+        XCTAssertEqual(number(row["cache_creation_1h_tokens"]), 2_000)
+        XCTAssertEqual(number(row["output_tokens_final"]), 840)
+        XCTAssertEqual(number(row["thinking_tokens_final"]), 300)
+        XCTAssertEqual(row["last_timestamp"] as? String, "2026-10-02T10:27:29.765Z")
+
+        XCTAssertFalse(fromPaneB.isError, fromPaneB.text)
+        let b = try object(fromPaneB.text)
+        XCTAssertEqual((b["rows"] as? [[String: Any]])?.map { number($0["responses"]) }, [1])
+        XCTAssertEqual(number((b["totals"] as? [String: Any])?["output_tokens_final"]), 420)
+    }
+
+    // The pane's agent row knows no session: `current` cannot be resolved.
+    func test_usageReport_currentFromAPaneWithoutASession_isAToolError() async throws {
+        let ledger = makeLedger()
+        start(ledger)
+
+        let result = try await usageReport(["session_id": "current"], from: UUID())
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.text, "No agent session is known for the calling pane.")
+    }
+
+    // The ledger's switch is off while the app's setting (in the test
+    // suite) is on: the bridge answers from the ledger, never from the
+    // setting. Tracking is off throughout, so nothing is read or created.
+    func test_usageReport_trackingOff_isTheTrackingOffToolError_whateverTheSettingSays() async throws {
+        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
+        fixture.tracking.set(false)
+        UsageTrackingSettings.enabled = true
+        let ledger = makeLedger()
+        let before = fixture.everyPath()
+        start(ledger)
+
+        let result = try await usageReport(["group_by": ["model"]])
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.text, "Usage tracking is off. Turn on Settings > Agents > Usage Tracking.")
+        await settle(ledger)
+        XCTAssertEqual(fixture.everyPath(), before)
+    }
+
+    // Wired once at launch; the tool follows the ledger's switch at each
+    // call. No session is stored, so whichever schedule the reconcile
+    // takes, a successful call reports no rows.
+    func test_usageReport_followsTheLedgersTrackingAtEachCall() async throws {
+        fixture.tracking.set(false)
+        let ledger = makeLedger()
+        start(ledger)
+
+        let off = try await usageReport([:])
+        fixture.tracking.set(true)
+        let on = try await usageReport([:])
+        fixture.tracking.set(false)
+        let offAgain = try await usageReport([:])
+
+        XCTAssertTrue(off.isError)
+        XCTAssertFalse(on.isError, on.text)
+        XCTAssertEqual(number(try object(on.text)["row_count"]), 0)
+        XCTAssertTrue(offAgain.isError)
+        XCTAssertEqual(offAgain.text, "Usage tracking is off. Turn on Settings > Agents > Usage Tracking.")
     }
 }

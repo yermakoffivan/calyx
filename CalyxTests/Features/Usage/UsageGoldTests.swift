@@ -767,4 +767,58 @@ final class UsageGoldTests: XCTestCase {
             defaultRow(["2026-10-03"], count: 1, lastMs: 1_790_964_900_000),
         ])
     }
+
+    // MARK: - Calendar systems
+
+    // A local day is defined by the calendar's time zone only; its label
+    // is always the ISO (Gregorian) date in that zone, whatever calendar
+    // system the caller's calendar uses. Records sit just before, at and
+    // after Tokyo's midnights; the expected labels and splits are the
+    // Gregorian dates in Asia/Tokyo, computed independently.
+    private func calendar(_ system: Calendar.Identifier, zone identifier: String) throws -> Calendar {
+        var calendar = Calendar(identifier: system)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: identifier), "Fixture error: unknown time zone")
+        return calendar
+    }
+
+    private func seedAroundTokyoMidnight() async throws {
+        try await seed([
+            makeRecord(key: "m1", timestampMs: 1_790_953_199_999), // 2026-10-02 23:59:59.999 JST
+            makeRecord(key: "m2", timestampMs: 1_790_953_200_000), // 2026-10-03 00:00 JST
+            makeRecord(key: "m3", timestampMs: 1_790_996_400_000), // 2026-10-03 12:00 JST
+            makeRecord(key: "m4", timestampMs: 1_791_039_600_000), // 2026-10-04 00:00 JST
+        ])
+    }
+
+    private var tokyoDays: [UsageRow] {
+        [
+            defaultRow(["2026-10-02"], count: 1, lastMs: 1_790_953_199_999),
+            defaultRow(["2026-10-03"], count: 2, lastMs: 1_790_996_400_000),
+            defaultRow(["2026-10-04"], count: 1, lastMs: 1_791_039_600_000),
+        ]
+    }
+
+    func test_report_groupByDay_gregorianInTokyo_labelsTheISODates() async throws {
+        try await seedAroundTokyoMidnight()
+
+        let rows = try await report(UsageQuery(groupBy: [.day]), calendar: calendar(.gregorian, zone: "Asia/Tokyo"))
+
+        XCTAssertEqual(rows, tokyoDays)
+    }
+
+    func test_report_groupByDay_japaneseCalendar_givesTheSameISOLabelsAndSplits() async throws {
+        try await seedAroundTokyoMidnight()
+
+        let rows = try await report(UsageQuery(groupBy: [.day]), calendar: calendar(.japanese, zone: "Asia/Tokyo"))
+
+        XCTAssertEqual(rows, tokyoDays)
+    }
+
+    func test_report_groupByDay_hebrewCalendar_givesTheSameISOLabelsAndSplits() async throws {
+        try await seedAroundTokyoMidnight()
+
+        let rows = try await report(UsageQuery(groupBy: [.day]), calendar: calendar(.hebrew, zone: "Asia/Tokyo"))
+
+        XCTAssertEqual(rows, tokyoDays)
+    }
 }

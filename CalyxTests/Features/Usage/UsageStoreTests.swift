@@ -1241,4 +1241,92 @@ final class UsageStoreTests: XCTestCase {
 
         await assertThrows(.closed, "session") { try await store.session("session-a") }
     }
+
+    // MARK: - reports(_:calendar:)
+
+    /// Two sessions on two days, with different models and threads, so
+    /// the queries below have different answers.
+    private func seedForReports(_ store: UsageStore) async throws {
+        try await store.apply(batch([
+            makeRecord(key: "msg_a1", sessionID: "session-a", timestampMs: 1_790_935_200_000, model: "claude-opus-5-5"),
+            makeRecord(key: "msg_a2", sessionID: "session-a", timestampMs: 1_790_935_201_000, model: "claude-opus-5-5"),
+            makeRecord(
+                key: "msg_b1", sessionID: "session-b", timestampMs: 1_791_021_600_000, model: "claude-sonnet-5",
+                thread: .subagent, agentID: "a1", agentType: "swift-specialist"),
+        ]))
+    }
+
+    private var utc: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }
+
+    // One call answers every query, in the order given, each exactly as
+    // `report` answers it alone.
+    func test_reports_answersEachQueryInOrder_likeReportDoes() async throws {
+        let store = try openStore()
+        try await seedForReports(store)
+        let queries = [
+            UsageQuery(groupBy: [.model]),
+            UsageQuery(),
+            UsageQuery(groupBy: [.day], sessionID: "session-b"),
+            UsageQuery(thread: .advisor),
+        ]
+
+        let results = try await store.reports(queries, calendar: utc)
+
+        var expected: [[UsageRow]] = []
+        for query in queries {
+            expected.append(try await store.report(query, calendar: utc))
+        }
+        XCTAssertEqual(results.count, 4)
+        XCTAssertEqual(results, expected)
+        // The four answers differ, so an answer in the wrong slot shows.
+        XCTAssertEqual(results[0].map(\.key), [["claude-opus-5-5"], ["claude-sonnet-5"]])
+        XCTAssertEqual(results[1].map(\.responses), [3])
+        XCTAssertEqual(results[2].map(\.key), [["2026-10-03"]])
+        XCTAssertEqual(results[3], [])
+    }
+
+    func test_reports_passesTheCalendarToEveryQuery() async throws {
+        let store = try openStore()
+        try await seedForReports(store)
+        // 2026-10-02T10:00Z is already 2026-10-03 at UTC+14.
+        var kiritimati = Calendar(identifier: .gregorian)
+        kiritimati.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 14 * 3_600))
+
+        let results = try await store.reports(
+            [UsageQuery(groupBy: [.day], sessionID: "session-a"), UsageQuery(groupBy: [.day])], calendar: kiritimati)
+
+        XCTAssertEqual(results.map { $0.map(\.key) }, [[["2026-10-03"]], [["2026-10-03"], ["2026-10-04"]]])
+    }
+
+    func test_reports_emptyList_returnsEmpty() async throws {
+        let store = try openStore()
+        try await seedForReports(store)
+
+        let results = try await store.reports([], calendar: utc)
+
+        XCTAssertEqual(results, [])
+    }
+
+    func test_reports_aQueryThatThrows_failsTheWholeCall() async throws {
+        let store = try openStore()
+        try await seedForReports(store)
+
+        await assertThrows(.invalidQuery, "the invalid query is last") {
+            try await store.reports([UsageQuery(), UsageQuery(groupBy: [.model, .model])], calendar: utc)
+        }
+        await assertThrows(.invalidQuery, "the invalid query is first") {
+            try await store.reports([UsageQuery(groupBy: [.effort, .effort]), UsageQuery()], calendar: utc)
+        }
+    }
+
+    func test_reports_afterClose_throwsClosed() async throws {
+        let store = try openStore()
+        await store.close()
+
+        await assertThrows(.closed, "reports") { try await store.reports([UsageQuery()], calendar: utc) }
+    }
 }

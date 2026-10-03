@@ -28,6 +28,15 @@ extension SQLiteError: CustomNSError {
     var errorCode: Int { Int(code) }
 }
 
+/// Shown to a person or an agent: the result code and SQLite's fixed
+/// text for it (`sqlite3_errstr`). The per-call `message` is left out
+/// because it can quote a file name.
+extension SQLiteError: LocalizedError {
+    var errorDescription: String? {
+        "The usage database reported SQLite error \(code) (\(String(cString: sqlite3_errstr(code))))."
+    }
+}
+
 /// A prepared statement, valid only inside the `withStatement` /
 /// `withTransientStatement` closure that provided it. It does not own the
 /// handle; the connection finalizes it.

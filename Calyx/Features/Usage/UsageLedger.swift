@@ -213,20 +213,41 @@ actor UsageLedger {
 
     // MARK: - Reading and deleting
 
-    /// The Gold query over the store. While tracking is on, every known
-    /// session is reconciled first, so the rows include what the
+    /// Whether tracking is on right now: the ledger's own `isEnabled`,
+    /// read at each access. Callers outside the ledger that need to say
+    /// whether tracking is on read it here, so they agree with what the
+    /// ledger does. Nonisolated: it only calls the immutable `@Sendable`
+    /// closure.
+    nonisolated var isTracking: Bool {
+        isEnabled()
+    }
+
+    /// The Gold query over the store: `reports` with one query.
+    func report(_ query: UsageQuery, calendar: Calendar) async throws -> [UsageRow] {
+        let results = try await reports([query], calendar: calendar)
+        // `reports` returns exactly one result per query.
+        return results[0]
+    }
+
+    /// Several Gold queries over the store, one result per query in
+    /// order. While tracking is on, every known session is reconciled
+    /// first, once for the whole list, so the rows include what the
     /// transcripts hold now; a failed reconcile is reported through
     /// `onDiagnostic` and does not fail the report. While tracking is
     /// off nothing is read from a transcript, and the store is opened
-    /// only if its database already exists (otherwise there are no rows
-    /// and nothing is created). Errors of the read itself are thrown.
-    func report(_ query: UsageQuery, calendar: Calendar) async throws -> [UsageRow] {
+    /// only if its database already exists (otherwise every query has no
+    /// rows and nothing is created). All queries are answered in one
+    /// store call, so the answers describe the same stored state. Errors
+    /// of the read itself are thrown; there is no partial result. Of
+    /// `calendar` only the time zone is used
+    /// (`UsagePeriod.localDayCalendar`).
+    func reports(_ queries: [UsageQuery], calendar: Calendar) async throws -> [[UsageRow]] {
         if isEnabled() {
             await reconcileKnown()
         }
         await awaitPendingClose()
-        guard let store = try storeIfWarranted() else { return [] }
-        return try await storeCall { try await store.report(query, calendar: calendar) }
+        guard let store = try storeIfWarranted() else { return queries.map { _ in [] } }
+        return try await storeCall { try await store.reports(queries, calendar: calendar) }
     }
 
     /// Deletes everything stored, whatever the setting.

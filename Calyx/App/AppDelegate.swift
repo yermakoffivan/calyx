@@ -1518,12 +1518,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// reconcile runs in a task of its own on the ledger. The sink's
     /// task keeps the default priority: it is tiny, and events reach the
     /// ledger in the order they arrived.
+    ///
+    /// It also installs the server's usage bridge, which answers the
+    /// usage_* MCP tools from the same ledger. Whether tracking is on is
+    /// the ledger's own `isTracking`, so the tool and the ledger never
+    /// disagree; `current` is looked up in the registry the server holds
+    /// at call time.
     func startUsageLedger(server: CalyxMCPServer, ledger: UsageLedger) {
         server.usageSink = { activity in
             Task {
                 await ledger.note(activity)
             }
         }
+        // Weak: the server owns the bridge, so a strong capture would be
+        // a cycle. The bridge is only reached through the server, so the
+        // server is alive whenever the closure runs.
+        server.usageBridge = MCPUsageBridge(
+            isEnabled: { ledger.isTracking },
+            reports: { queries, calendar in try await ledger.reports(queries, calendar: calendar) },
+            currentSessionID: { [weak server] surfaceID in server?.agentRegistry.entries[surfaceID]?.sessionID },
+            now: { Date() },
+            calendar: { Calendar.current })
         // Catch-up work: at utility priority it does not compete with the
         // main thread while windows are being restored.
         Task(priority: .utility) {

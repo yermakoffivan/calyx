@@ -263,8 +263,10 @@ enum ClaudeTranscriptParser {
     /// Done by hand in integer arithmetic for two reasons: the result is
     /// millisecond-exact (no Double seconds to round), and it needs no
     /// formatter, which would either be allocated per line or shared as
-    /// non-Sendable global state.
-    private static func epochMilliseconds(fromISO8601 text: String) -> Int64? {
+    /// non-Sendable global state. Not private: the `usage_report` MCP
+    /// tool parses its `since` / `until` arguments with it, so they take
+    /// exactly the shape the transcripts use.
+    static func epochMilliseconds(fromISO8601 text: String) -> Int64? {
         let bytes = Array(text.utf8)
         // "YYYY-MM-DDTHH:MM:SSZ" is 20 bytes; a fraction adds "." + digits.
         guard bytes.count >= 20, bytes.last == UInt8(ascii: "Z"),

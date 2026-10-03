@@ -64,6 +64,29 @@ enum UsageStoreError: Error, Equatable {
     case dayBoundaryUnavailable
 }
 
+/// Shown to a person or an agent: one fixed sentence per case, never a
+/// path or a stored label.
+extension UsageStoreError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .closed:
+            return "The usage database is closed."
+        case .invalidQuery:
+            return "The usage report query is not valid: a dimension is listed more than once."
+        case .unsupportedSchemaVersion(let version):
+            return "The usage database was written by a newer version of Calyx (schema version \(version))."
+        case .incompatibleSchema:
+            return "The usage database is missing tables or columns this version of Calyx needs."
+        case .integrityCheckFailed:
+            return "The usage database failed its integrity check."
+        case .malformedRow:
+            return "The usage database holds a row this version of Calyx cannot read."
+        case .dayBoundaryUnavailable:
+            return "The calendar gave no usable day boundary, so usage cannot be grouped by day."
+        }
+    }
+}
+
 // MARK: - UsageStore
 
 actor UsageStore {
@@ -201,10 +224,21 @@ actor UsageStore {
         }
     }
 
-    /// The Gold query: see `UsageGold.rows`.
+    /// The Gold query: see `UsageGold.rows`. Of `calendar` only the time
+    /// zone is used (`UsagePeriod.localDayCalendar`).
     func report(_ query: UsageQuery, calendar: Calendar) throws -> [UsageRow] {
         let connection = try openConnection()
         return try UsageGold.rows(for: query, calendar: calendar, connection: connection)
+    }
+
+    /// Several Gold queries answered in one actor call, one result per
+    /// query in order. Nothing here suspends, so no batch can be applied
+    /// between two of the answers: they all describe the same stored
+    /// state. Any query that throws fails the whole call. Of `calendar`
+    /// only the time zone is used (`UsagePeriod.localDayCalendar`).
+    func reports(_ queries: [UsageQuery], calendar: Calendar) throws -> [[UsageRow]] {
+        let connection = try openConnection()
+        return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
     /// Removes every record, session and checkpoint in one transaction.

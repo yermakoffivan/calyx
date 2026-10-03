@@ -64,14 +64,18 @@ enum UsageGold {
     ///
     /// `Dimension.day` is not computed in SQL. SQLite can only shift a
     /// timestamp by a fixed offset, which is wrong on the 23- and 25-hour
-    /// days around a DST change. Instead the injected calendar supplies
-    /// each local day's exact [start, end) interval and the aggregate runs
-    /// once per interval, with the day's label spliced into the key.
+    /// days around a DST change. Instead a calendar supplies each local
+    /// day's exact [start, end) interval and the aggregate runs once per
+    /// interval, with the day's label spliced into the key. Of `calendar`
+    /// only the time zone is used: days are computed and labelled by
+    /// `UsagePeriod.localDayCalendar`, Gregorian in that zone, so a label
+    /// is always the ISO date whatever the user's calendar system.
     /// Empty days cost nothing: after each day the next matching record is
     /// looked up and the walk jumps straight to that record's day.
     static func rows(
-        for query: UsageQuery, calendar: Calendar, connection: SQLiteConnection
+        for query: UsageQuery, calendar injected: Calendar, connection: SQLiteConnection
     ) throws -> [UsageRow] {
+        let calendar = UsagePeriod.localDayCalendar(injected)
         guard Set(query.groupBy).count == query.groupBy.count else {
             throw UsageStoreError.invalidQuery
         }
@@ -272,8 +276,9 @@ enum UsageGold {
     // MARK: - Days
 
     /// The local day containing `timestampMs`: its exact interval in epoch
-    /// milliseconds and its "yyyy-MM-dd" label, both from the injected
-    /// calendar (so DST days and 30- / 45-minute offsets come out right).
+    /// milliseconds and its "yyyy-MM-dd" label, both from `calendar`,
+    /// the Gregorian local-day calendar (so DST days and 30- / 45-minute
+    /// offsets come out right).
     /// Throws rather than guessing if the calendar's interval does not
     /// contain the timestamp; that check is also what guarantees the day
     /// walk always moves forward.

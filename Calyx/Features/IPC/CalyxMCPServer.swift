@@ -237,6 +237,11 @@ final class CalyxMCPServer {
     /// the receiver does. nil (the default) drops the activity.
     var usageSink: ((UsageActivity) -> Void)?
 
+    /// Bridge that answers the usage_* MCP tools from the usage ledger.
+    /// nil (the default) until `AppDelegate.startUsageLedger` installs
+    /// one; while nil, a usage_* call is a "not available" tool error.
+    var usageBridge: MCPUsageBridge?
+
     /// Directory `agent-endpoint.json` is written to (by `finishStart`)
     /// and removed from (by `stop()`). Required at construction, not
     /// defaulted: a caller that forgets to wire this fails to build
@@ -2049,6 +2054,16 @@ final class CalyxMCPServer {
             )
         }
 
+        // usage_* route — dispatched through `MCPUsageBridge`.
+        if MCPRouter.isUsageTool(name: toolName) {
+            return await handleUsageToolCall(
+                id: id,
+                toolName: toolName,
+                params: params,
+                surfaceID: surfaceID
+            )
+        }
+
         let arguments = extractDict(params, "arguments")
 
         switch toolName {
@@ -2403,6 +2418,32 @@ final class CalyxMCPServer {
         let arguments = extractDict(params, "arguments") ?? [:]
         do {
             let text = try await lazyCockpitBridge.handleToolCall(name: toolName, arguments: arguments)
+            return toolSuccess(id: id, text: text)
+        } catch {
+            return toolError(id: id, text: error.localizedDescription)
+        }
+    }
+
+    // MARK: - usage_* Tool Dispatch
+
+    /// Route a `usage_*` tool call to `MCPUsageBridge`, in
+    /// `handleTerminalToolCall`'s shape, passing the request's surface so
+    /// `session_id: "current"` can name the calling pane's session. The
+    /// bridge is optional (installed with the usage ledger), so without
+    /// one every usage_* name is the "not available" tool error. A thrown
+    /// error, the store's included, becomes the tool-error text.
+    private func handleUsageToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable],
+        surfaceID: UUID?
+    ) async -> (statusCode: Int, body: Data?) {
+        guard let usageBridge else {
+            return toolError(id: id, text: "Usage tracking is not available.")
+        }
+        let arguments = extractDict(params, "arguments") ?? [:]
+        do {
+            let text = try await usageBridge.handleToolCall(name: toolName, arguments: arguments, surfaceID: surfaceID)
             return toolSuccess(id: id, text: text)
         } catch {
             return toolError(id: id, text: error.localizedDescription)

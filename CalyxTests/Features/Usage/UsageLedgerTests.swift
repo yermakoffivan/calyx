@@ -1494,6 +1494,155 @@ final class UsageLedgerTests: XCTestCase {
         }
     }
 
+    // MARK: - Reports (several queries, one reconcile)
+
+    // A caller that needs several aggregates pays for one reconcile, not
+    // one per aggregate: each reconcile reads every stored session once,
+    // which is visible as one call of the ingest seam.
+    func test_on_reports_reconcilesOncePerCall_notOncePerQuery() async throws {
+        try makeMainFile()
+        await script.setOutcome(stores([record("msg_m1")]), forCall: 1)
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+        let before = await ingestCount()
+        XCTAssertEqual(before, 1, "Fixture error")
+
+        let results = try await ledger.reports(
+            [UsageQuery(sessionID: sessionA), UsageQuery(groupBy: [.session]), UsageQuery(thread: .advisor)],
+            calendar: utc)
+
+        let after = await ingestCount()
+        XCTAssertEqual(after, 2, "one reconcile for the whole call")
+        XCTAssertEqual(results, [[totalRow(1)], [totalRow(1, key: [sessionA])], []])
+    }
+
+    // The reconcile happens before the read, so what the transcripts
+    // gained since the last ingest is in every answer of the call.
+    func test_on_reports_reconcilesFirst_soEveryAnswerHasTheAppendedLines() async throws {
+        await script.setDefault(.real)
+        try write([assistantLine("msg_m1")], to: mainPath(sessionA))
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+        try append(assistantLine("msg_m2") + "\n", to: mainPath(sessionA))
+
+        let results = try await ledger.reports([UsageQuery(), UsageQuery(groupBy: [.model])], calendar: utc)
+
+        XCTAssertEqual(results, [[totalRow(2)], [totalRow(2, key: ["claude-opus-5-5"])]])
+    }
+
+    // An empty list follows the same rules: it still reconciles once.
+    func test_on_reports_emptyList_returnsEmpty_andStillReconcilesOnce() async throws {
+        try makeMainFile()
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+
+        let results = try await ledger.reports([], calendar: utc)
+
+        let count = await ingestCount()
+        XCTAssertEqual(results, [])
+        XCTAssertEqual(count, 2)
+    }
+
+    func test_off_reports_withAnExistingDatabase_readsItWithoutCallingTheSeam() async throws {
+        try write([assistantLine("msg_m1"), assistantLine("msg_m2")], to: mainPath(sessionA))
+        try await seedStore([sessionBatch(sessionA, transcriptPath: mainPath(sessionA), records: [record("msg_m1")])])
+        setEnabled(false)
+        let ledger = makeLedger()
+
+        let results = try await ledger.reports(
+            [UsageQuery(sessionID: sessionA), UsageQuery(groupBy: [.session])], calendar: utc)
+
+        let count = await ingestCount()
+        XCTAssertEqual(results, [[totalRow(1)], [totalRow(1, key: [sessionA])]])
+        XCTAssertEqual(count, 0)
+        assertDiagnostics([])
+    }
+
+    func test_off_reports_withoutADatabase_returnsNoRowsPerQueryAndCreatesNothing() async throws {
+        setEnabled(false)
+        let ledger = makeLedger()
+
+        let two = try await ledger.reports([UsageQuery(), UsageQuery(groupBy: [.model])], calendar: utc)
+        let none = try await ledger.reports([], calendar: utc)
+
+        XCTAssertEqual(two, [[], []])
+        XCTAssertEqual(none, [])
+        XCTAssertFalse(exists(tempPath + "/store"))
+        let count = await ingestCount()
+        XCTAssertEqual(count, 0)
+        assertDiagnostics([])
+    }
+
+    func test_reports_aQueryThatThrows_failsTheWholeCall() async throws {
+        try makeMainFile()
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+
+        for isOn in [true, false] {
+            setEnabled(isOn)
+            do {
+                _ = try await ledger.reports(
+                    [UsageQuery(), UsageQuery(groupBy: [.model, .model])], calendar: utc)
+                XCTFail("Expected invalidQuery (enabled: \(isOn))")
+            } catch {
+                XCTAssertEqual(error as? UsageStoreError, .invalidQuery, "enabled: \(isOn), got \(error)")
+            }
+        }
+    }
+
+    // `report` keeps its behaviour: one reconcile, then the one answer.
+    func test_on_report_reconcilesOnce_andAnswersLikeReportsWithOneQuery() async throws {
+        try makeMainFile()
+        await script.setOutcome(stores([record("msg_m1"), record("msg_m2")]), forCall: 1)
+        let ledger = makeLedger()
+        await noteAndSettle(ledger, "Stop")
+
+        let single = try await ledger.report(UsageQuery(groupBy: [.session]), calendar: utc)
+        let afterReport = await ingestCount()
+        let listed = try await ledger.reports([UsageQuery(groupBy: [.session])], calendar: utc)
+        let afterReports = await ingestCount()
+
+        XCTAssertEqual(single, [totalRow(2, key: [sessionA])])
+        XCTAssertEqual(listed, [single])
+        XCTAssertEqual(afterReport, 2)
+        XCTAssertEqual(afterReports, 3)
+    }
+
+    // MARK: - isTracking
+
+    /// Compiles only while `isTracking` is readable without awaiting the
+    /// actor (it is nonisolated).
+    private func readTrackingSynchronously(_ ledger: UsageLedger) -> Bool {
+        ledger.isTracking
+    }
+
+    func test_isTracking_isReadFromTheClosureAtEveryAccess() async throws {
+        let answer = OSAllocatedUnfairLock(initialState: false)
+        let reads = OSAllocatedUnfairLock(initialState: 0)
+        let ledger = UsageLedger(
+            isEnabled: {
+                reads.withLock { $0 += 1 }
+                return answer.withLock { $0 }
+            },
+            projectsRoot: { "/nonexistent" },
+            storeDirectory: URL(fileURLWithPath: storePath, isDirectory: true),
+            ingest: { _, _ in throw InjectedIngestFailure() },
+            publish: { _, _ in },
+            onDiagnostic: { _ in })
+        ledgers.append(ledger)
+        XCTAssertEqual(reads.withLock { $0 }, 0, "Fixture error: init must not read the setting")
+
+        let first = readTrackingSynchronously(ledger)
+        answer.withLock { $0 = true }
+        let second = readTrackingSynchronously(ledger)
+        let third = ledger.isTracking
+        answer.withLock { $0 = false }
+        let fourth = ledger.isTracking
+
+        XCTAssertEqual([first, second, third, fourth], [false, true, true, false])
+        XCTAssertEqual(reads.withLock { $0 }, 4, "one read of the closure per access")
+    }
+
     // MARK: - DeleteAll
 
     /// Returns once `deleteAll` has begun in some other task.
