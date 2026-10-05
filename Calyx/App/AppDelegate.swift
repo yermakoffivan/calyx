@@ -1524,7 +1524,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// the ledger's own `isTracking`, so the tool and the ledger never
     /// disagree; `current` is looked up in the registry the server holds
     /// at call time.
-    func startUsageLedger(server: CalyxMCPServer, ledger: UsageLedger) {
+    ///
+    /// R3b: it installs the usage route's endpoint (`server.usageIngest`),
+    /// which accepts the credential `credentialHolder` holds, hands every
+    /// export to `ledger.ingestExport` and notes every verdict in
+    /// `ingestMonitor`. Its startup work runs in one task, returned so a
+    /// caller can wait for it: the credential is loaded from
+    /// `credentialDirectory` off the main actor (created only while
+    /// tracking is on, decided when the load runs), the store's tracking
+    /// flag is synced, and the catch-up runs next to `reconcileKnown`, at
+    /// utility priority.
+    @discardableResult
+    func startUsageLedger(
+        server: CalyxMCPServer,
+        ledger: UsageLedger,
+        credentialDirectory: String = AppSupportDirectory.path,
+        credentialHolder: UsageIngestCredentialHolder = .shared,
+        ingestMonitor: UsageIngestMonitor = .shared
+    ) -> Task<Void, Never> {
         server.usageSink = { activity in
             Task {
                 await ledger.note(activity)
@@ -1539,12 +1556,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
             currentSessionID: { [weak server] surfaceID in server?.agentRegistry.entries[surfaceID]?.sessionID },
             now: { Date() },
             calendar: { Calendar.current })
+        server.usageIngest = UsageIngestEndpoint(
+            token: { credentialHolder.credential?.token },
+            now: Date.init,
+            ingest: { body, receivedAtNs in await ledger.ingestExport(body, receivedAtNs: receivedAtNs) },
+            note: { ingestMonitor.note($0, at: $1) })
         // Catch-up work: at utility priority it does not compete with the
         // main thread while windows are being restored.
-        Task(priority: .utility) {
-            await ledger.reconcileKnown()
+        return Task(priority: .utility) {
+            // A failed load leaves the route without a credential (401)
+            // until the next load; the failure carries nothing to show.
+            do {
+                try await credentialHolder.load(create: ledger.isTracking, directory: credentialDirectory)
+            } catch {
+                Self.usageLogger.error("""
+                    Usage credential could not be loaded: \
+                    \((error as NSError).domain, privacy: .public) \((error as NSError).code, privacy: .public)
+                    """)
+            }
+            await ledger.syncTracking()
+            async let known: Void = ledger.reconcileKnown()
+            async let caughtUp: Void = ledger.catchUp()
+            _ = await (known, caughtUp)
         }
     }
+
+    private static let usageLogger = Logger(subsystem: "com.calyx.terminal", category: "UsageIngest")
 
     // MARK: - MCP Apps host
 

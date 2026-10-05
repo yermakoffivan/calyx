@@ -29,6 +29,13 @@
 //  both orders: WHICH rows were published (as a set), never how often.
 //  Each test says which of the two it is.
 //
+//  R3b: it also installs the usage route's endpoint on that server
+//  (`server.usageIngest`), forwarding exports to `ledger.ingestExport`,
+//  accepting the credential held by the holder it is given, and noting
+//  every verdict in the monitor it is given; it loads that credential
+//  from the directory it is given (a per-test directory here, never
+//  Application Support), syncs the tracking flag, and starts a catch-up.
+//
 //  WAITING. A test waits for a publish that must happen through an
 //  expectation (bound: UsageWiringFixture.waitSeconds, reached only on
 //  failure). Before asserting what was or was not published it calls
@@ -53,6 +60,11 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     private var server: CalyxMCPServer!
     private var recorder: UsagePublishRecorder!
     private var ledgers: [UsageLedger] = []
+    private var holderStorage: UsageIngestCredentialHolder?
+    private var monitorStorage: UsageIngestMonitor?
+    /// The startup work of every `start`, awaited before the directories
+    /// are removed, so none of it can run after the teardown.
+    private var startups: [Task<Void, Never>] = []
 
     override func setUp() async throws {
         try await super.setUp()
@@ -62,16 +74,25 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         server.agentRegistry = AgentRegistry()
         server._testSetToken(testToken)
         recorder = UsagePublishRecorder()
+        holderStorage = UsageIngestCredentialHolder()
+        monitorStorage = UsageIngestMonitor()
     }
 
     override func tearDown() async throws {
         server?.usageSink = nil
+        server?.usageIngest = nil
+        for startup in startups {
+            await startup.value
+        }
+        startups = []
         server?.stop()
         server = nil
         await fixture?.shutDown(ledgers)
         ledgers = []
         fixture = nil
         recorder = nil
+        holderStorage = nil
+        monitorStorage = nil
         UsageTrackingSettings._testTeardownSuite(named: settingsSuiteName)
         try await super.tearDown()
     }
@@ -84,11 +105,23 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         return ledger
     }
 
+    /// The directory the credential is loaded from: under the fixture,
+    /// never Application Support.
+    private var credentialDirectory: String { fixture.basePath + "/credential" }
+
     /// Wires `ledger` to this test's server through a new app delegate,
-    /// as the launch does with the shared pair.
+    /// as the launch does with the shared pair, with this test's
+    /// credential directory, holder and monitor.
     private func start(_ ledger: UsageLedger) {
+        guard let holder = holderStorage, let monitor = monitorStorage else {
+            XCTFail("Fixture error: no holder or monitor")
+            return
+        }
         let appDelegate = AppDelegate()
-        appDelegate.startUsageLedger(server: server, ledger: ledger)
+        let startup = appDelegate.startUsageLedger(
+            server: server, ledger: ledger, credentialDirectory: credentialDirectory,
+            credentialHolder: holder, ingestMonitor: monitor)
+        startups.append(startup)
     }
 
     /// A Claude-shaped hook event naming `sessionID`'s synthetic transcript.
@@ -466,5 +499,201 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         XCTAssertEqual(number(try object(on.text)["row_count"]), 0)
         XCTAssertTrue(offAgain.isError)
         XCTAssertEqual(offAgain.text, "Usage tracking is off. Turn on Settings > Agents > Usage Tracking.")
+    }
+
+    // MARK: - The usage route (R3b)
+
+    private func theHolder() throws -> UsageIngestCredentialHolder {
+        try XCTUnwrap(holderStorage, "Fixture error: no holder")
+    }
+
+    private func theMonitor() throws -> UsageIngestMonitor {
+        try XCTUnwrap(monitorStorage, "Fixture error: no monitor")
+    }
+
+    /// A usage token written by hand (64 lowercase hex characters).
+    private let usageToken = String(repeating: "0123456789abcdef", count: 4)
+
+    /// Writes the credential file the launch will find.
+    private func writeCredential() throws -> UsageIngestCredential {
+        let token = usageToken
+        return try UsageIngestCredentialStore.loadOrCreate(directory: credentialDirectory, makeToken: { token })
+    }
+
+    private func usageRequest(_ body: Data, token: String) -> HTTPRequest {
+        HTTPRequest(
+            method: "POST", path: HTTPParser.usageMetricsPath,
+            headers: ["Authorization": "Bearer \(token)", "Content-Type": "application/json"], body: body)
+    }
+
+    // Tracking is off: nothing is read or created whatever the schedule.
+    func test_startUsageLedger_installsTheUsageEndpointOnTheGivenServer() {
+        XCTAssertNil(server.usageIngest, "Fixture error: a new server has no usage endpoint")
+        fixture.tracking.set(false)
+
+        start(makeLedger())
+
+        XCTAssertNotNil(server.usageIngest)
+    }
+
+    // The database is created first with tracking from the epoch, so the
+    // export (received at the endpoint's real clock) counts in full. The
+    // test loads the credential itself after `start`, which sets the same
+    // holder deterministically whichever load runs first. The session has
+    // no transcript, so its settles and the catch-up only find it missing.
+    func test_fixtureExportPostedToTheRoute_endsUpInTheLedgersTokenReports() async throws {
+        let holder = try theHolder()
+        let monitor = try theMonitor()
+        let seeded = try UsageStore(directory: fixture.storeURL, now: UsageTestClock(Date(timeIntervalSince1970: 0)).now)
+        await seeded.close()
+        let credential = try writeCredential()
+        let body = try XCTUnwrap(try UsageTelemetryFixtures.exports(run: "run1").last)
+        let ledger = makeLedger()
+        start(ledger)
+        let loaded = try await holder.load(create: false, directory: credentialDirectory)
+        XCTAssertEqual(loaded, credential, "Fixture error")
+        XCTAssertEqual(holder.credential, credential)
+
+        let before = Date()
+        let response = await server.route(request: usageRequest(body, token: credential.token))
+        let after = Date()
+
+        XCTAssertEqual(response.statusCode, 200)
+        XCTAssertEqual(response.body, Data("{}".utf8))
+        let accepted = try XCTUnwrap(monitor.lastAcceptedAt, "the monitor records the accepted time")
+        XCTAssertGreaterThanOrEqual(accepted, before)
+        XCTAssertLessThanOrEqual(accepted, after)
+        XCTAssertNil(monitor.lastRejection)
+
+        let results = try await ledger.tokenReports([UsageTokenQuery(groupBy: [.model])], calendar: Fixture.utc)
+        let rows = try XCTUnwrap(results.first)
+        XCTAssertEqual(rows.filter(\.isUnreported), [])
+        let totals = UsageTelemetryFixtures.sumByModel(rows.flatMap { row -> [(String, String, Int64)] in
+            let model = row.key.first.flatMap { $0 } ?? ""
+            return [(model, "input", row.inputTokens), (model, "output", row.outputTokens),
+                    (model, "cacheRead", row.cacheReadTokens), (model, "cacheCreation", row.cacheCreationTokens)]
+        })
+        XCTAssertEqual(totals, try UsageTelemetryFixtures.expectedTotals(run: "run1"))
+        await settle(ledger)
+    }
+
+    // Tracking is off, so the launch loads without creating: there is no
+    // credential, and the route refuses every token.
+    func test_withoutACredential_theSameRequestIsUnauthorized_andNothingIsCreated() async throws {
+        let holder = try theHolder()
+        let monitor = try theMonitor()
+        fixture.tracking.set(false)
+        let body = try XCTUnwrap(try UsageTelemetryFixtures.exports(run: "run1").last)
+        let ledger = makeLedger()
+        let before = fixture.everyPath()
+        start(ledger)
+        let loaded = try await holder.load(create: false, directory: credentialDirectory)
+        XCTAssertNil(loaded)
+        XCTAssertNil(holder.credential)
+
+        let response = await server.route(request: usageRequest(body, token: usageToken))
+
+        XCTAssertEqual(response.statusCode, 401)
+        XCTAssertEqual(monitor.lastRejection?.reason, .unauthorized)
+        XCTAssertNil(monitor.lastAcceptedAt)
+        await settle(ledger)
+        XCTAssertEqual(fixture.everyPath(), before, "with tracking off nothing is created")
+    }
+
+    // MARK: - UsageIngestCredentialHolder
+
+    func test_holder_loadWithCreate_writesTheCredential_andHoldsIt() async throws {
+        let holder = try theHolder()
+        let loaded = try await holder.load(create: true, directory: credentialDirectory)
+
+        let credential = try XCTUnwrap(loaded)
+        XCTAssertEqual(holder.credential, credential)
+        XCTAssertEqual(UsageIngestCredentialStore.read(directory: credentialDirectory), credential)
+        XCTAssertEqual(credential.token.count, 64)
+    }
+
+    func test_holder_loadWithoutCreate_readsAnExistingCredential() async throws {
+        let holder = try theHolder()
+        let credential = try writeCredential()
+
+        let loaded = try await holder.load(create: false, directory: credentialDirectory)
+
+        XCTAssertEqual(loaded, credential)
+        XCTAssertEqual(holder.credential, credential)
+    }
+
+    func test_holder_loadWithoutCreate_withoutAFile_holdsNothing_andCreatesNothing() async throws {
+        let holder = try theHolder()
+        holder.set(UsageIngestCredential(token: usageToken, headersFilePath: "/nonexistent/x"))
+
+        let loaded = try await holder.load(create: false, directory: credentialDirectory)
+
+        XCTAssertNil(loaded)
+        XCTAssertNil(holder.credential)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: credentialDirectory))
+    }
+
+    // A load that throws (the headers path is occupied by a directory)
+    // leaves the held credential as it was and rethrows.
+    func test_holder_loadThatThrows_keepsTheCredential_andRethrows() async throws {
+        let holder = try theHolder()
+        let credential = try writeCredential()
+        let loaded = try await holder.load(create: false, directory: credentialDirectory)
+        XCTAssertEqual(loaded, credential, "Fixture error")
+        let path = UsageIngestCredentialStore.headersFilePath(directory: credentialDirectory)
+        try FileManager.default.removeItem(atPath: path)
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+
+        do {
+            _ = try await holder.load(create: true, directory: credentialDirectory)
+            XCTFail("a load whose headers path is a directory must throw")
+        } catch {
+            XCTAssertEqual(holder.credential, credential)
+        }
+    }
+
+    func test_holder_set_replacesTheCredential() throws {
+        let holder = try theHolder()
+        let credential = UsageIngestCredential(token: usageToken, headersFilePath: "/nonexistent/x")
+        XCTAssertNil(holder.credential)
+        holder.set(credential)
+        XCTAssertEqual(holder.credential, credential)
+        holder.set(nil)
+        XCTAssertNil(holder.credential)
+    }
+
+    // MARK: - UsageIngestMonitor
+
+    func test_monitor_acceptedRequest_recordsItsTime() throws {
+        let monitor = try theMonitor()
+        let date = Date(timeIntervalSince1970: 1_000)
+        monitor.note(nil, at: date)
+        XCTAssertEqual(monitor.lastAcceptedAt, date)
+        XCTAssertNil(monitor.lastRejection)
+    }
+
+    func test_monitor_keepsTheRefusalsAnExporterCanCause() throws {
+        let monitor = try theMonitor()
+        let reasons: [UsageIngestRejection] = [.unauthorized, .tooLarge, .undecodable, .unavailable]
+        for (offset, reason) in reasons.enumerated() {
+            let date = Date(timeIntervalSince1970: 2_000 + Double(offset))
+            monitor.note(reason, at: date)
+            XCTAssertEqual(monitor.lastRejection, UsageIngestMonitor.Rejection(reason: reason, at: date), "\(reason)")
+        }
+        XCTAssertNil(monitor.lastAcceptedAt)
+    }
+
+    func test_monitor_ignoresAForeignOriginAndAMissingBody() throws {
+        let monitor = try theMonitor()
+        let accepted = Date(timeIntervalSince1970: 1_000)
+        let refused = Date(timeIntervalSince1970: 1_001)
+        monitor.note(nil, at: accepted)
+        monitor.note(.unauthorized, at: refused)
+
+        monitor.note(.foreignOrigin, at: Date(timeIntervalSince1970: 1_002))
+        monitor.note(.noBody, at: Date(timeIntervalSince1970: 1_003))
+
+        XCTAssertEqual(monitor.lastAcceptedAt, accepted)
+        XCTAssertEqual(monitor.lastRejection, UsageIngestMonitor.Rejection(reason: .unauthorized, at: refused))
     }
 }

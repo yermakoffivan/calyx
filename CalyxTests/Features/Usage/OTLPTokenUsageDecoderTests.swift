@@ -897,4 +897,87 @@ final class OTLPTokenUsageDecoderTests: XCTestCase {
             XCTAssertNotEqual(try id(left), try id(right), "\(left) vs \(right)")
         }
     }
+
+    // MARK: - Deeply nested bodies (R3b, section B)
+
+    // JSONSerialization refuses input nested deeper than 512 levels with an
+    // ordinary error; the decoder turns it into `.undecodable`. The nesting
+    // sits UNDER `resourceMetrics`, so a parser that accepted it would
+    // produce an empty export instead of throwing: the throw is the
+    // parser's depth limit, not the root's shape.
+
+    /// `{"resourceMetrics":` + `open` × depth + `inner` + `close` × depth + `}`.
+    private func nestedBody(depth: Int, open: String, inner: String, close: String) -> Data {
+        Data(("{\"resourceMetrics\":" + String(repeating: open, count: depth) + inner
+              + String(repeating: close, count: depth) + "}").utf8)
+    }
+
+    private func assertUndecodable(_ body: Data, _ message: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try OTLPTokenUsageDecoder.decode(body), message, file: file, line: line) { error in
+            XCTAssertEqual(error as? OTLPTokenUsageDecodeError, .undecodable, message, file: file, line: line)
+        }
+    }
+
+    func test_decode_600NestedArrays_throwsUndecodable_withoutCrashing() throws {
+        let shallow = nestedBody(depth: 10, open: "[", inner: "", close: "]")
+        XCTAssertEqual(try OTLPTokenUsageDecoder.decode(shallow).samples, [], "Fixture error: shallow nesting decodes")
+        assertUndecodable(nestedBody(depth: 600, open: "[", inner: "", close: "]"), "600 nested arrays")
+    }
+
+    func test_decode_600NestedObjects_throwsUndecodable_withoutCrashing() throws {
+        let shallow = nestedBody(depth: 10, open: "{\"a\":", inner: "1", close: "}")
+        XCTAssertEqual(try OTLPTokenUsageDecoder.decode(shallow).samples, [], "Fixture error: shallow nesting decodes")
+        assertUndecodable(nestedBody(depth: 600, open: "{\"a\":", inner: "1", close: "}"), "600 nested objects")
+    }
+
+    /// A JSON array nested `depth` levels deep (the innermost one empty).
+    private func nestedArray(depth: Int) -> Any {
+        var value: Any = [Any]()
+        for _ in 1..<depth {
+            value = [value]
+        }
+        return value
+    }
+
+    /// The attribute `key` with a 100-deep nested array as its value.
+    private func deeplyNestedAttribute(_ key: String) -> [String: Any] {
+        ["key": key, "value": ["arrayValue": ["values": nestedArray(depth: 100)]]]
+    }
+
+    // A read label (`effort`) whose value is a deep array is read as if it
+    // were absent. Every field but the series id is compared: the series
+    // id hashes every non-personal attribute's whole value (see
+    // `test_seriesID_*`), so a different value there is a different series.
+    func test_decode_readLabelHoldingA100DeepArray_decodesAsIfTheLabelWereAbsent() throws {
+        let nested = removing("effort", from: baseAttributes()) + [deeplyNestedAttribute("effort")]
+        let absent = removing("effort", from: baseAttributes())
+
+        let sample = try onlySample(Fixtures.point(attributes: nested, asDouble: 77))
+        let expected = try onlySample(Fixtures.point(attributes: absent, asDouble: 77))
+
+        XCTAssertNil(sample.effort)
+        XCTAssertEqual(sample.sessionID, expected.sessionID)
+        XCTAssertEqual(sample.startNs, expected.startNs)
+        XCTAssertEqual(sample.timeNs, expected.timeNs)
+        XCTAssertEqual(sample.kind, expected.kind)
+        XCTAssertEqual(sample.value, 77)
+        XCTAssertEqual(sample.model, expected.model)
+        XCTAssertEqual(sample.effort, expected.effort)
+        XCTAssertEqual(sample.thread, expected.thread)
+        XCTAssertEqual(sample.agent, expected.agent)
+        XCTAssertNotEqual(sample.seriesID, expected.seriesID, "an attribute's value is part of the series identity")
+    }
+
+    // A personal attribute takes no part in anything, so with a deep value
+    // the sample is exactly the one without it, series id included.
+    func test_decode_personalAttributeHoldingA100DeepArray_decodesExactlyAsIfAbsent() throws {
+        let nested = removing("user.email", from: baseAttributes()) + [deeplyNestedAttribute("user.email")]
+        let absent = removing("user.email", from: baseAttributes())
+
+        let sample = try onlySample(Fixtures.point(attributes: nested, asDouble: 77))
+        let expected = try onlySample(Fixtures.point(attributes: absent, asDouble: 77))
+
+        XCTAssertEqual(sample, expected)
+        XCTAssertEqual(sample.value, 77)
+    }
 }

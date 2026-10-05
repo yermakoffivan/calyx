@@ -286,7 +286,7 @@ actor UsageStore {
     /// open and usable.
     func deleteAll() throws {
         let connection = try openConnection()
-        let trackedFrom = Self.nanoseconds(now())
+        let trackedFrom = UsageClock.nanoseconds(now())
         try connection.transaction {
             try connection.execute("""
                 DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files; \
@@ -487,7 +487,7 @@ actor UsageStore {
                 try connection.execute(schemaV2Additions)
                 // Tracking starts now: whatever running processes counted
                 // before this moment only sets their baselines.
-                try setTrackedFrom(nanoseconds(now()), connection: connection)
+                try setTrackedFrom(UsageClock.nanoseconds(now()), connection: connection)
             }
             try connection.execute("PRAGMA user_version = \(schemaVersion)")
         }
@@ -857,6 +857,11 @@ struct UsageSeriesApplyOutcome: Sendable, Equatable {
     /// Tokens added by this call (saturating at Int64.max); kinds with 0
     /// omitted.
     var added: [UsageTokenKind: Int64] = [:]
+    /// The sessions for which this call stored a new series (also one
+    /// that only sets a baseline, and one whose value is 0) or added
+    /// tokens. Not: stale samples, zero increments, regressions. Empty for
+    /// an ignored call.
+    var changedSessions: Set<String> = []
 }
 
 /// The stored baseline of one series.
@@ -984,8 +989,10 @@ extension UsageStore {
                         outcome.baselineOnly += 1
                     }
                     try Self.insertSeries(sample, firstHeardNs: receivedAtNs, connection: connection)
+                    outcome.changedSessions.insert(sample.sessionID)
                 }
                 guard amount != 0 else { continue }
+                outcome.changedSessions.insert(sample.sessionID)
                 try Self.addToPoint(amount, of: sample, minute: minute, connection: connection)
                 outcome.added[sample.kind] = Self.saturatingSum(outcome.added[sample.kind] ?? 0, amount)
             }
@@ -1069,33 +1076,64 @@ extension UsageStore {
     /// while it was off is never added.
     func resetTracking() throws {
         let connection = try openConnection()
-        let trackedFrom = Self.nanoseconds(now())
+        let trackedFrom = UsageClock.nanoseconds(now())
         try connection.transaction {
             try Self.restartTracking(at: trackedFrom, connection: connection)
         }
     }
 
+    /// Records whether tracking is active (`usage_meta.tracking_active`,
+    /// 0 / 1). Paused -> active restarts tracking (`restartTracking`) in
+    /// the same transaction and returns true. Active -> active and
+    /// paused -> paused write nothing and return false.
+    @discardableResult
+    func setTrackingActive(_ active: Bool) throws -> Bool {
+        let connection = try openConnection()
+        guard try Self.trackingActive(connection: connection) != active else { return false }
+        let trackedFrom = UsageClock.nanoseconds(now())
+        var restarted = false
+        try connection.transaction {
+            // Read again inside the transaction: the answer above is only
+            // a shortcut that keeps the steady state free of writes.
+            guard try Self.trackingActive(connection: connection) != active else { return }
+            if active {
+                try Self.restartTracking(at: trackedFrom, connection: connection)
+                restarted = true
+            }
+            try Self.setMeta(Self.trackingActiveKey, to: active ? 1 : 0, connection: connection)
+        }
+        return restarted
+    }
+
+    /// Whether tracking is active; a database without the row is active
+    /// (a database is only ever created while tracking is on).
+    func isTrackingActive() throws -> Bool {
+        let connection = try openConnection()
+        return try Self.trackingActive(connection: connection)
+    }
+
     // MARK: - Series helpers
+
+    private static let trackingActiveKey = "tracking_active"
+
+    private static func trackingActive(connection: SQLiteConnection) throws -> Bool {
+        try connection.withStatement(selectTrackedFromSQL) { statement in
+            try statement.bind(trackingActiveKey, at: 1)
+            guard try statement.step(), !statement.isNull(at: 0) else { return true }
+            return statement.int64(at: 0) != 0
+        }
+    }
+
+    private static func setMeta(_ key: String, to value: Int64, connection: SQLiteConnection) throws {
+        try connection.withStatement(upsertTrackedFromSQL) { statement in
+            try statement.bind(key, at: 1)
+            try statement.bind(value, at: 2)
+            _ = try statement.step()
+        }
+    }
 
     private static let nanosecondsPerMinute: Int64 = 60_000_000_000
     private static let trackedFromKey = "tracked_from_ns"
-
-    /// `date` in whole nanoseconds since the epoch, truncated toward zero
-    /// and saturated to Int64's range, so it never throws and never traps
-    /// (`Date.distantFuture` / `distantPast` are legal clocks). A
-    /// non-finite clock reads as `Int64.max`: nothing counts as tracked,
-    /// the safe side for a clock that cannot be trusted. The single
-    /// conversion for every place the store reads its clock.
-    private static func nanoseconds(_ date: Date) -> Int64 {
-        let nanoseconds = (date.timeIntervalSince1970 * 1_000_000_000).rounded(.towardZero)
-        guard nanoseconds.isFinite else { return Int64.max }
-        // Exact bounds: -2^63 is Int64.min, and 2^63 is the first double
-        // above Int64.max (`Double(Int64.max)` rounds up to it), so the
-        // conversion below only sees values it can represent.
-        if nanoseconds < -9_223_372_036_854_775_808.0 { return Int64.min }
-        if nanoseconds >= 9_223_372_036_854_775_808.0 { return Int64.max }
-        return Int64(nanoseconds)
-    }
 
     /// `lhs + rhs`, clamped to Int64's range instead of overflowing.
     private static func saturatingSum(_ lhs: Int64, _ rhs: Int64) -> Int64 {

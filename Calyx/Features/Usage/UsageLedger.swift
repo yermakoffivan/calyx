@@ -44,6 +44,16 @@ enum UsageLedgerDiagnostic: Sendable, Equatable {
     case projectRootResolutionFailed(sessionID: String)
     /// The store could not be opened or read outside an ingest.
     case storeUnavailable(error: Failure)
+    /// An export handed over by the usage route is not a metric export.
+    /// Carries nothing of the body.
+    case exportUndecodable
+    /// Reading a session's run log threw.
+    case runLogReadFailed(sessionID: String, error: Failure)
+    /// A session's transcript was there but could not be used:
+    /// `.notARegularFile` or `.redirected`. Never reported for `.missing`.
+    case transcriptNotUsable(sessionID: String, status: UsageRunLogReadResult.Status)
+    /// Recomputing a session's unreported rows threw.
+    case reconcileFailed(sessionID: String, error: Failure)
 }
 
 // MARK: - UsageLedger
@@ -65,6 +75,40 @@ actor UsageLedger {
     private let ingest: @Sendable (ClaudeTranscriptLocation, UsageStore) async throws -> UsageIngestResult
     private let publish: @Sendable (String, UsageRow?) async -> Void
     private let onDiagnostic: @Sendable (UsageLedgerDiagnostic) -> Void
+    private let readRunLog: @Sendable (String, UsageStore, Bool) async throws -> UsageRunLogReadResult
+    private let now: @Sendable () -> Date
+    /// Test seam: awaited inside `ingestExport`'s counted store call right
+    /// after `store.apply` returned. Production passes nothing.
+    private let afterApply: (@Sendable () async -> Void)?
+
+    /// How long `catchUp` does not look again for a session whose
+    /// transcript was found missing.
+    static let missingTranscriptRetryInterval: TimeInterval = 10 * 60
+
+    /// One session's settle, from the request that started it until its
+    /// last re-run has ended.
+    private struct Settle {
+        /// Tells this settle from a later one for the same session.
+        let id: UInt64
+        /// A request arrived since the current run started.
+        var rerunRequested = false
+    }
+
+    /// Running settles, keyed by session id.
+    private var settles: [String: Settle] = [:]
+    private var lastSettleID: UInt64 = 0
+    /// Sessions whose project root could not be resolved in this process
+    /// and whose transcript has had no new line read since. Bounded: at
+    /// most one entry per session heard in this run of the app; cleared
+    /// by `deleteAll()`.
+    private var projectRootFailed: Set<String> = []
+    /// When a session's transcript was last found missing. Bounded: at
+    /// most one entry per session heard in this run of the app; cleared
+    /// by `deleteAll()`.
+    private var transcriptMissingSince: [String: Date] = [:]
+    /// The tracking state last written to the store's durable flag; nil
+    /// until the first successful sync.
+    private var syncedTracking: Bool?
 
     /// One transcript's ingest, from the trigger that started it until
     /// its last re-run has ended.
@@ -118,14 +162,23 @@ actor UsageLedger {
         storeDirectory: URL,
         ingest: @escaping @Sendable (ClaudeTranscriptLocation, UsageStore) async throws -> UsageIngestResult,
         publish: @escaping @Sendable (String, UsageRow?) async -> Void,
-        onDiagnostic: @escaping @Sendable (UsageLedgerDiagnostic) -> Void
+        onDiagnostic: @escaping @Sendable (UsageLedgerDiagnostic) -> Void,
+        readRunLog: (@Sendable (String, UsageStore, Bool) async throws -> UsageRunLogReadResult)? = nil,
+        now: @escaping @Sendable () -> Date = { Date() },
+        afterApply: (@Sendable () async -> Void)? = nil
     ) {
+        self.afterApply = afterApply
         self.isEnabled = isEnabled
         self.projectsRoot = projectsRoot
         self.storeDirectory = storeDirectory
         self.ingest = ingest
         self.publish = publish
         self.onDiagnostic = onDiagnostic
+        self.readRunLog = readRunLog ?? { sessionID, store, resolveProjectRoot in
+            try await UsageRunLogReader(store: store, resolver: GitProjectRootResolver(), projectsRoot: projectsRoot)
+                .read(sessionID: sessionID, resolveProjectRoot: resolveProjectRoot)
+        }
+        self.now = now
     }
 
     // MARK: - Events
@@ -242,10 +295,11 @@ actor UsageLedger {
     /// `calendar` only the time zone is used
     /// (`UsagePeriod.localDayCalendar`).
     func reports(_ queries: [UsageQuery], calendar: Calendar) async throws -> [[UsageRow]] {
+        await waitWhileDeleting()
         if isEnabled() {
             await reconcileKnown()
         }
-        await awaitPendingClose()
+        await awaitStoreReadyAfterDeletes()
         guard let store = try storeIfWarranted() else { return queries.map { _ in [] } }
         return try await storeCall { try await store.reports(queries, calendar: calendar) }
     }
@@ -280,9 +334,19 @@ actor UsageLedger {
             // No flight can have marked a transcript since the wait
             // below ended, so this leaves the set empty on every path.
             ingested.removeAll()
+            projectRootFailed.removeAll()
+            transcriptMissingSince.removeAll()
             deletionsInProgress -= 1
+            // Wakes the reports waiting for the delete to finish.
+            signalChange()
         }
-        while !flights.isEmpty {
+        // Waits for everything in flight that started before it, as
+        // `close()` does: transcript flights, settles, and store calls (an
+        // export's `apply` suspended in the store included). Work that
+        // resumes meanwhile sees `isDeleting` and requests nothing new; a
+        // requested re-run of a settle is not run. Its own store call
+        // starts only after this wait, so it never waits on itself.
+        while !flights.isEmpty || !settles.isEmpty || storeCallsInProgress > 0 {
             await waitForChange()
         }
         await awaitPendingClose()
@@ -296,6 +360,26 @@ actor UsageLedger {
         }
     }
 
+    /// Returns once no `deleteAll` is in progress (several in a row
+    /// included). Holds no store call while it waits, so a report waiting
+    /// here never keeps a delete from running.
+    private func waitWhileDeleting() async {
+        while isDeleting {
+            await waitForChange()
+        }
+    }
+
+    /// Returns with no delete in progress and no store closing, in the
+    /// same synchronous stretch, so the store call that follows directly
+    /// answers from the store as it is after every delete and never
+    /// starts while a delete waits.
+    private func awaitStoreReadyAfterDeletes() async {
+        repeat {
+            await waitWhileDeleting()
+            await awaitPendingClose()
+        } while isDeleting
+    }
+
     /// True from `deleteAll`'s first statement until it returns or
     /// throws.
     var isDeleting: Bool {
@@ -304,9 +388,9 @@ actor UsageLedger {
 
     // MARK: - Lifetime
 
-    /// Returns when no ingest is running or pending.
+    /// Returns when no ingest or settle is running or pending.
     func waitUntilIdle() async {
-        while !flights.isEmpty {
+        while !flights.isEmpty || !settles.isEmpty {
             await waitForChange()
         }
     }
@@ -316,7 +400,7 @@ actor UsageLedger {
     /// the one closing it. The ledger stays usable: the next need opens
     /// the store again.
     func close() async {
-        while !flights.isEmpty || storeCallsInProgress > 0 {
+        while !flights.isEmpty || !settles.isEmpty || storeCallsInProgress > 0 {
             await waitForChange()
         }
         // Taken out of `store` before the suspension below, so whatever
@@ -484,6 +568,221 @@ actor UsageLedger {
         await publish(sessionID, row)
     }
 
+    // MARK: - Exports (version 2)
+
+    /// One export from the usage route. Returns once the export is
+    /// committed (or refused); the settles it requests run afterwards in
+    /// tasks of the ledger's own and are not waited for.
+    ///
+    /// - Tracking off or a delete in progress: `.dropped`, nothing opened
+    ///   or created (with tracking off the durable flag is brought in line
+    ///   first, which opens only an existing database).
+    /// - Not a metric export: `.undecodable`, reported once.
+    /// - The flag cannot be made active, the store cannot be opened, or
+    ///   `apply` throws: `.unavailable`, reported as `storeUnavailable`.
+    /// - Otherwise `.stored`, and every session the export changed is
+    ///   settled.
+    func ingestExport(_ body: Data, receivedAtNs: Int64) async -> UsageIngestOutcome {
+        guard !isDeleting else { return .dropped }
+        guard isEnabled() else {
+            await syncTrackingIfChanged()
+            return .dropped
+        }
+        let batch: OTLPTokenUsageBatch
+        do {
+            batch = try OTLPTokenUsageDecoder.decode(body)
+        } catch {
+            onDiagnostic(.exportUndecodable)
+            return .undecodable
+        }
+        // Never applied before the durable flag is active: a switch back
+        // on must restart tracking before the first export after it.
+        if syncedTracking != true {
+            await syncTracking()
+        }
+        guard isEnabled(), !isDeleting else { return .dropped }
+        guard syncedTracking == true else { return .unavailable }
+        await awaitPendingClose()
+        guard isEnabled(), !isDeleting else { return .dropped }
+        let outcome: UsageSeriesApplyOutcome
+        do {
+            let store = try openedStore()
+            let afterApply = self.afterApply
+            outcome = try await storeCall {
+                let applied = try await store.apply(
+                    samples: batch.samples, processStarts: batch.processStarts, receivedAtNs: receivedAtNs)
+                await afterApply?()
+                return applied
+            }
+        } catch {
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
+            return .unavailable
+        }
+        if !isDeleting {
+            for sessionID in outcome.changedSessions.sorted() {
+                _ = requestSettle(of: sessionID)
+            }
+        }
+        return .stored
+    }
+
+    /// Settles every session heard from since tracking (re)started, one
+    /// after another, and returns when they are done. A session whose
+    /// transcript was found missing less than
+    /// `missingTranscriptRetryInterval` ago (the injected clock) is
+    /// skipped. Does nothing while tracking is off or a delete is in
+    /// progress. Never throws; a store failure is `storeUnavailable`.
+    func catchUp() async {
+        guard isEnabled(), !isDeleting else { return }
+        await syncTrackingIfChanged()
+        await awaitPendingClose()
+        guard isEnabled(), !isDeleting else { return }
+        let sessionIDs: [String]
+        do {
+            let store = try openedStore()
+            sessionIDs = try await storeCall { try await store.sessionsWithSeries() }
+        } catch {
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
+            return
+        }
+        for sessionID in sessionIDs {
+            guard isEnabled(), !isDeleting else { return }
+            if let missingSince = transcriptMissingSince[sessionID],
+               now().timeIntervalSince(missingSince) < Self.missingTranscriptRetryInterval {
+                continue
+            }
+            let settle = requestSettle(of: sessionID)
+            // Ends when that settle does, re-run included.
+            while settles[sessionID]?.id == settle {
+                await waitForChange()
+            }
+        }
+    }
+
+    /// The token aggregate query, one result per query in order. With
+    /// tracking on it first catches up; then ONE store call answers every
+    /// query. With tracking off and no database every answer is empty and
+    /// nothing is created. Errors of the store call are thrown.
+    func tokenReports(_ queries: [UsageTokenQuery], calendar: Calendar) async throws -> [[UsageTokenRow]] {
+        await waitWhileDeleting()
+        if isEnabled() {
+            await catchUp()
+        } else {
+            await syncTrackingIfChanged()
+        }
+        await awaitStoreReadyAfterDeletes()
+        guard let store = try storeIfWarranted() else { return queries.map { _ in [] } }
+        return try await storeCall { try await store.tokenReports(queries, calendar: calendar) }
+    }
+
+    /// Brings the store's durable tracking flag in line with the setting.
+    /// Tracking on: opens (creates) the store and marks it active, which
+    /// restarts tracking when it was paused. Tracking off: marks it paused
+    /// only when the database exists; nothing is created. A failure is
+    /// `storeUnavailable` and is retried at the next call.
+    ///
+    /// A pause takes effect when the ledger observes it: here, which
+    /// R4b's activation reconciler calls on every change of the setting,
+    /// and at every entry point that notices the setting differs from
+    /// what was last synced. A switch off and on again that no call
+    /// observed in between is not a pause.
+    func syncTracking() async {
+        await awaitPendingClose()
+        let enabled = isEnabled()
+        do {
+            guard let store = try storeIfWarranted() else {
+                // Off, and no database: nothing to record.
+                syncedTracking = false
+                return
+            }
+            _ = try await storeCall { try await store.setTrackingActive(enabled) }
+            syncedTracking = enabled
+        } catch {
+            syncedTracking = nil
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
+        }
+    }
+
+    /// `syncTracking()` when the setting differs from what was last
+    /// synced; the steady state costs nothing.
+    private func syncTrackingIfChanged() async {
+        guard syncedTracking != isEnabled() else { return }
+        await syncTracking()
+    }
+
+    // MARK: - Settles
+
+    /// Asks for one settle of `sessionID` and returns the id of the
+    /// settle that will run it: the session's running settle, now asked
+    /// for a re-run, or a new one in a task of the ledger's own.
+    private func requestSettle(of sessionID: String) -> UInt64 {
+        if let running = settles[sessionID] {
+            settles[sessionID]?.rerunRequested = true
+            return running.id
+        }
+        lastSettleID += 1
+        settles[sessionID] = Settle(id: lastSettleID)
+        Task { await self.runSettle(sessionID) }
+        return lastSettleID
+    }
+
+    /// Runs the registered settle of `sessionID`: one settle, then one
+    /// more for as long as a request arrived during the last one. The
+    /// entry is removed in the same synchronous stretch that finds no
+    /// re-run requested, so a request either sets the flag or starts a
+    /// new settle. No re-run starts while a delete is in progress.
+    private func runSettle(_ sessionID: String) async {
+        repeat {
+            settles[sessionID]?.rerunRequested = false
+            await settleOnce(sessionID)
+        } while !isDeleting && settles[sessionID]?.rerunRequested == true
+        settles[sessionID] = nil
+        signalChange()
+    }
+
+    /// Reads the session's run log, then recomputes its unreported rows.
+    /// Never throws; failures become diagnostics.
+    private func settleOnce(_ sessionID: String) async {
+        await awaitPendingClose()
+        guard isEnabled(), !isDeleting else { return }
+        let store: UsageStore
+        do {
+            store = try openedStore()
+        } catch {
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
+            return
+        }
+        let resolveProjectRoot = !projectRootFailed.contains(sessionID)
+        let result: UsageRunLogReadResult
+        do {
+            result = try await readRunLog(sessionID, store, resolveProjectRoot)
+        } catch {
+            onDiagnostic(.runLogReadFailed(sessionID: sessionID, error: UsageLedgerDiagnostic.Failure(error)))
+            return
+        }
+        switch result.status {
+        case .read:
+            transcriptMissingSince[sessionID] = nil
+        case .missing:
+            transcriptMissingSince[sessionID] = now()
+        case .notARegularFile, .redirected:
+            transcriptMissingSince[sessionID] = nil
+            onDiagnostic(.transcriptNotUsable(sessionID: sessionID, status: result.status))
+        }
+        if result.linesRead > 0 {
+            projectRootFailed.remove(sessionID)
+        }
+        if result.projectRootResolutionFailed {
+            projectRootFailed.insert(sessionID)
+            onDiagnostic(.projectRootResolutionFailed(sessionID: sessionID))
+        }
+        do {
+            _ = try await store.reconcile(session: sessionID)
+        } catch {
+            onDiagnostic(.reconcileFailed(sessionID: sessionID, error: UsageLedgerDiagnostic.Failure(error)))
+        }
+    }
+
     // MARK: - Waiting
 
     /// Suspends until the next `signalChange()`. Callers loop on their
@@ -617,6 +916,30 @@ extension UsageLedger {
                 Usage store is unavailable: \
                 \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
                 """)
+        case .exportUndecodable:
+            logger.warning("A usage export could not be decoded")
+        case .runLogReadFailed(let sessionID, let error):
+            logger.error("""
+                Run log of session \(sessionID) could not be read: \
+                \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
+                """)
+        case .transcriptNotUsable(let sessionID, let status):
+            logger.warning(
+                "Transcript of session \(sessionID) was not read: \(runLogStatusName(status), privacy: .public)")
+        case .reconcileFailed(let sessionID, let error):
+            logger.error("""
+                Unreported usage of session \(sessionID) could not be recomputed: \
+                \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
+                """)
+        }
+    }
+
+    private static func runLogStatusName(_ status: UsageRunLogReadResult.Status) -> String {
+        switch status {
+        case .read: return "read"
+        case .missing: return "missing"
+        case .notARegularFile: return "notARegularFile"
+        case .redirected: return "redirected"
         }
     }
 

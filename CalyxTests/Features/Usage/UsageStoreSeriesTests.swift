@@ -231,9 +231,11 @@ final class UsageStoreSeriesTests: XCTestCase {
 
     private func outcome(
         ignored: Bool = false, newSeries: Int = 0, baselineOnly: Int = 0, advancedSeries: Int = 0,
-        unchangedSamples: Int = 0, staleSamples: Int = 0, regressions: Int = 0, added: [UsageTokenKind: Int64] = [:]
+        unchangedSamples: Int = 0, staleSamples: Int = 0, regressions: Int = 0, added: [UsageTokenKind: Int64] = [:],
+        changedSessions: Set<String> = []
     ) -> UsageSeriesApplyOutcome {
         var outcome = UsageSeriesApplyOutcome()
+        outcome.changedSessions = changedSessions
         outcome.ignored = ignored
         outcome.newSeries = newSeries
         outcome.baselineOnly = baselineOnly
@@ -419,7 +421,7 @@ final class UsageStoreSeriesTests: XCTestCase {
 
         let result = try await send(samples, starts: [fresh(Self.beforeCapturesNs)], to: store)
 
-        XCTAssertEqual(result, outcome(newSeries: 2, added: [.output: 150]))
+        XCTAssertEqual(result, outcome(newSeries: 2, added: [.output: 150], changedSessions: ["11111111-1111-4111-8111-111111111111"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows.map(\.outputTokens), [150])
     }
@@ -430,7 +432,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             sample(session: "session-a", timeNs: 10, value: 10),
             sample(session: "session-b", timeNs: 10, value: 20),
         ], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 30]))
+        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 30], changedSessions: ["session-a", "session-b"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(session: "session-a", input: 10), row(session: "session-b", input: 20)])
     }
@@ -439,7 +441,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let store = try openStore()
         try await send([sample(startNs: 1_000, timeNs: 10, value: 500)], to: store)
         let result = try await send([sample(startNs: 2_000, timeNs: 11, value: 7)], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 7]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 7], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: 507)])
     }
@@ -547,7 +549,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let store = try openStore(at: Self.tracked)
         let result = try await send([sample(timeNs: 10, value: 9)], starts: [fresh(Self.trackedNs)], to: store,
                                     at: Self.trackedNs)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 9]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 9], changedSessions: ["session-a"]))
     }
 
     private var oldProcess: UsageProcessStart {
@@ -570,7 +572,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let after = try await send(
             [sample(startNs: oldProcess.startNs + 1, timeNs: 20, value: 130)], starts: [oldProcess], to: store,
             at: Self.trackedNs + Self.settleNs)
-        XCTAssertEqual(after, outcome(baselineOnly: 1))
+        XCTAssertEqual(after, outcome(baselineOnly: 1, changedSessions: ["session-a"]))
         let starts = try await store.processStarts()
         XCTAssertEqual(starts, [oldProcess])
         let rows = try await store.pointRows()
@@ -582,7 +584,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let result = try await send(
             [sample(startNs: Self.trackedNs + 1, timeNs: 10, value: 40)], starts: [fresh(Self.trackedNs)], to: store,
             at: Self.trackedNs + 1_000_000_000)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 40]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 40], changedSessions: ["session-a"]))
         let starts = try await store.processStarts()
         XCTAssertEqual(starts, [fresh(Self.trackedNs)])
     }
@@ -596,7 +598,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             // A series start after tracking decides nothing.
             sample(series: 2, startNs: Self.trackedNs + 1, timeNs: 10, value: 7),
         ], starts: [oldProcess], to: store, at: Self.trackedNs + Self.settleNs)
-        XCTAssertEqual(first, outcome(baselineOnly: 2))
+        XCTAssertEqual(first, outcome(baselineOnly: 2, changedSessions: ["session-a"]))
         let rowsAfterFirst = try await store.pointRows()
         XCTAssertEqual(rowsAfterFirst, [])
 
@@ -607,7 +609,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             // though its own start is far before tracking.
             sample(series: 3, startNs: 1, timeNs: 20, value: 40),
         ], starts: [oldProcess], to: store, at: Self.trackedNs + Self.settleNs + 5_000_000_000)
-        XCTAssertEqual(second, outcome(newSeries: 1, advancedSeries: 1, unchangedSamples: 1, added: [.input: 70]))
+        XCTAssertEqual(second, outcome(newSeries: 1, advancedSeries: 1, unchangedSamples: 1, added: [.input: 70], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows.map(\.inputTokens), [70])
     }
@@ -618,7 +620,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             sample(series: 1, startNs: Self.trackedNs - 1, timeNs: 10, value: 3),
             sample(series: 2, startNs: Self.trackedNs + 5, timeNs: 10, value: 4),
         ], starts: [fresh(Self.trackedNs)], to: store, at: Self.trackedNs + Self.settleNs + 1)
-        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 7]))
+        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 7], changedSessions: ["session-a"]))
     }
 
     func test_neverHeardProcessStartedAfterTracking_seriesStartingBeforeTracking_countsWhole() async throws {
@@ -626,7 +628,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let result = try await send(
             [sample(startNs: 1, timeNs: 10, value: 25)], starts: [fresh(Self.trackedNs + 1)], to: store,
             at: Self.trackedNs + Self.settleNs + 1)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 25]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 25], changedSessions: ["session-a"]))
     }
 
     func test_freshStore_trackedFromIsTheClockAtCreation() async throws {
@@ -657,7 +659,7 @@ final class UsageStoreSeriesTests: XCTestCase {
     func test_regression_addsNothing_writesNothing_andLaterGrowthCountsOnlyBeyondTheLargestValue() async throws {
         let store = try openStore()
         let first = try await send([sample(timeNs: 10, value: 100)], to: store)
-        XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 100]))
+        XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 100], changedSessions: ["session-a"]))
         let seriesBefore = try await store.seriesRows()
 
         let regression = try await send([sample(timeNs: 20, value: 50)], to: store)
@@ -668,7 +670,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(rowsAfterRegression, [row(input: 100)])
 
         let growth = try await send([sample(timeNs: 30, value: 120)], to: store)
-        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 20]))
+        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 20], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: 120)])
     }
@@ -748,7 +750,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         try await send([sample(timeNs: 10, value: 100)], to: store)
         try await send([sample(timeNs: 20, value: 40)], to: store)
         let result = try await send([sample(timeNs: 15, value: 300)], to: store)
-        XCTAssertEqual(result, outcome(advancedSeries: 1, added: [.input: 200]))
+        XCTAssertEqual(result, outcome(advancedSeries: 1, added: [.input: 200], changedSessions: ["session-a"]))
         let stale = try await send([sample(timeNs: 15, value: 400)], to: store)
         XCTAssertEqual(stale, outcome(staleSamples: 1))
         let rows = try await store.pointRows()
@@ -758,12 +760,12 @@ final class UsageStoreSeriesTests: XCTestCase {
     func test_samplesWithEqualTime_keepInputOrder_firstWins() async throws {
         let store = try openStore()
         let result = try await send([sample(timeNs: 10, value: 10), sample(timeNs: 10, value: 20)], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, staleSamples: 1, added: [.input: 10]))
+        XCTAssertEqual(result, outcome(newSeries: 1, staleSamples: 1, added: [.input: 10], changedSessions: ["session-a"]))
 
         try await closeAllStoresAndRemoveDirectory()
         let other = try openStore()
         let swapped = try await send([sample(timeNs: 10, value: 20), sample(timeNs: 10, value: 10)], to: other)
-        XCTAssertEqual(swapped, outcome(newSeries: 1, staleSamples: 1, added: [.input: 20]))
+        XCTAssertEqual(swapped, outcome(newSeries: 1, staleSamples: 1, added: [.input: 20], changedSessions: ["session-a"]))
     }
 
     func test_oneCall_outOfOrderSamples_areAppliedInAscendingTime() async throws {
@@ -773,7 +775,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             sample(timeNs: 9, value: 10),
             sample(timeNs: 20, value: 60),
         ], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, advancedSeries: 2, added: [.input: 90]))
+        XCTAssertEqual(result, outcome(newSeries: 1, advancedSeries: 2, added: [.input: 90], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: 90)])
     }
@@ -799,13 +801,13 @@ final class UsageStoreSeriesTests: XCTestCase {
         // time is still compared with the stored 50 at t=10: a regression.
         XCTAssertEqual(result, outcome(
             newSeries: 2, advancedSeries: 1, unchangedSamples: 1, staleSamples: 1, regressions: 2,
-            added: [.output: 7, .cacheCreation: 800]))
+            added: [.output: 7, .cacheCreation: 800], changedSessions: ["session-a"]))
     }
 
     func test_zeroAmount_createsNoRow() async throws {
         let store = try openStore()
         let first = try await send([sample(timeNs: 10, value: 0)], to: store)
-        XCTAssertEqual(first, outcome(newSeries: 1))
+        XCTAssertEqual(first, outcome(newSeries: 1, changedSessions: ["session-a"]))
         let unchanged = try await send([sample(timeNs: 20, value: 0)], to: store, at: Self.minuteStartNs + Self.oneMinuteNs)
         XCTAssertEqual(unchanged, outcome(unchangedSamples: 1))
         let rows = try await store.pointRows()
@@ -887,7 +889,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             XCTAssertEqual(starts, [], "export \(index + 1)")
         }
         let firstAfterWindow = try await apply(try element(exports, at: 5), to: store)
-        XCTAssertEqual(firstAfterWindow, outcome(baselineOnly: 8))
+        XCTAssertEqual(firstAfterWindow, outcome(baselineOnly: 8, changedSessions: ["11111111-1111-4111-8111-111111111111"]))
         let rowsAfterBaseline = try await store.pointRows()
         XCTAssertEqual(rowsAfterBaseline, rowsBeforeReset)
         try await apply(try element(exports, at: 6), to: store)
@@ -913,7 +915,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         try await assertNothingStored(store, retired: 1)
         let outcomes = try await apply(Array(exports.dropFirst(2)), to: store)
         XCTAssertEqual(outcomes.map(\.ignored), [true, true, true, false, false])
-        XCTAssertEqual(try element(outcomes, at: 3), outcome(baselineOnly: 8), "Deleted usage must not come back")
+        XCTAssertEqual(try element(outcomes, at: 3), outcome(baselineOnly: 8, changedSessions: ["11111111-1111-4111-8111-111111111111"]), "Deleted usage must not come back")
         let actual = try await totals(of: store)
         XCTAssertEqual(actual, try expectedIncrements(raw, kept: nil, baseline: 5))
     }
@@ -935,7 +937,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(trackedFrom, Self.setBackNs, "tracked_from is the clock, even when earlier than before")
         let outcomes = try await apply(Array(exports.dropFirst(3)), to: store)
         XCTAssertEqual(outcomes.map(\.ignored), [false, false, false, false])
-        XCTAssertEqual(try element(outcomes, at: 0), outcome(baselineOnly: 8))
+        XCTAssertEqual(try element(outcomes, at: 0), outcome(baselineOnly: 8, changedSessions: ["11111111-1111-4111-8111-111111111111"]))
         let actual = try await totals(of: store)
         XCTAssertEqual(actual, try expectedIncrements(raw, kept: 2, baseline: 3))
         XCTAssertNotEqual(actual, try Fixtures.expectedTotals(run: "run1"), "Fixture error: the reset must leave out some tokens")
@@ -955,7 +957,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(trackedFrom, Self.setBackNs)
         try await assertNothingStored(store, retired: 1)
         let outcomes = try await apply(Array(exports.dropFirst(3)), to: store)
-        XCTAssertEqual(try element(outcomes, at: 0), outcome(baselineOnly: 8))
+        XCTAssertEqual(try element(outcomes, at: 0), outcome(baselineOnly: 8, changedSessions: ["11111111-1111-4111-8111-111111111111"]))
         let actual = try await totals(of: store)
         XCTAssertEqual(actual, try expectedIncrements(raw, kept: nil, baseline: 3))
     }
@@ -970,7 +972,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             let store = try openStore(clock: clock)
             let process = fresh(2_000_000_000_000)
             let first = try await send([sample(timeNs: 10, value: 10)], starts: [process], to: store, at: 2_100_000_000_000)
-            XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 10]))
+            XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]))
 
             clock.set(Date(timeIntervalSince1970: 1_500))
             try await restart(store, deleting: deleting)
@@ -984,10 +986,10 @@ final class UsageStoreSeriesTests: XCTestCase {
             XCTAssertEqual(retiredAfterInside, 1, "an already retired process adds no digest; deleting: \(deleting)")
             let edge = try await send([sample(timeNs: 30, value: 50)], starts: [process], to: store,
                                       at: 1_500_000_000_000 + Self.settleNs)
-            XCTAssertEqual(edge, outcome(baselineOnly: 1), "deleting: \(deleting)")
+            XCTAssertEqual(edge, outcome(baselineOnly: 1, changedSessions: ["session-a"]), "deleting: \(deleting)")
             let growth = try await send([sample(timeNs: 40, value: 54)], starts: [process], to: store,
                                         at: 2_200_000_000_000)
-            XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 4]), "deleting: \(deleting)")
+            XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 4], changedSessions: ["session-a"]), "deleting: \(deleting)")
             let rows = try await store.pointRows()
             XCTAssertEqual(rows.map(\.inputTokens).reduce(0, +), deleting ? 4 : 14, "deleting: \(deleting)")
         }
@@ -1017,7 +1019,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             let future = fresh(4_000_000_000_000_000_000)
             let accepted = try await send(
                 [sample(startNs: 4_000_000_000_000_000_000, timeNs: 10, value: 5)], starts: [future], to: store)
-            XCTAssertEqual(accepted, outcome(newSeries: 1, added: [.input: 5]))
+            XCTAssertEqual(accepted, outcome(newSeries: 1, added: [.input: 5], changedSessions: ["session-a"]))
 
             clock.set(Date(timeIntervalSince1970: 2_000))
             try await restart(store, deleting: deleting)
@@ -1026,7 +1028,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             let ordinary = try await send(
                 [sample(series: 2, timeNs: 10, value: 8)], starts: [fresh(3_000_000_000_000, session: "session-b")],
                 to: store)
-            XCTAssertEqual(ordinary, outcome(newSeries: 1, added: [.input: 8]), "deleting: \(deleting)")
+            XCTAssertEqual(ordinary, outcome(newSeries: 1, added: [.input: 8], changedSessions: ["session-a"]), "deleting: \(deleting)")
         }
     }
 
@@ -1043,7 +1045,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             let trackedFrom = try await store.trackedFromNs()
             XCTAssertEqual(trackedFrom, Self.trackedNs, "deleting: \(deleting)")
             let counted = try await sendRealisticExport(to: store)
-            XCTAssertEqual(counted, outcome(newSeries: 1, added: [.input: 10]), "deleting: \(deleting)")
+            XCTAssertEqual(counted, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]), "deleting: \(deleting)")
         }
     }
 
@@ -1129,10 +1131,10 @@ final class UsageStoreSeriesTests: XCTestCase {
             XCTAssertEqual(insideNew, outcome(ignored: true), "deleting: \(deleting)")
             let baseline = try await send([sample(timeNs: 30, value: 200)], starts: [oldProcess], to: store,
                                           at: setBackNs + Self.settleNs)
-            XCTAssertEqual(baseline, outcome(baselineOnly: 1), "deleting: \(deleting)")
+            XCTAssertEqual(baseline, outcome(baselineOnly: 1, changedSessions: ["session-a"]), "deleting: \(deleting)")
             let growth = try await send([sample(timeNs: 40, value: 206)], starts: [oldProcess], to: store,
                                         at: setBackNs + Self.settleNs + 5_000_000_000)
-            XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 6]), "deleting: \(deleting)")
+            XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 6], changedSessions: ["session-a"]), "deleting: \(deleting)")
             let rows = try await store.pointRows()
             XCTAssertEqual(rows.map(\.inputTokens), [6], "deleting: \(deleting)")
         }
@@ -1205,7 +1207,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(retiredOne, outcome(ignored: true))
         let other = try await send([sample(session: "s12", timeNs: 20, value: 7)], starts: [fresh(3, session: "s12")],
                                    to: store, at: 1_000)
-        XCTAssertEqual(other, outcome(newSeries: 1, added: [.input: 7]))
+        XCTAssertEqual(other, outcome(newSeries: 1, added: [.input: 7], changedSessions: ["s12"]))
     }
 
     // MARK: - An unchanged value writes nothing
@@ -1266,7 +1268,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let grow = try await store.apply(
             samples: movedLater(last.batch.samples, by: 3 * fiveSeconds) { $0 == growing ? 7 : 0 },
             processStarts: last.batch.processStarts, receivedAtNs: last.receivedAtNs + 3 * fiveSeconds)
-        XCTAssertEqual(grow, outcome(advancedSeries: 1, unchangedSamples: 7, added: [.output: 7]))
+        XCTAssertEqual(grow, outcome(advancedSeries: 1, unchangedSamples: 7, added: [.output: 7], changedSessions: ["11111111-1111-4111-8111-111111111111"]))
         let repeated = try await store.apply(
             samples: movedLater(last.batch.samples, by: 4 * fiveSeconds) { $0 == growing ? 7 : 0 },
             processStarts: last.batch.processStarts, receivedAtNs: last.receivedAtNs + 4 * fiveSeconds)
@@ -1321,7 +1323,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             [sample(startNs: base + 160 * second, timeNs: base + time * second, value: value)]
         }
         let first = try await send(export(10, time: 199), starts: [process], to: store, at: base + 200 * second)
-        XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 10]))
+        XCTAssertEqual(first, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]))
 
         clock.set(Date(timeIntervalSince1970: 1_791_183_300))
         try await store.deleteAll()
@@ -1333,9 +1335,9 @@ final class UsageStoreSeriesTests: XCTestCase {
         try await assertNothingStored(store, retired: 1)
 
         let baseline = try await send(export(50, time: 319), starts: [process], to: store, at: base + 320 * second)
-        XCTAssertEqual(baseline, outcome(baselineOnly: 1))
+        XCTAssertEqual(baseline, outcome(baselineOnly: 1, changedSessions: ["session-a"]))
         let growth = try await send(export(55, time: 329), starts: [process], to: store, at: base + 330 * second)
-        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 5]))
+        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 5], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows.map(\.inputTokens), [5])
     }
@@ -1352,7 +1354,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let series = try await store.seriesRows()
         XCTAssertEqual(series, [])
         let next = try await send([sample(timeNs: 30, value: 45)], starts: [process], to: store, at: 1_400_000_000_000)
-        XCTAssertEqual(next, outcome(baselineOnly: 1))
+        XCTAssertEqual(next, outcome(baselineOnly: 1, changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows.map(\.inputTokens), [10])
     }
@@ -1410,7 +1412,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let result = try await store.apply(
             samples: export.batch.samples, processStarts: export.batch.processStarts,
             receivedAtNs: 1_791_183_900_000_000_000)
-        XCTAssertEqual(result, outcome(baselineOnly: 4))
+        XCTAssertEqual(result, outcome(baselineOnly: 4, changedSessions: ["44444444-4444-4444-8444-444444444444"]))
         let points = try await store.pointRows()
         XCTAssertEqual(points, [])
         let rows = try await store.seriesRows()
@@ -1581,7 +1583,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             sample(series: 2, timeNs: 11, value: 11),
             sample(series: 3, timeNs: 11, kind: .output, value: 4),
         ], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 11, .output: 4]))
+        XCTAssertEqual(result, outcome(newSeries: 2, added: [.input: 11, .output: 4], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: Int64.max, output: 4)])
         let series = try await store.seriesRows()
@@ -1596,7 +1598,7 @@ final class UsageStoreSeriesTests: XCTestCase {
             sample(series: 3, timeNs: 11, value: 1),
             sample(series: 4, timeNs: 12, value: Int64.max),
         ], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 4, added: [.input: Int64.max, .output: 7]))
+        XCTAssertEqual(result, outcome(newSeries: 4, added: [.input: Int64.max, .output: 7], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: Int64.max, output: 7)])
     }
@@ -1701,7 +1703,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let trackedFrom = await trackedFromOrFail(store)
         XCTAssertEqual(trackedFrom, Int64.min)
         let result = try await sendRealisticExport(to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 10]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]))
     }
 
     private func assertNonFiniteClockIgnoresEverything(
@@ -1762,7 +1764,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         let trackedFrom = await trackedFromOrFail(store)
         XCTAssertEqual(trackedFrom, Int64.min)
         let result = try await sendRealisticExport(to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 10]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]))
     }
 
     func test_clock_ordinaryDates_truncateTowardZero() async throws {
@@ -1888,7 +1890,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(trackedFrom, Self.trackedNs)
 
         let result = try await send([sample(timeNs: 10, value: 12)], starts: [fresh(Self.trackedNs)], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 12]))
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 12], changedSessions: ["session-a"]))
         let rows = try await store.pointRows()
         XCTAssertEqual(rows, [row(input: 12)])
 
@@ -2021,5 +2023,285 @@ final class UsageStoreSeriesTests: XCTestCase {
         try assertNoSentinel("open")
         await store.close()
         try assertNoSentinel("closed")
+    }
+
+    // MARK: - changedSessions (R3b, section A)
+
+    // The sessions a call stored a new series for or added tokens to; the
+    // ledger settles exactly these after an export.
+
+    func test_changedSessions_newSeries_isItsSession() async throws {
+        let store = try openStore()
+        let result = try await send([sample(timeNs: 10, value: 10)], to: store)
+        XCTAssertEqual(result.changedSessions, ["session-a"])
+        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 10], changedSessions: ["session-a"]))
+    }
+
+    func test_changedSessions_increment_isItsSession() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let result = try await send([sample(timeNs: 20, value: 15)], to: store)
+        XCTAssertEqual(result, outcome(advancedSeries: 1, added: [.input: 5], changedSessions: ["session-a"]))
+    }
+
+    func test_changedSessions_staleSample_isEmpty() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 20, value: 10)], to: store)
+        let result = try await send([sample(timeNs: 20, value: 99)], to: store)
+        XCTAssertEqual(result, outcome(staleSamples: 1))
+        XCTAssertEqual(result.changedSessions, [])
+    }
+
+    func test_changedSessions_zeroIncrement_isEmpty() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let result = try await send([sample(timeNs: 20, value: 10)], to: store)
+        XCTAssertEqual(result, outcome(unchangedSamples: 1))
+        XCTAssertEqual(result.changedSessions, [])
+    }
+
+    func test_changedSessions_regression_isEmpty() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let result = try await send([sample(timeNs: 20, value: 4)], to: store)
+        XCTAssertEqual(result, outcome(regressions: 1))
+        XCTAssertEqual(result.changedSessions, [])
+    }
+
+    func test_changedSessions_ignoredCall_isEmpty() async throws {
+        let store = try openStore(at: Self.tracked)
+        let beforeTracking = try await send(
+            [sample(timeNs: 10, value: 9)], starts: [fresh(Self.trackedNs)], to: store, at: Self.trackedNs - 1)
+        let twoStarts = try await send(
+            [sample(timeNs: 10, value: 9)], starts: [fresh(Self.trackedNs), fresh(Self.trackedNs + 1)], to: store,
+            at: Self.trackedNs + 1)
+        let insideTheWindow = try await send(
+            [sample(timeNs: 10, value: 9)], starts: [oldProcess], to: store, at: Self.trackedNs + 1)
+        for (name, result) in [("before tracking", beforeTracking), ("two starts", twoStarts),
+                               ("inside the window", insideTheWindow)] {
+            XCTAssertTrue(result.ignored, "Fixture error: \(name)")
+            XCTAssertEqual(result.changedSessions, [], name)
+        }
+    }
+
+    // One call of a process that has several sessions: two sessions gain
+    // something, a third only has stale samples, a fourth only an
+    // unchanged one.
+    func test_changedSessions_severalSessionsInOneCall_areExactlyTheChangedOnes() async throws {
+        let store = try openStore()
+        try await send([
+            sample(series: 3, session: "session-c", timeNs: 50, value: 30),
+            sample(series: 4, session: "session-d", timeNs: 50, value: 40),
+        ], to: store)
+        let result = try await send([
+            sample(series: 1, session: "session-a", timeNs: 60, value: 10),
+            sample(series: 2, session: "session-b", timeNs: 60, kind: .output, value: 20),
+            sample(series: 3, session: "session-c", timeNs: 40, value: 99),
+            sample(series: 4, session: "session-d", timeNs: 60, value: 40),
+        ], to: store)
+        XCTAssertEqual(result, outcome(
+            newSeries: 2, unchangedSamples: 1, staleSamples: 1, added: [.input: 10, .output: 20],
+            changedSessions: ["session-a", "session-b"]))
+    }
+
+    func test_changedSessions_captureExports_nameTheCapturesSession() async throws {
+        let store = try openStore(at: Self.beforeCaptures)
+        let exports = try receivedExports(run: "run1")
+        let outcomes = try await apply(exports, to: store)
+        let changed = outcomes.filter { !$0.added.isEmpty }
+        XCTAssertFalse(changed.isEmpty, "Fixture error: run1 adds tokens")
+        for result in changed {
+            XCTAssertEqual(result.changedSessions, ["11111111-1111-4111-8111-111111111111"])
+        }
+        XCTAssertEqual(try element(outcomes, at: 0).changedSessions, [],
+                       "run1's first export carries only its process start")
+    }
+
+    // MARK: - The tracking flag (R3b, section A2)
+
+    func test_trackingFlag_newDatabase_isActive() async throws {
+        let store = try openStore()
+        let active = try await store.isTrackingActive()
+        XCTAssertTrue(active)
+    }
+
+    /// Bytes of the database and its WAL, after a write made the WAL exist.
+    private func storeFileBytes() throws -> (database: Data?, wal: Data?) {
+        (try fileBytes("usage.sqlite"), try fileBytes("usage.sqlite-wal"))
+    }
+
+    func test_trackingFlag_activeToActive_changesNothing_andWritesNothing() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let before = try storeFileBytes()
+        XCTAssertNotNil(before.wal, "Fixture error: the WAL must exist while the store is open")
+        let trackedBefore = try await store.trackedFromNs()
+
+        let restarted = try await store.setTrackingActive(true)
+
+        XCTAssertFalse(restarted)
+        let after = try storeFileBytes()
+        XCTAssertEqual(after.database, before.database, "active -> active must not write the database")
+        XCTAssertEqual(after.wal, before.wal, "active -> active must not write the WAL")
+        let active = try await store.isTrackingActive()
+        let trackedAfter = try await store.trackedFromNs()
+        let series = try await store.seriesRows()
+        XCTAssertTrue(active)
+        XCTAssertEqual(trackedAfter, trackedBefore)
+        XCTAssertEqual(series.count, 1)
+    }
+
+    func test_trackingFlag_pausedToPaused_changesNothing_andWritesNothing() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let paused = try await store.setTrackingActive(false)
+        XCTAssertFalse(paused, "active -> paused restarts nothing")
+        let before = try storeFileBytes()
+        XCTAssertNotNil(before.wal, "Fixture error: the WAL must exist while the store is open")
+
+        let again = try await store.setTrackingActive(false)
+
+        XCTAssertFalse(again)
+        let after = try storeFileBytes()
+        XCTAssertEqual(after.database, before.database, "paused -> paused must not write the database")
+        XCTAssertEqual(after.wal, before.wal, "paused -> paused must not write the WAL")
+        let active = try await store.isTrackingActive()
+        XCTAssertFalse(active)
+    }
+
+    func test_trackingFlag_pausing_keepsEverythingStored_andApplyIsUnchanged() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        let trackedBefore = try await store.trackedFromNs()
+        try await store.setTrackingActive(false)
+        let trackedAfter = try await store.trackedFromNs()
+        let starts = try await store.processStarts()
+        XCTAssertEqual(trackedAfter, trackedBefore, "pausing does not restart tracking")
+        XCTAssertEqual(starts, [Self.defaultProcess])
+        // `apply` does not look at the flag.
+        let growth = try await send([sample(timeNs: 20, value: 13)], to: store)
+        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 3], changedSessions: ["session-a"]))
+    }
+
+    // run1: exports 1-2 heard, tracking paused, then switched on again at
+    // …416 s. The switch restarts tracking, so run1's process (heard before
+    // the pause) is ignored inside the settling window and then only sets
+    // baselines: the usage it counted while tracking was off is never added.
+    func test_trackingFlag_pausedToActive_returnsTrue_andRestartsTracking() async throws {
+        let clock = UsageTestClock(Self.beforeCaptures)
+        let store = try openStore(clock: clock)
+        let exports = try receivedExports(run: "run1")
+        let raw = try rawExports(run: "run1")
+        try await apply(Array(exports.prefix(2)), to: store)
+        let rowsBefore = try await store.pointRows()
+        try await store.setTrackingActive(false)
+
+        clock.set(Self.afterRun1Export2)
+        let restarted = try await store.setTrackingActive(true)
+
+        XCTAssertTrue(restarted)
+        let active = try await store.isTrackingActive()
+        let trackedFrom = try await store.trackedFromNs()
+        let retired = try await store.retiredProcessCount()
+        let series = try await store.seriesRows()
+        let starts = try await store.processStarts()
+        let rowsAfterSwitch = try await store.pointRows()
+        XCTAssertTrue(active)
+        XCTAssertEqual(trackedFrom, Self.afterRun1Export2Ns)
+        XCTAssertEqual(retired, 1)
+        XCTAssertEqual(series, [])
+        XCTAssertEqual(starts, [])
+        XCTAssertEqual(rowsAfterSwitch, rowsBefore, "the switch keeps the points")
+
+        let outcomes = try await apply(Array(exports.dropFirst(2)), to: store)
+        XCTAssertEqual(outcomes.map(\.ignored), [true, true, true, false, false])
+        XCTAssertEqual(try element(outcomes, at: 3), outcome(baselineOnly: 8, changedSessions: ["11111111-1111-4111-8111-111111111111"]))
+        let actual = try await totals(of: store)
+        XCTAssertEqual(actual, try expectedIncrements(raw, kept: 1, baseline: 5))
+    }
+
+    func test_trackingFlag_survivesClosingAndReopening() async throws {
+        let clock = UsageTestClock(Self.tracked)
+        let first = try openStore(clock: clock)
+        try await first.setTrackingActive(false)
+        await first.close()
+
+        let second = try openStore(clock: clock)
+        let pausedAfterReopen = try await second.isTrackingActive()
+        XCTAssertFalse(pausedAfterReopen)
+        let restarted = try await second.setTrackingActive(true)
+        XCTAssertTrue(restarted, "a paused flag read back from disk still restarts tracking")
+        await second.close()
+
+        let third = try openStore(clock: clock)
+        let activeAfterReopen = try await third.isTrackingActive()
+        XCTAssertTrue(activeAfterReopen)
+    }
+
+    func test_trackingFlag_deleteAllWhileActive_staysActive() async throws {
+        let store = try openStore()
+        try await send([sample(timeNs: 10, value: 10)], to: store)
+        try await store.deleteAll()
+        let active = try await store.isTrackingActive()
+        XCTAssertTrue(active)
+        let restarted = try await store.setTrackingActive(true)
+        XCTAssertFalse(restarted)
+    }
+
+    // Tracking off (paused at 1_000 s), data deleted at 2_000 s, a process
+    // starts at 2_100 s (unheard: the ledger drops exports while off),
+    // tracking on at 3_000 s. The flag is still paused after the delete, so
+    // the switch restarts tracking at 3_000 s and the process predates it:
+    // its first export (after the settling window) adds nothing, its second
+    // only the growth. Had the delete marked tracking active, the process
+    // would not predate tracking (2_100 s > 2_000 s) and its first export
+    // would count in full.
+    func test_trackingFlag_deleteAllWhilePaused_staysPaused_andALaterProcessOnlyAddsItsGrowth() async throws {
+        let second: Int64 = 1_000_000_000
+        let clock = UsageTestClock(Date(timeIntervalSince1970: 1_000))
+        let store = try openStore(clock: clock)
+        try await store.setTrackingActive(false)
+
+        clock.set(Date(timeIntervalSince1970: 2_000))
+        try await store.deleteAll()
+        let pausedAfterDelete = try await store.isTrackingActive()
+        let trackedAfterDelete = try await store.trackedFromNs()
+        XCTAssertFalse(pausedAfterDelete, "deleteAll keeps the flag as it is")
+        XCTAssertEqual(trackedAfterDelete, 2_000 * second)
+
+        clock.set(Date(timeIntervalSince1970: 3_000))
+        let restarted = try await store.setTrackingActive(true)
+        XCTAssertTrue(restarted)
+        let trackedFrom = try await store.trackedFromNs()
+        XCTAssertEqual(trackedFrom, 3_000 * second)
+
+        let process = fresh(2_100 * second)
+        let first = try await send(
+            [sample(startNs: 2_100 * second, timeNs: 3_100 * second, value: 500)], starts: [process], to: store,
+            at: 3_100 * second)
+        XCTAssertEqual(first, outcome(baselineOnly: 1, changedSessions: ["session-a"]))
+        let growth = try await send(
+            [sample(startNs: 2_100 * second, timeNs: 3_105 * second, value: 700)], starts: [process], to: store,
+            at: 3_105 * second)
+        XCTAssertEqual(growth, outcome(advancedSeries: 1, added: [.input: 200], changedSessions: ["session-a"]))
+        let rows = try await store.pointRows()
+        XCTAssertEqual(rows.map(\.inputTokens), [200])
+    }
+
+    func test_trackingFlag_afterClose_throwsClosed() async throws {
+        let store = try openStore()
+        await store.close()
+        do {
+            _ = try await store.isTrackingActive()
+            XCTFail("isTrackingActive must throw after close")
+        } catch {
+            XCTAssertEqual(error as? UsageStoreError, .closed)
+        }
+        do {
+            try await store.setTrackingActive(false)
+            XCTFail("setTrackingActive must throw after close")
+        } catch {
+            XCTAssertEqual(error as? UsageStoreError, .closed)
+        }
     }
 }
