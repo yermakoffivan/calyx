@@ -17,7 +17,7 @@
 //  (resetTracking / deleteAll) never before anything already heard, even
 //  with a clock set back; saturating sums; the clock conversion; the
 //  per-series rows and process starts; label groups and row order; the
-//  version-1 to version-2 migration; and that no personal value of an
+//  fresh database and reopening; and that no personal value of an
 //  export ever reaches a file of the store.
 //
 //  Every database lives in a per-test temporary directory removed in
@@ -1359,14 +1359,13 @@ final class UsageStoreSeriesTests: XCTestCase {
         XCTAssertEqual(rows.map(\.inputTokens), [10])
     }
 
-    func test_deleteAll_alsoRemovesVersion1Records() async throws {
+    func test_deleteAll_alsoRemovesSessionRows() async throws {
         let store = try openStore()
         try await send([sample(timeNs: 10, value: 3)], to: store)
-        try await store.apply(UsageBatch(
-            records: [], session: UsageSessionMeta(sessionID: "s", transcriptPath: nil, projectRoot: nil), fileCheckpoint: nil))
+        try await store.setProjectRootIfUnset("/r/s", forSession: "s")
         try await store.deleteAll()
-        let sessions = try await store.sessions()
-        XCTAssertEqual(sessions, [])
+        let session = try await store.session("s")
+        XCTAssertNil(session)
         try await assertNothingStored(store, retired: 1)
     }
 
@@ -1781,44 +1780,7 @@ final class UsageStoreSeriesTests: XCTestCase {
         }
     }
 
-    // MARK: - Schema and migration
-
-    /// The version-1 schema exactly as the first release of the store
-    /// created it; frozen here so the migration is tested against the
-    /// real thing, not against whatever the current source says.
-    private static let version1Schema = """
-        CREATE TABLE usage_records (
-            key TEXT NOT NULL PRIMARY KEY CHECK (length(key) > 0),
-            session_id TEXT NOT NULL,
-            timestamp_ms INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            effort TEXT,
-            thread TEXT NOT NULL,
-            agent_id TEXT,
-            agent_type TEXT,
-            git_branch TEXT,
-            cwd TEXT,
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            thinking_tokens INTEGER NOT NULL,
-            cache_read_tokens INTEGER NOT NULL,
-            cache_creation_tokens INTEGER NOT NULL,
-            cache_creation_1h_tokens INTEGER NOT NULL,
-            is_final INTEGER NOT NULL CHECK (is_final IN (0, 1))
-        ) WITHOUT ROWID;
-        CREATE INDEX usage_records_session ON usage_records (session_id);
-        CREATE INDEX usage_records_timestamp ON usage_records (timestamp_ms);
-        CREATE TABLE usage_sessions (
-            session_id TEXT NOT NULL PRIMARY KEY,
-            transcript_path TEXT,
-            project_root TEXT
-        ) WITHOUT ROWID;
-        CREATE TABLE usage_files (
-            path TEXT NOT NULL PRIMARY KEY,
-            inode INTEGER NOT NULL,
-            offset INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        """
+    // MARK: - Schema
 
     /// Runs `sql` on a new connection to the database file, creating it.
     private func execute(_ sql: String, at url: URL) throws {
@@ -1852,64 +1814,8 @@ final class UsageStoreSeriesTests: XCTestCase {
             .filter { $0.hasPrefix("usage.sqlite.corrupt-") }
     }
 
-    private var version1Record: UsageRecord {
-        UsageRecord(
-            key: "msg_v1", sessionID: "session-v1", timestampMs: 1_790_935_200_000, model: "claude-opus-5-5",
-            effort: "high", thread: .subagent, agentID: "agent-1", agentType: "Explore", gitBranch: "main",
-            cwd: "/tmp/project", inputTokens: 3, outputTokens: 100, thinkingTokens: 10, cacheReadTokens: 9_000,
-            cacheCreationTokens: 120, cacheCreation1hTokens: 100, isFinal: true)
-    }
-
-    private static let version1Rows = """
-        INSERT INTO usage_records VALUES ('msg_v1', 'session-v1', 1790935200000, 'claude-opus-5-5', 'high', \
-        'subagent', 'agent-1', 'Explore', 'main', '/tmp/project', 3, 100, 10, 9000, 120, 100, 1);
-        INSERT INTO usage_sessions VALUES ('session-v1', '/t/v1.jsonl', '/r/v1');
-        INSERT INTO usage_files VALUES ('/t/v1.jsonl', 7, 99);
-        PRAGMA user_version = 1;
-        """
-
     private func tableCount(_ table: String, at url: URL) -> Int64? {
         integer("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '\(table)'", at: url)
-    }
-
-    func test_migration_version1Database_keepsItsRows_setsTrackedFromToTheClock_andAcceptsSamples() async throws {
-        let url = try databaseURL()
-        try execute(Self.version1Schema + Self.version1Rows, at: url)
-        XCTAssertEqual(integer("PRAGMA user_version", at: url), 1, "Fixture error")
-
-        let store = try openStore(at: Self.tracked)
-
-        XCTAssertEqual(try corruptSiblings(), [], "A version-1 database must be migrated, not moved aside")
-        let records = try await store.records(forSession: "session-v1")
-        XCTAssertEqual(records, [version1Record])
-        let session = try await store.session("session-v1")
-        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-v1", transcriptPath: "/t/v1.jsonl", projectRoot: "/r/v1"))
-        let checkpoint = try await store.checkpoint(forPath: "/t/v1.jsonl")
-        XCTAssertEqual(checkpoint, TranscriptCheckpoint(inode: 7, offset: 99))
-        let trackedFrom = try await store.trackedFromNs()
-        XCTAssertEqual(trackedFrom, Self.trackedNs)
-
-        let result = try await send([sample(timeNs: 10, value: 12)], starts: [fresh(Self.trackedNs)], to: store)
-        XCTAssertEqual(result, outcome(newSeries: 1, added: [.input: 12], changedSessions: ["session-a"]))
-        let rows = try await store.pointRows()
-        XCTAssertEqual(rows, [row(input: 12)])
-
-        await store.close()
-        XCTAssertEqual(integer("PRAGMA user_version", at: url), 2)
-        for table in ["usage_series", "usage_points", "usage_meta", "usage_process_starts"] {
-            XCTAssertEqual(tableCount(table, at: url), 1, table)
-        }
-        XCTAssertEqual(integer("SELECT count(*) FROM usage_records", at: url), 1)
-    }
-
-    func test_migration_version1Database_withDistantFutureClock_opens_andTracksFromInt64Max() async throws {
-        let url = try databaseURL()
-        try execute(Self.version1Schema + Self.version1Rows, at: url)
-        guard let store = openOrFail(UsageTestClock(Date.distantFuture)) else { return }
-        let records = try await store.records(forSession: "session-v1")
-        XCTAssertEqual(records, [version1Record])
-        let trackedFrom = await trackedFromOrFail(store)
-        XCTAssertEqual(trackedFrom, Int64.max)
     }
 
     func test_freshDatabase_isVersion2_withTheNewTables() async throws {

@@ -6,6 +6,12 @@
 
 import Foundation
 
+/// Maps a working directory to the repository root usage is attributed
+/// to; nil when the directory is not inside a repository.
+protocol ProjectRootResolving: Sendable {
+    func projectRoot(forCWD cwd: String) async throws -> String?
+}
+
 struct GitProjectRootResolver: ProjectRootResolving {
     /// The work tree containing `cwd`, or nil when `cwd` is outside any
     /// repository. Every other git failure is thrown. Same rule as

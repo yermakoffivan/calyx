@@ -3,9 +3,8 @@
 //  CalyxTests
 //
 //  Pins TranscriptTimestamp.epochMilliseconds(fromISO8601:), the parser
-//  moved out of ClaudeTranscriptParser, and that the v1 name forwards to
-//  it. Expected milliseconds were computed by hand (Python `datetime`,
-//  UTC).
+//  of transcript timestamps. Expected milliseconds were computed by hand
+//  (Python `datetime`, UTC).
 //
 
 import XCTest
@@ -38,13 +37,6 @@ final class TranscriptTimestampTests: XCTestCase {
     func test_rejected_inputs_areNil() {
         for text in rejected {
             XCTAssertNil(TranscriptTimestamp.epochMilliseconds(fromISO8601: text), text)
-        }
-    }
-
-    func test_v1Forwarder_agreesForEveryInput() {
-        for text in accepted.map(\.0) + rejected {
-            XCTAssertEqual(ClaudeTranscriptParser.epochMilliseconds(fromISO8601: text),
-                           TranscriptTimestamp.epochMilliseconds(fromISO8601: text), text)
         }
     }
 }

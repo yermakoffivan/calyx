@@ -24,7 +24,7 @@
 //    production does. Every such setup is checked against
 //    `unreportedRows()` and fails as "Fixture error" if it differs.
 //  - project roots: `setProjectRootIfUnset`; a session row with a NULL
-//    root through the version-1 `apply(UsageBatch)`.
+//    root with raw SQL (the store's API cannot make one).
 //
 //  Token amounts follow one pattern, `n` → input n, output 10n, cache read
 //  100n, cache creation 1000n, with n a distinct power of two per source
@@ -281,12 +281,22 @@ class UsageTokenGoldTestSupport: XCTestCase {
         try await store.setProjectRootIfUnset(root, forSession: session)
     }
 
-    /// A session row whose project root is NULL (version-1 session meta).
+    /// A session row whose project root is NULL. The store's API cannot
+    /// make one (`setProjectRootIfUnset` takes a root), so it is written
+    /// with raw SQL into the open store's database (WAL: the store sees
+    /// it on its next read). `session` must be a plain identifier.
     func addSessionWithoutRoot(_ store: UsageStore, session: String) async throws {
-        try await store.apply(UsageBatch(
-            records: [],
-            session: UsageSessionMeta(sessionID: session, transcriptPath: "/t/\(session).jsonl", projectRoot: nil),
-            fileCheckpoint: nil))
+        let path = try temporaryDirectory().appendingPathComponent("store", isDirectory: true)
+            .appendingPathComponent("usage.sqlite").path
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            throw UsageTelemetryFixtureError.unexpectedShape("Fixture error: cannot open the database")
+        }
+        let sql = "INSERT INTO usage_sessions (session_id, project_root) VALUES ('\(session)', NULL)"
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+            throw UsageTelemetryFixtureError.unexpectedShape("Fixture error: cannot insert the session row")
+        }
     }
 }
 

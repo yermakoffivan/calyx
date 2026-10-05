@@ -33,8 +33,8 @@ final class UsageWindowModel {
         /// its selection and scroll position across refreshes.
         let id: String
         /// Optional because the ledger's grouping key is `[String?]`; no
-        /// stored record has a nil model (`UsageRecord.model` is not
-        /// optional), but the key type allows it, and the view shows `—`
+        /// stored row has a nil model (`usage_points.model` and
+        /// `usage_unreported.model` are NOT NULL), but the key type allows it, and the view shows `—`
         /// rather than assuming it away.
         let model: String?
         /// nil: no effort was recorded (always nil for an unreported row).

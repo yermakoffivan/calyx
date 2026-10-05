@@ -1,45 +1,28 @@
 // UsageStore.swift
 // Calyx
 //
-// The Silver layer of the usage ledger: one row per API response
-// (UsageRecord), per-session metadata, and per-transcript-file read
-// checkpoints, in a SQLite database. Schema version 2 adds the telemetry
-// side: per-series baselines of Claude Code's cumulative token metric,
-// the per-minute token points their increments are added to, the process
-// starts, and the time tracking started from, and the run logs read from
-// Claude Code's own `cost-state` lines, and the unreported amounts the two
-// sources' comparison yields. SQLite rather than the JSON documents
-// used elsewhere because a batch -- records, session meta and the file
-// checkpoint -- must commit atomically on every agent turn, and the data
-// only grows. The store touches nothing outside its own directory; later
-// slices resolve transcript paths and project roots and pass them in.
+// The ledger's database: per-series baselines of Claude Code's cumulative
+// token metric, the per-minute token points their increments are added
+// to, the process starts, the time tracking started from, per-session
+// project roots, the run logs read from Claude Code's own `cost-state`
+// lines, and the unreported amounts the two sources' comparison yields,
+// in a SQLite database. SQLite rather than the JSON documents used
+// elsewhere because each export must commit atomically with the
+// baselines it moves, and the data only grows. The store touches nothing
+// outside its own directory; callers resolve paths and project roots and
+// pass them in.
 
 import CryptoKit
 import Foundation
 import SQLite3
 
-// MARK: - Batch
+// MARK: - Session
 
 struct UsageSessionMeta: Sendable, Equatable {
     let sessionID: String
-    let transcriptPath: String?
     /// The repository root the session is attributed to, resolved by the
     /// caller; nil while unknown.
     let projectRoot: String?
-}
-
-struct UsageFileCheckpoint: Sendable, Equatable {
-    let path: String
-    let checkpoint: TranscriptCheckpoint
-}
-
-/// What one read of one transcript file produced. Applied as a unit so
-/// the checkpoint can never run ahead of (or behind) the records it
-/// accounts for.
-struct UsageBatch: Sendable, Equatable {
-    var records: [UsageRecord]
-    var session: UsageSessionMeta?
-    var fileCheckpoint: UsageFileCheckpoint?
 }
 
 // MARK: - Errors
@@ -54,9 +37,10 @@ enum UsageStoreError: Error, Equatable {
     /// The database was written by a newer schema than this build knows.
     /// Raised while opening, where it makes the file be moved aside.
     case unsupportedSchemaVersion(Int64)
-    /// The database is at this build's schema version but lacks a table
-    /// or column the store's statements need. Raised while opening, where
-    /// it makes the file be moved aside.
+    /// The database's layout is not the one this build creates: a version
+    /// below this build's, a version-0 file that already holds tables, or
+    /// this version with other tables or columns. Raised while opening,
+    /// where it makes the file be moved aside.
     case incompatibleSchema
     /// `PRAGMA quick_check` reported damage (or anything but the single
     /// row "ok"). Raised while opening, where it makes the file be moved
@@ -105,8 +89,8 @@ actor UsageStore {
     /// Sendable, and the actor is what serializes access to it.
     private var connection: SQLiteConnection?
 
-    /// The store's clock: read when tracking starts (a new database, the
-    /// migration from version 1, `deleteAll`). Injected so tests can pin it.
+    /// The store's clock: read when tracking starts (a new database,
+    /// `deleteAll`, a restart). Injected so tests can pin it.
     private let now: @Sendable () -> Date
 
     /// Opens the database in `directory`, creating both as needed.
@@ -117,17 +101,16 @@ actor UsageStore {
     ///   opens it: SQLite gives `-wal` / `-shm` the main file's mode, so
     ///   this is what keeps those owner-only too.
     /// - A file that is not a SQLite database, is reported corrupt, has a
-    ///   newer schema version, claims this version without having the
-    ///   store's tables and columns, fails `PRAGMA quick_check`, or is a
-    ///   symbolic link (never followed) is moved aside to
+    ///   newer schema version, does not have exactly the layout this build
+    ///   creates (see `createAndValidate`), fails `PRAGMA quick_check`, or
+    ///   is a symbolic link (never followed) is moved aside to
     ///   `usage.sqlite.corrupt-<suffix>` and a fresh database is created.
-    ///   The version-1 tables can be rebuilt from the transcripts; the
-    ///   telemetry tables (series, points, process starts) cannot: their
-    ///   source is exports Claude Code sends once, so what a moved-aside
-    ///   file held is lost from the ledger (it stays in the moved file).
-    ///   Refusing to start would still be worse than starting empty.
-    /// - A version-1 database is migrated in place; it and a new database
-    ///   get `tracked_from_ns` = `now()` at that moment.
+    ///   The telemetry tables (series, points, process starts) cannot be
+    ///   rebuilt: their source is exports Claude Code sends once, so what
+    ///   a moved-aside file held is lost from the ledger (it stays in the
+    ///   moved file). Refusing to start would still be worse than
+    ///   starting empty.
+    /// - A new database gets `tracked_from_ns` = `now()` at that moment.
     init(directory: URL, now: @escaping @Sendable () -> Date) throws {
         self.now = now
         connection = try Self.openDatabase(in: directory, now: now)
@@ -138,128 +121,15 @@ actor UsageStore {
         try self.init(directory: directory, now: { Date() })
     }
 
-    /// Applies one batch in ONE transaction; any failure rolls back all of
-    /// it and is rethrown. An entirely empty batch is a no-op.
-    ///
-    /// - Records: for each key the stored record (if any) and the incoming
-    ///   ones are folded with `UsageRecord.winner`, which is the single
-    ///   definition of the ordering -- deliberately not re-encoded in SQL.
-    ///   A record with an empty key is rejected by a CHECK constraint.
-    /// - Session meta: a non-nil `transcriptPath` replaces the stored one
-    ///   and nil leaves it; `projectRoot` is only set while the stored
-    ///   value is nil (the first non-nil root wins).
-    /// - File checkpoint: the last one applied for a path is kept as is.
-    func apply(_ batch: UsageBatch) throws {
-        let connection = try openConnection()
-        guard !batch.records.isEmpty || batch.session != nil || batch.fileCheckpoint != nil else { return }
-
-        // Fold repeated keys first, keeping first-seen order, so each key
-        // costs one read and at most one write.
-        var keys: [String] = []
-        var folded: [String: UsageRecord] = [:]
-        for record in batch.records {
-            if let seen = folded[record.key] {
-                folded[record.key] = UsageRecord.winner(seen, record)
-            } else {
-                keys.append(record.key)
-                folded[record.key] = record
-            }
-        }
-
-        try connection.transaction {
-            for key in keys {
-                guard let incoming = folded[key] else { continue }
-                let existing = try Self.record(forKey: key, connection: connection)
-                let winner = existing.map { UsageRecord.winner($0, incoming) } ?? incoming
-                if winner != existing {
-                    try Self.write(winner, connection: connection)
-                }
-            }
-            if let session = batch.session {
-                try connection.withStatement(Self.upsertSessionSQL) { statement in
-                    try statement.bind(session.sessionID, at: 1)
-                    try statement.bind(session.transcriptPath, at: 2)
-                    try statement.bind(session.projectRoot, at: 3)
-                    _ = try statement.step()
-                }
-            }
-            if let file = batch.fileCheckpoint {
-                try connection.withStatement(Self.upsertFileSQL) { statement in
-                    try statement.bind(file.path, at: 1)
-                    try statement.bind(Int64(bitPattern: file.checkpoint.inode), at: 2)
-                    try statement.bind(Int64(bitPattern: file.checkpoint.offset), at: 3)
-                    _ = try statement.step()
-                }
-            }
-        }
-    }
-
-    /// The stored records of one session, ordered by key ascending.
-    func records(forSession sessionID: String) throws -> [UsageRecord] {
-        let connection = try openConnection()
-        return try connection.withStatement(Self.selectSessionRecordsSQL) { statement in
-            try statement.bind(sessionID, at: 1)
-            var records: [UsageRecord] = []
-            while try statement.step() {
-                records.append(try Self.decodeRecord(statement))
-            }
-            return records
-        }
-    }
-
-    /// Every session that a batch carried metadata for, ordered by id.
-    func sessions() throws -> [UsageSessionMeta] {
-        let connection = try openConnection()
-        return try connection.withStatement(Self.selectSessionsSQL) { statement in
-            var sessions: [UsageSessionMeta] = []
-            while try statement.step() {
-                guard let sessionID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
-                sessions.append(UsageSessionMeta(
-                    sessionID: sessionID, transcriptPath: statement.text(at: 1), projectRoot: statement.text(at: 2)))
-            }
-            return sessions
-        }
-    }
-
-    /// The stored metadata of one session; nil if no batch carried any.
+    /// The stored metadata of one session; nil if none was stored.
     func session(_ sessionID: String) throws -> UsageSessionMeta? {
         let connection = try openConnection()
         return try connection.withStatement(Self.selectSessionSQL) { statement in
             try statement.bind(sessionID, at: 1)
             guard try statement.step() else { return nil }
             guard let storedID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
-            return UsageSessionMeta(
-                sessionID: storedID, transcriptPath: statement.text(at: 1), projectRoot: statement.text(at: 2))
+            return UsageSessionMeta(sessionID: storedID, projectRoot: statement.text(at: 1))
         }
-    }
-
-    /// Where the last applied read of `path` stopped; nil if never read.
-    func checkpoint(forPath path: String) throws -> TranscriptCheckpoint? {
-        let connection = try openConnection()
-        return try connection.withStatement(Self.selectFileSQL) { statement in
-            try statement.bind(path, at: 1)
-            guard try statement.step() else { return nil }
-            return TranscriptCheckpoint(
-                inode: UInt64(bitPattern: statement.int64(at: 0)),
-                offset: UInt64(bitPattern: statement.int64(at: 1)))
-        }
-    }
-
-    /// The Gold query: see `UsageGold.rows`. Of `calendar` only the time
-    /// zone is used (`UsagePeriod.localDayCalendar`).
-    func report(_ query: UsageQuery, calendar: Calendar) throws -> [UsageRow] {
-        let connection = try openConnection()
-        return try UsageGold.rows(for: query, calendar: calendar, connection: connection)
-    }
-
-    /// Several Gold queries answered in one actor call, one result per
-    /// query in order. Nothing here suspends, so no batch can be applied
-    /// between two of the answers: they all describe the same stored
-    /// state. Any query that throws fails the whole call. Of `calendar`
-    /// only the time zone is used (`UsagePeriod.localDayCalendar`).
-    func reports(_ queries: [UsageQuery], calendar: Calendar) throws -> [[UsageRow]] {
-        let connection = try openConnection()
-        return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
     /// The token Gold query: see `UsageTokenGold.rows`. Of `calendar`
@@ -278,20 +148,19 @@ actor UsageStore {
         return try queries.map { try UsageTokenGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
-    /// Removes every record, session, checkpoint, point, series baseline,
-    /// run log (with its runs and totals) and unreported row in one transaction and restarts tracking at the store's
-    /// clock (see `restartTracking`). The processes heard so far are
-    /// retired, so their later exports only set baselines and deleted
-    /// usage never comes back; only their digests remain. The store stays
-    /// open and usable.
+    /// Removes every session, point, series baseline, run log (with its
+    /// runs and totals) and unreported row in one transaction and restarts
+    /// tracking at the store's clock (see `restartTracking`). The
+    /// processes heard so far are retired, so their later exports only set
+    /// baselines and deleted usage never comes back; only their digests
+    /// remain. The store stays open and usable.
     func deleteAll() throws {
         let connection = try openConnection()
         let trackedFrom = UsageClock.nanoseconds(now())
         try connection.transaction {
             try connection.execute("""
-                DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files; \
-                DELETE FROM usage_points; DELETE FROM usage_run_logs; DELETE FROM usage_runs; \
-                DELETE FROM usage_run_totals; DELETE FROM usage_unreported;
+                DELETE FROM usage_sessions; DELETE FROM usage_points; DELETE FROM usage_run_logs; \
+                DELETE FROM usage_runs; DELETE FROM usage_run_totals; DELETE FROM usage_unreported;
                 """)
             try Self.restartTracking(at: trackedFrom, connection: connection)
         }
@@ -311,51 +180,10 @@ actor UsageStore {
     }
 
     // MARK: - Schema
-
-    /// Version 1. `key` is the primary key because one API response is one
-    /// row whatever file it was read from. The indexes serve the two ways
-    /// rows are selected: by session (`records(forSession:)`, the session
-    /// filter) and by time range (report filters, day intervals).
-    /// `inode` / `offset` hold a UInt64's bit pattern, since SQLite
-    /// integers are signed 64-bit.
-    private static let schemaV1 = """
-        CREATE TABLE usage_records (
-            key TEXT NOT NULL PRIMARY KEY CHECK (length(key) > 0),
-            session_id TEXT NOT NULL,
-            timestamp_ms INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            effort TEXT,
-            thread TEXT NOT NULL,
-            agent_id TEXT,
-            agent_type TEXT,
-            git_branch TEXT,
-            cwd TEXT,
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            thinking_tokens INTEGER NOT NULL,
-            cache_read_tokens INTEGER NOT NULL,
-            cache_creation_tokens INTEGER NOT NULL,
-            cache_creation_1h_tokens INTEGER NOT NULL,
-            is_final INTEGER NOT NULL CHECK (is_final IN (0, 1))
-        ) WITHOUT ROWID;
-        CREATE INDEX usage_records_session ON usage_records (session_id);
-        CREATE INDEX usage_records_timestamp ON usage_records (timestamp_ms);
-        CREATE TABLE usage_sessions (
-            session_id TEXT NOT NULL PRIMARY KEY,
-            transcript_path TEXT,
-            project_root TEXT
-        ) WITHOUT ROWID;
-        CREATE TABLE usage_files (
-            path TEXT NOT NULL PRIMARY KEY,
-            inode INTEGER NOT NULL,
-            offset INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        """
-
-    /// Version 2 adds these to version 1's tables, unchanged. A new
-    /// database runs the version-1 and then this step, so the tables have
-    /// a single definition whether created fresh or by migration.
+    /// Schema version 2, the only layout this build reads and writes.
     ///
+    /// - `usage_sessions`: the project root each session is attributed to
+    ///   (`setProjectRootIfUnset`; the first stored root wins).
     /// - `usage_series`: one baseline per `(session_id, series_id, start_ns)`:
     ///   `last_value` / `last_time_ns` are the sender's values, used only
     ///   to order the series' samples; `kind` and `model` are those of
@@ -379,9 +207,7 @@ actor UsageStore {
     /// - `usage_run_logs`: one row per session whose main transcript was
     ///   read for its `cost-state` lines: the transcript path, where
     ///   reading stopped (`inode` / `offset`, a UInt64's bit pattern), the
-    ///   open run and the first cwd. Its own checkpoint, not `usage_files`:
-    ///   the version-1 reader reads the same file for something else, and
-    ///   neither may move the other's position.
+    ///   open run and the first cwd.
     /// - `usage_runs`: the closed runs of a session, by `sequence`.
     /// - `usage_run_totals`: each closed run's totals per model.
     /// - `usage_unreported`: per session, run and model, the tokens Claude
@@ -391,8 +217,13 @@ actor UsageStore {
     /// - `usage_points_minute` / `usage_unreported_time`: the time-range
     ///   indexes of the token Gold query. A version-2 file created before
     ///   they existed lacks them; that is only slower, never incompatible,
-    ///   so no fixed statement depends on them.
-    private static let schemaV2Additions = """
+    ///   so no fixed statement depends on them and the open-time layout
+    ///   check compares tables and columns only.
+    private static let schema = """
+        CREATE TABLE usage_sessions (
+            session_id TEXT NOT NULL PRIMARY KEY,
+            project_root TEXT
+        ) WITHOUT ROWID;
         CREATE TABLE usage_series (
             session_id TEXT NOT NULL,
             series_id TEXT NOT NULL,
@@ -472,33 +303,11 @@ actor UsageStore {
         CREATE INDEX usage_unreported_time ON usage_unreported (time_ns);
         """
 
-    /// Brings a database at `version` up to `schemaVersion`, one step per
-    /// version, all in one transaction with the version bump, so a crash
-    /// cannot leave a half-migrated file that claims either version.
-    private static func migrate(
-        _ connection: SQLiteConnection, from version: Int64, now: @Sendable () -> Date
-    ) throws {
-        guard version < schemaVersion else { return }
-        try connection.transaction {
-            if version < 1 {
-                try connection.execute(schemaV1)
-            }
-            if version < 2 {
-                try connection.execute(schemaV2Additions)
-                // Tracking starts now: whatever running processes counted
-                // before this moment only sets their baselines.
-                try setTrackedFrom(UsageClock.nanoseconds(now()), connection: connection)
-            }
-            try connection.execute("PRAGMA user_version = \(schemaVersion)")
-        }
-    }
-
     /// Every fixed statement the store runs. Together they name every
-    /// table and every column the store (and the Gold queries, which read
+    /// table and every column the store (and the Gold query, which reads
     /// the same columns) depends on.
     private static let fixedStatements = [
-        selectRecordSQL, selectSessionRecordsSQL, writeRecordSQL,
-        upsertSessionSQL, selectSessionsSQL, selectSessionSQL, upsertFileSQL, selectFileSQL,
+        upsertSessionSQL, selectSessionSQL,
         selectSeriesSQL, insertSeriesSQL, updateSeriesSQL, selectPointSQL, insertPointSQL, updatePointSQL,
         insertProcessStartSQL, selectProcessStartSQL, selectRetiredSQL, insertRetiredSQL, countRetiredSQL, selectTrackedFromSQL, upsertTrackedFromSQL,
         selectPointRowsSQL, selectSeriesRowsSQL, selectProcessStartsSQL,
@@ -508,23 +317,107 @@ actor UsageStore {
         selectSessionUnreportedSQL, deleteSessionUnreportedSQL, insertUnreportedSQL, selectUnreportedRowsSQL,
     ]
 
-    /// Migrates, then proves the result is the schema this build uses by
-    /// PREPARING every fixed statement: SQLite resolves each table and
-    /// column name at prepare time, so a missing table or a missing column
-    /// fails here, at open, instead of on the first `apply` of every
-    /// launch with no way to heal. (It also leaves the statements cached
-    /// for use.) Checking table names alone would miss a missing column.
+    /// A database's layout: each table's column names in column order,
+    /// by table name. SQLite's own tables (`sqlite_*`, e.g. the
+    /// `sqlite_stat1` an ANALYZE adds) are not part of it, nor are
+    /// indexes, views and triggers. The table name is bound, never
+    /// spliced into SQL, since a foreign file may name tables anything.
+    private static func layout(of connection: SQLiteConnection) throws -> [String: [String]] {
+        let tables = try connection.withTransientStatement(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name"
+        ) { statement in
+            var names: [String] = []
+            while try statement.step() {
+                guard let name = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+                names.append(name)
+            }
+            return names
+        }
+        var layout: [String: [String]] = [:]
+        for table in tables {
+            layout[table] = try connection.withTransientStatement(
+                "SELECT name FROM pragma_table_info(?1) ORDER BY cid"
+            ) { statement in
+                try statement.bind(table, at: 1)
+                var columns: [String] = []
+                while try statement.step() {
+                    guard let column = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+                    columns.append(column)
+                }
+                return columns
+            }
+        }
+        return layout
+    }
+
+    /// The layout `schema` produces, read back with `layout(of:)` from a
+    /// private in-memory database: both sides of the open-time comparison
+    /// come from the same statements and the same reader, so a file this
+    /// build created always compares equal.
+    private static func finalLayout() throws -> [String: [String]] {
+        let scratch = try SQLiteConnection(path: ":memory:")
+        defer { scratch.close() }
+        try scratch.execute(schema)
+        return try layout(of: scratch)
+    }
+
+    /// Creates the schema in a new database, or accepts an existing one
+    /// only if it is exactly this build's layout, then proves the result
+    /// by PREPARING every fixed statement (which also caches them).
     ///
-    /// SQLITE_ERROR is SQLite's code for exactly that kind of failure --
-    /// "no such table", "no such column", and, in the migration, "table
-    /// already exists" for a file holding a clashing table -- so only it
-    /// becomes `incompatibleSchema`. An I/O or lock error has its own code
-    /// and propagates untouched; it must never cost a healthy database.
-    private static func migrateAndValidate(
-        _ connection: SQLiteConnection, from version: Int64, now: @Sendable () -> Date
+    /// - Version 0 holding no table (a new or zero-byte file): `schema`,
+    ///   `tracked_from_ns` = `now()` and the version are written in one
+    ///   transaction, so a crash cannot leave a half-created file that
+    ///   claims the version. Tracking starts now: whatever running
+    ///   processes counted before this moment only sets their baselines.
+    /// - Version 2: accepted only if `layout(of:)` equals `finalLayout()`
+    ///   (same table names; per table the same column names in the same
+    ///   order). Missing indexes are no reason to reject (they only slow
+    ///   the Gold query).
+    /// - Anything else -- a version-0 file that holds a table, or any
+    ///   other version below 2 -- is `incompatibleSchema`.
+    ///
+    /// Reading the reference layout (`finalLayout()`, in memory) maps no
+    /// error: its failure is a programming error and propagates, so it
+    /// never moves the user's file aside. Reading the opened file's layout
+    /// maps exactly SQLITE_ERROR (primary code) to `incompatibleSchema`;
+    /// every other code (I/O, busy, locked, ...) propagates untouched.
+    ///
+    /// SQLITE_ERROR from creating or preparing ("no such table", "no such
+    /// column") becomes `incompatibleSchema`. An I/O or lock error has its
+    /// own code and propagates untouched; it must never cost a healthy
+    /// database.
+    private static func createAndValidate(
+        _ connection: SQLiteConnection, version: Int64, now: @Sendable () -> Date
     ) throws {
+        let expected = try finalLayout()
+        let actual: [String: [String]]
         do {
-            try migrate(connection, from: version, now: now)
+            actual = try layout(of: connection)
+        } catch let error as SQLiteError where error.primaryCode == SQLITE_ERROR {
+            // SQLITE_ERROR here means the file's schema cannot even be
+            // described, e.g. a virtual table of a module this build does
+            // not register ("no such module" from `pragma_table_info`): a
+            // file this build did not write, so it is incompatible like
+            // any other foreign shape and is moved aside.
+            throw UsageStoreError.incompatibleSchema
+        }
+        switch version {
+        case 0 where actual.isEmpty:
+            break
+        case schemaVersion where actual == expected:
+            break
+        default:
+            throw UsageStoreError.incompatibleSchema
+        }
+        do {
+            if version == 0 {
+                try connection.transaction {
+                    try connection.execute(schema)
+                    try setTrackedFrom(UsageClock.nanoseconds(now()), connection: connection)
+                    try connection.execute("PRAGMA user_version = \(schemaVersion)")
+                }
+            }
             for sql in fixedStatements {
                 try connection.withStatement(sql) { _ in }
             }
@@ -538,16 +431,15 @@ actor UsageStore {
     /// open as healthy and then fail EVERY `apply`, read and report with
     /// "database disk image is malformed", on every turn and every launch,
     /// with nothing to heal it. `PRAGMA quick_check` walks every page once
-    /// at open instead: one scan per launch (about 10 MB at the measured
-    /// transcript volume), cheap next to never recovering. `quick_check`
+    /// at open instead: one scan per launch, cheap next to never
+    /// recovering. `quick_check`
     /// rather than `integrity_check` because the latter's extra work
     /// (index-against-table comparison) costs more for little gain here.
     ///
-    /// A file that fails is moved aside. That loses its telemetry points
-    /// for good (the version-1 tables can be rebuilt from the transcripts;
-    /// the points, series and process starts cannot), but it is still the
-    /// rule: a database that fails its integrity check cannot be trusted
-    /// to answer at all.
+    /// A file that fails is moved aside. That loses its telemetry points,
+    /// series and process starts for good, but it is still the rule: a
+    /// database that fails its integrity check cannot be trusted to answer
+    /// at all.
     ///
     /// Damage is REPORTED as result rows, so anything but the single row
     /// "ok" is `integrityCheckFailed`. A SQLITE_CORRUPT thrown by the
@@ -593,11 +485,11 @@ actor UsageStore {
         }
         try ensureOwnerOnlyFile(atPath: path)
         do {
-            return try openAndMigrate(path: path, now: now)
+            return try openAndCheck(path: path, now: now)
         } catch where isUnusableDatabase(error) {
             try moveAside(path)
             try ensureOwnerOnlyFile(atPath: path)
-            return try openAndMigrate(path: path, now: now)
+            return try openAndCheck(path: path, now: now)
         }
     }
 
@@ -646,10 +538,10 @@ actor UsageStore {
     /// Reads the schema version FIRST: that is the first read of the file,
     /// so it is where a non-database fails (SQLITE_NOTADB), and a too-new
     /// database must be recognized before anything writes to it. The
-    /// schema is then migrated and validated, the content is checked, and
+    /// schema is then created or checked, the content is checked, and
     /// only a database that passed is switched to WAL, so a file about to
     /// be moved aside is not rewritten first.
-    private static func openAndMigrate(path: String, now: @Sendable () -> Date) throws -> SQLiteConnection {
+    private static func openAndCheck(path: String, now: @Sendable () -> Date) throws -> SQLiteConnection {
         let connection = try SQLiteConnection(path: path)
         do {
             let version = try connection.withTransientStatement("PRAGMA user_version") { statement in
@@ -660,13 +552,12 @@ actor UsageStore {
                 throw UsageStoreError.unsupportedSchemaVersion(version)
             }
             try connection.disablePersistentWAL()
-            try migrateAndValidate(connection, from: version, now: now)
+            try createAndValidate(connection, version: version, now: now)
             try checkIntegrity(connection)
-            // WAL: readers (reports) do not block the per-turn writer.
+            // WAL: readers (reports) do not block the per-export writer.
             // NORMAL: in WAL mode a power loss can lose the last commits
-            // but not corrupt the file. Lost version-1 rows are re-read
-            // from the transcripts. For the telemetry tables, `apply`
-            // moves a series' baseline (`last_value`) in the same
+            // but not corrupt the file. `apply` moves a series' baseline
+            // (`last_value`) in the same
             // transaction as the points it adds to, so both roll back
             // together: the next accepted export of a still-running
             // process adds the lost increment again, in the minute it is
@@ -706,111 +597,15 @@ actor UsageStore {
 
     // MARK: - Statements
 
-    private static let recordColumns = """
-        key, session_id, timestamp_ms, model, effort, thread, agent_id, agent_type, git_branch, cwd, \
-        input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_creation_tokens, \
-        cache_creation_1h_tokens, is_final
-        """
-
-    private static let selectRecordSQL = "SELECT \(recordColumns) FROM usage_records WHERE key = ?1"
-
-    private static let selectSessionRecordsSQL =
-        "SELECT \(recordColumns) FROM usage_records WHERE session_id = ?1 ORDER BY key"
-
-    /// REPLACE resolves only the primary-key conflict; the CHECK on `key`
-    /// still aborts the statement.
-    private static let writeRecordSQL = """
-        INSERT OR REPLACE INTO usage_records (\(recordColumns)) \
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-        """
-
     private static let upsertSessionSQL = """
-        INSERT INTO usage_sessions (session_id, transcript_path, project_root) VALUES (?1, ?2, ?3) \
+        INSERT INTO usage_sessions (session_id, project_root) VALUES (?1, ?2) \
         ON CONFLICT (session_id) DO UPDATE SET \
-        transcript_path = COALESCE(excluded.transcript_path, transcript_path), \
         project_root = COALESCE(project_root, excluded.project_root)
         """
 
-    private static let selectSessionsSQL =
-        "SELECT session_id, transcript_path, project_root FROM usage_sessions ORDER BY session_id"
-
     private static let selectSessionSQL =
-        "SELECT session_id, transcript_path, project_root FROM usage_sessions WHERE session_id = ?1"
-
-    private static let upsertFileSQL = """
-        INSERT INTO usage_files (path, inode, offset) VALUES (?1, ?2, ?3) \
-        ON CONFLICT (path) DO UPDATE SET inode = excluded.inode, offset = excluded.offset
-        """
-
-    private static let selectFileSQL = "SELECT inode, offset FROM usage_files WHERE path = ?1"
-
-    private static func record(forKey key: String, connection: SQLiteConnection) throws -> UsageRecord? {
-        try connection.withStatement(selectRecordSQL) { statement in
-            try statement.bind(key, at: 1)
-            guard try statement.step() else { return nil }
-            return try decodeRecord(statement)
-        }
-    }
-
-    private static func write(_ record: UsageRecord, connection: SQLiteConnection) throws {
-        try connection.withStatement(writeRecordSQL) { statement in
-            try statement.bind(record.key, at: 1)
-            try statement.bind(record.sessionID, at: 2)
-            try statement.bind(record.timestampMs, at: 3)
-            try statement.bind(record.model, at: 4)
-            try statement.bind(record.effort, at: 5)
-            try statement.bind(record.thread.rawValue, at: 6)
-            try statement.bind(record.agentID, at: 7)
-            try statement.bind(record.agentType, at: 8)
-            try statement.bind(record.gitBranch, at: 9)
-            try statement.bind(record.cwd, at: 10)
-            try statement.bind(record.inputTokens, at: 11)
-            try statement.bind(record.outputTokens, at: 12)
-            try statement.bind(record.thinkingTokens, at: 13)
-            try statement.bind(record.cacheReadTokens, at: 14)
-            try statement.bind(record.cacheCreationTokens, at: 15)
-            try statement.bind(record.cacheCreation1hTokens, at: 16)
-            try statement.bind(record.isFinal ? 1 : 0, at: 17)
-            _ = try statement.step()
-        }
-    }
-
-    /// Decodes a row selected with `recordColumns`.
-    private static func decodeRecord(_ statement: SQLiteStatement) throws -> UsageRecord {
-        guard let key = statement.text(at: 0),
-              let sessionID = statement.text(at: 1),
-              let model = statement.text(at: 3),
-              let threadRaw = statement.text(at: 5),
-              let thread = UsageRecord.Thread(rawValue: threadRaw) else {
-            throw UsageStoreError.malformedRow
-        }
-        return UsageRecord(
-            key: key,
-            sessionID: sessionID,
-            timestampMs: statement.int64(at: 2),
-            model: model,
-            effort: statement.text(at: 4),
-            thread: thread,
-            agentID: statement.text(at: 6),
-            agentType: statement.text(at: 7),
-            gitBranch: statement.text(at: 8),
-            cwd: statement.text(at: 9),
-            inputTokens: statement.int64(at: 10),
-            outputTokens: statement.int64(at: 11),
-            thinkingTokens: statement.int64(at: 12),
-            cacheReadTokens: statement.int64(at: 13),
-            cacheCreationTokens: statement.int64(at: 14),
-            cacheCreation1hTokens: statement.int64(at: 15),
-            isFinal: statement.int64(at: 16) != 0
-        )
-    }
+        "SELECT session_id, project_root FROM usage_sessions WHERE session_id = ?1"
 }
-
-// MARK: - UsageBatchStoring
-
-/// The actor's synchronous methods satisfy the protocol's `async`
-/// requirements as they are; the ingestor reaches the store through this.
-extension UsageStore: UsageBatchStoring {}
 
 // MARK: - Token series (schema version 2)
 
@@ -1546,14 +1341,12 @@ extension UsageStore {
 
     /// Sets the session's project root unless one is already stored (the
     /// first stored root wins), creating the session row when there is
-    /// none. The same statement a version-1 batch uses, with no transcript
-    /// path, so a stored path is kept and the rule has one definition.
+    /// none.
     func setProjectRootIfUnset(_ root: String, forSession sessionID: String) throws {
         let connection = try openConnection()
         try connection.withStatement(Self.upsertSessionSQL) { statement in
             try statement.bind(sessionID, at: 1)
-            try statement.bind(nil, at: 2)
-            try statement.bind(root, at: 3)
+            try statement.bind(root, at: 2)
             _ = try statement.step()
         }
     }

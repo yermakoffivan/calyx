@@ -2,11 +2,11 @@
 //  TranscriptLabelTests.swift
 //  CalyxTests
 //
-//  Pins TranscriptLabel, the label rule moved out of
-//  ClaudeTranscriptParser: `label(_:maxScalars:)` (edge whitespace
-//  trimmed; an escaped-category scalar, an empty or over-long value or a
-//  non-string rejected), `isCWD` / `isIdentifier` (verbatim only), the
-//  limits, and that the v1 forwarders agree.
+//  Pins TranscriptLabel, the label rule for values read from Claude
+//  Code's transcripts: `label(_:maxScalars:)` (edge whitespace trimmed;
+//  an escaped-category scalar, an empty or over-long value or a
+//  non-string rejected), `isCWD` / `isIdentifier` (verbatim only), and
+//  the limits.
 //
 
 import XCTest
@@ -73,14 +73,5 @@ final class TranscriptLabelTests: XCTestCase {
         XCTAssertFalse(TranscriptLabel.isIdentifier(" abc"))
         XCTAssertFalse(TranscriptLabel.isIdentifier("abc\u{0}"))
         XCTAssertFalse(TranscriptLabel.isIdentifier(""))
-    }
-
-    func test_v1Forwarders_agree() {
-        let inputs = ["/fixture/project", " /x", "/a\u{7}b", "", String(repeating: "a", count: 128),
-                      String(repeating: "a", count: 129), "/" + String(repeating: "a", count: 1_024), "abc\u{202E}"]
-        for input in inputs {
-            XCTAssertEqual(ClaudeTranscriptParser.isCWDLabel(input), TranscriptLabel.isCWD(input), input)
-            XCTAssertEqual(ClaudeTranscriptParser.isIdentifierLabel(input), TranscriptLabel.isIdentifier(input), input)
-        }
     }
 }

@@ -1534,6 +1534,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// Every `.calyxIPCStateDidChange` requests another reconcile; that
     /// observer lives as long as this delegate (or until the next call)
     /// and holds `activation` weakly.
+    ///
+    /// Token counts reach the ledger only through Claude Code's telemetry export; agent hooks do not feed it.
     @discardableResult
     func startUsageLedger(
         server: CalyxMCPServer,

@@ -8,8 +8,8 @@
 //  `setProjectRootIfUnset(_:forSession:)`, what `deleteAll()` and
 //  `resetTracking()` do to run logs, and the schema: version 2 gains the
 //  run-log tables in place, so a version-2 file written by the previous
-//  slice (frozen here) is moved aside, a version-1 file migrates in one
-//  step, and a version-3 file is moved aside.
+//  slice (frozen here) is moved aside, and a version-3 file is moved
+//  aside. The other earlier layouts are pinned in UsageStoreTests.
 //
 //  Every database lives in a per-test temporary directory removed in
 //  tearDown after every opened store is closed. The store's clock is
@@ -242,26 +242,6 @@ final class UsageStoreRunLogTests: XCTestCase {
         XCTAssertEqual(storedB?.file, file("/p/-b/t.jsonl"))
     }
 
-    func test_saveRunLog_doesNotTouchTheV1Checkpoints() async throws {
-        let store = try openStore()
-
-        try await store.saveRunLog(richLog, file: file("/same/path.jsonl", inode: 1, offset: 500), forSession: "session-a")
-        let v1 = try await store.checkpoint(forPath: "/same/path.jsonl")
-
-        XCTAssertNil(v1)
-    }
-
-    func test_v1Checkpoint_doesNotCreateARunLog() async throws {
-        let store = try openStore()
-        try await store.apply(UsageBatch(
-            records: [], session: nil,
-            fileCheckpoint: UsageFileCheckpoint(path: "/same/path.jsonl", checkpoint: TranscriptCheckpoint(inode: 1, offset: 5))))
-
-        let stored = try await store.runLog(forSession: "session-a")
-
-        XCTAssertNil(stored)
-    }
-
     // MARK: - saveRunLog writes only what changed
 
     /// The bytes of a file in the store directory; nil when absent.
@@ -399,9 +379,9 @@ final class UsageStoreRunLogTests: XCTestCase {
         let store = try openStore()
 
         try await store.setProjectRootIfUnset("/work/repo", forSession: "session-a")
-        let sessions = try await store.sessions()
+        let session = try await store.session("session-a")
 
-        XCTAssertEqual(sessions, [UsageSessionMeta(sessionID: "session-a", transcriptPath: nil, projectRoot: "/work/repo")])
+        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-a", projectRoot: "/work/repo"))
     }
 
     func test_setProjectRootIfUnset_neverReplacesAStoredRoot() async throws {
@@ -414,28 +394,19 @@ final class UsageStoreRunLogTests: XCTestCase {
         XCTAssertEqual(session?.projectRoot, "/work/first")
     }
 
-    func test_setProjectRootIfUnset_neverReplacesARootSetByAV1Batch() async throws {
+    func test_setProjectRootIfUnset_onARowWithoutRoot_setsIt() async throws {
         let store = try openStore()
-        try await store.apply(UsageBatch(
-            records: [], session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t.jsonl", projectRoot: "/v1/root"),
-            fileCheckpoint: nil))
-
-        try await store.setProjectRootIfUnset("/work/other", forSession: "session-a")
-        let session = try await store.session("session-a")
-
-        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t.jsonl", projectRoot: "/v1/root"))
-    }
-
-    func test_setProjectRootIfUnset_onARowWithoutRoot_setsIt_andKeepsTheTranscriptPath() async throws {
-        let store = try openStore()
-        try await store.apply(UsageBatch(
-            records: [], session: UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t.jsonl", projectRoot: nil),
-            fileCheckpoint: nil))
+        // A session row whose root is NULL cannot be made through the
+        // store's API; it is written with raw SQL into the open database.
+        try execute("INSERT INTO usage_sessions (session_id, project_root) VALUES ('session-a', NULL);",
+                    at: try databaseURL())
+        let before = try await store.session("session-a")
+        XCTAssertEqual(before, UsageSessionMeta(sessionID: "session-a", projectRoot: nil), "Fixture error")
 
         try await store.setProjectRootIfUnset("/work/repo", forSession: "session-a")
         let session = try await store.session("session-a")
 
-        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-a", transcriptPath: "/t.jsonl", projectRoot: "/work/repo"))
+        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-a", projectRoot: "/work/repo"))
     }
 
     // MARK: - deleteAll / resetTracking
@@ -550,43 +521,6 @@ final class UsageStoreRunLogTests: XCTestCase {
         PRAGMA user_version = 2;
         """
 
-    /// Version 1 as the first release created it.
-    private static let version1Schema = """
-        CREATE TABLE usage_records (
-            key TEXT NOT NULL PRIMARY KEY CHECK (length(key) > 0),
-            session_id TEXT NOT NULL,
-            timestamp_ms INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            effort TEXT,
-            thread TEXT NOT NULL,
-            agent_id TEXT,
-            agent_type TEXT,
-            git_branch TEXT,
-            cwd TEXT,
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            thinking_tokens INTEGER NOT NULL,
-            cache_read_tokens INTEGER NOT NULL,
-            cache_creation_tokens INTEGER NOT NULL,
-            cache_creation_1h_tokens INTEGER NOT NULL,
-            is_final INTEGER NOT NULL CHECK (is_final IN (0, 1))
-        ) WITHOUT ROWID;
-        CREATE INDEX usage_records_session ON usage_records (session_id);
-        CREATE INDEX usage_records_timestamp ON usage_records (timestamp_ms);
-        CREATE TABLE usage_sessions (
-            session_id TEXT NOT NULL PRIMARY KEY,
-            transcript_path TEXT,
-            project_root TEXT
-        ) WITHOUT ROWID;
-        CREATE TABLE usage_files (
-            path TEXT NOT NULL PRIMARY KEY,
-            inode INTEGER NOT NULL,
-            offset INTEGER NOT NULL
-        ) WITHOUT ROWID;
-        INSERT INTO usage_sessions VALUES ('session-v1', '/t/v1.jsonl', '/r/v1');
-        PRAGMA user_version = 1;
-        """
-
     func test_freshDatabase_hasTheRunLogTables_atVersion2() async throws {
         let store = try openStore()
         await store.close()
@@ -611,31 +545,11 @@ final class UsageStoreRunLogTests: XCTestCase {
             let moved = try storeDirectory().appendingPathComponent(sibling)
             XCTAssertEqual(integer("SELECT count(*) FROM usage_sessions WHERE session_id = 'session-r1'", at: moved), 1)
         }
-        let sessions = try await store.sessions()
-        XCTAssertEqual(sessions, [], "The fresh database starts empty")
+        let session = try await store.session("session-r1")
+        XCTAssertNil(session, "The fresh database starts empty")
         try await store.saveRunLog(richLog, file: file(), forSession: "session-a")
         let stored = try await store.runLog(forSession: "session-a")
         XCTAssertEqual(stored?.log, richLog)
-    }
-
-    func test_version1Database_migratesInOneStep_toEveryTable() async throws {
-        let url = try databaseURL()
-        try execute(Self.version1Schema, at: url)
-
-        let store = try openStore()
-
-        XCTAssertEqual(try corruptSiblings(), [], "A version-1 database is migrated, not moved aside")
-        let session = try await store.session("session-v1")
-        XCTAssertEqual(session, UsageSessionMeta(sessionID: "session-v1", transcriptPath: "/t/v1.jsonl", projectRoot: "/r/v1"))
-        try await store.saveRunLog(richLog, file: file(), forSession: "session-v1")
-        let stored = try await store.runLog(forSession: "session-v1")
-        XCTAssertEqual(stored?.log, richLog)
-        await store.close()
-        XCTAssertEqual(integer("PRAGMA user_version", at: url), 2)
-        for table in runLogTables + ["usage_series", "usage_points", "usage_meta", "usage_process_starts",
-                                     "usage_retired_processes", "usage_records", "usage_files"] {
-            XCTAssertEqual(tableCount(table, at: url), 1, table)
-        }
     }
 
     func test_databaseClaimingVersion3_isMovedAside() async throws {

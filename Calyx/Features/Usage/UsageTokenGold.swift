@@ -64,7 +64,7 @@ enum UsageTokenGold {
     /// column (`minute` / `time_ns`), so the comparisons can use the
     /// columns' indexes, and the stored maxima are converted back.
     ///
-    /// `Dimension.day` is walked as in `UsageGold`: the calendar supplies
+    /// `Dimension.day` is walked per local day: the calendar supplies
     /// each local day's exact interval and the aggregate runs once per
     /// interval and source. Of `calendar` only the time zone is used
     /// (`UsagePeriod.localDayCalendar`).

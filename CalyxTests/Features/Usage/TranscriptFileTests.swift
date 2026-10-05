@@ -2,7 +2,7 @@
 //  TranscriptFileTests.swift
 //  CalyxTests
 //
-//  Pins TranscriptFile.open(atPath:), moved out of UsageIngestor: a
+//  Pins TranscriptFile.open(atPath:): a
 //  regular file opens with its inode and size; a missing path, a symbolic
 //  link at the final component, a directory, and a path that reaches the
 //  file through a linked directory (`redirected`) do not. Paths are built
@@ -96,11 +96,7 @@ final class TranscriptFileTests: XCTestCase {
         XCTAssertEqual(openAndClose(try base() + "/linked/a.jsonl"), .redirected)
     }
 
-    func test_lineReaderDefaults_areTheV1IngestorsValues() {
-        // The v1 open path forwards to TranscriptFile; its behaviour stays
-        // pinned by UsageIngestorTests.
-        XCTAssertEqual(UsageIngestor.defaultMaxLineBytes, TranscriptLineReader.defaultMaxLineBytes)
-        XCTAssertEqual(UsageIngestor.defaultByteBudget, TranscriptLineReader.defaultByteBudget)
+    func test_lineReaderDefaults_arePinned() {
         XCTAssertEqual(TranscriptLineReader.defaultMaxLineBytes, 16_777_216)
         XCTAssertEqual(TranscriptLineReader.defaultByteBudget, 4_194_304)
     }

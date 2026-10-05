@@ -10,7 +10,7 @@
 // dots), a cross-row a2->a4, a cross-band a4->b1, and a conflict a1-a3.
 // a4 alone also carries a git badge (branch main) and a session usage
 // row with one response not yet final, so its card shows the git line
-// and the usage line "≥45.2k out · 1.2M in" above its tool line.
+// and the usage line "45.2k out · 1.2M in" above its tool line.
 
 import Foundation
 

@@ -153,7 +153,7 @@ enum ControlCharacterDisplay {
     ///
     /// Not `private`: this is the single definition of "a scalar that is
     /// unsafe to show or hand on", shared with
-    /// `ClaudeTranscriptParser.label`, which REJECTS a transcript-derived
+    /// `TranscriptLabel.label`, which REJECTS a transcript-derived
     /// label containing any such scalar (those labels later reach other
     /// agents through an MCP tool, where the same bidi / zero-width /
     /// Tag-block payloads are the threat). Note it is also `true` for C0

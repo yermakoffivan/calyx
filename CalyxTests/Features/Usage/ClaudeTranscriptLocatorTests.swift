@@ -3,12 +3,10 @@
 //  CalyxTests
 //
 //  Pins ClaudeTranscriptLocator, the gate between an UNTRUSTED transcript
-//  path (it arrives in a hook payload) and the usage ingestor:
+//  path and the run-log reader:
 //  locate(transcriptPath:sessionID:root:) accepts only an absolute path
 //  whose realpath is "<realpath of root>/<project dir>/<sessionID>.jsonl"
 //  and whose final component is itself an existing regular file, and
-//  subagentTranscripts(in:) lists only the regular "agent-*.jsonl" files
-//  directly inside "<project dir>/<sessionID>/subagents", by name, and
 //  locate(sessionID:root:) finds "<root>/<one dir>/<sessionID>.jsonl" with
 //  the same acceptance, the latest modification time winning and equal
 //  times decided by the directory name, byte-wise ascending.
@@ -75,7 +73,6 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
     private var projectDirectory: String { root + "/-Users-someone-repo" }
     private var realProjectDirectory: String { realRoot + "/-Users-someone-repo" }
     private var mainPath: String { projectDirectory + "/" + sessionID + ".jsonl" }
-    private var realSubagentsDirectory: String { realProjectDirectory + "/" + sessionID + "/subagents" }
 
     private func makeDirectory(_ path: String) throws {
         try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
@@ -96,14 +93,6 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
             transcriptPath: transcriptPath, sessionID: sessionID ?? self.sessionID, root: root ?? self.root)
     }
 
-    /// A location built by hand (resolved paths), for subagentTranscripts.
-    private var location: ClaudeTranscriptLocation {
-        ClaudeTranscriptLocation(
-            mainPath: realProjectDirectory + "/" + sessionID + ".jsonl",
-            sessionID: sessionID,
-            subagentsDirectory: realSubagentsDirectory)
-    }
-
     // MARK: - locate: accepted
 
     func test_locate_regularFileAtDepthTwo_returnsResolvedLocation() throws {
@@ -113,17 +102,7 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
 
         XCTAssertEqual(found, ClaudeTranscriptLocation(
             mainPath: realProjectDirectory + "/" + sessionID + ".jsonl",
-            sessionID: sessionID,
-            subagentsDirectory: realProjectDirectory + "/" + sessionID + "/subagents"))
-    }
-
-    func test_locate_subagentsDirectoryDoesNotNeedToExist() throws {
-        try makeFile(mainPath)
-
-        let found = locate(mainPath)
-
-        XCTAssertFalse(FileManager.default.fileExists(atPath: realSubagentsDirectory), "Fixture error")
-        XCTAssertEqual(found?.subagentsDirectory, realSubagentsDirectory)
+            sessionID: sessionID))
     }
 
     func test_locate_rootGivenResolvedAndPathGivenUnresolved_returnsResolvedLocation() throws {
@@ -144,8 +123,7 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
 
         XCTAssertEqual(found, ClaudeTranscriptLocation(
             mainPath: realProjectDirectory + "/" + sessionID + ".jsonl",
-            sessionID: sessionID,
-            subagentsDirectory: realProjectDirectory + "/" + sessionID + "/subagents"))
+            sessionID: sessionID))
     }
 
     func test_locate_rootIsSymlinkButPathGivenThroughRealDirectory_isAccepted() throws {
@@ -315,190 +293,6 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
         XCTAssertNil(locate(mainPath, sessionID: ""))
     }
 
-    // MARK: - subagentTranscripts
-
-    func test_subagentTranscripts_returnsAgentJsonlFilesSortedByNameAsFullPaths() throws {
-        // Created out of name order.
-        try makeFile(realSubagentsDirectory + "/agent-c3.jsonl")
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        try makeFile(realSubagentsDirectory + "/agent-b2.jsonl")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [
-            realSubagentsDirectory + "/agent-a1.jsonl",
-            realSubagentsDirectory + "/agent-b2.jsonl",
-            realSubagentsDirectory + "/agent-c3.jsonl",
-        ])
-    }
-
-    func test_subagentTranscripts_ignoresMetaAndForkedSkillSidecars() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        try makeFile(realSubagentsDirectory + "/agent-a1.meta.json")
-        try makeFile(realSubagentsDirectory + "/agent-a1.forked-skill.json")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    func test_subagentTranscripts_ignoresNamesNotMatchingAgentStarJsonl() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        try makeFile(realSubagentsDirectory + "/notes.jsonl")
-        try makeFile(realSubagentsDirectory + "/subagent-a1.jsonl")
-        try makeFile(realSubagentsDirectory + "/agent-a1.json")
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl.bak")
-        try makeFile(realSubagentsDirectory + "/agent-a1.txt")
-        try makeFile(realSubagentsDirectory + "/" + sessionID + ".jsonl")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    func test_subagentTranscripts_ignoresSymlinks() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        let target = realTempPath + "/elsewhere/agent-real.jsonl"
-        try makeFile(target)
-        try makeSymlink(at: realSubagentsDirectory + "/agent-b2.jsonl", to: target)
-        // A link to a sibling that is itself listed is ignored as well.
-        try makeSymlink(
-            at: realSubagentsDirectory + "/agent-c3.jsonl", to: realSubagentsDirectory + "/agent-a1.jsonl")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    func test_subagentTranscripts_ignoresDirectories() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        try makeDirectory(realSubagentsDirectory + "/agent-b2.jsonl")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    func test_subagentTranscripts_doesNotDescendIntoSubdirectories() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        try makeFile(realSubagentsDirectory + "/nested/agent-z9.jsonl")
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: location)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    func test_subagentTranscripts_missingDirectory_returnsEmpty() {
-        XCTAssertFalse(FileManager.default.fileExists(atPath: realSubagentsDirectory), "Fixture error")
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_emptyDirectory_returnsEmpty() throws {
-        try makeDirectory(realSubagentsDirectory)
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_subagentsPathIsARegularFile_returnsEmpty() throws {
-        try makeFile(realSubagentsDirectory)
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_ofALocatedTranscript_listsItsSubagentFiles() throws {
-        try makeFile(mainPath)
-        try makeFile(projectDirectory + "/" + sessionID + "/subagents/agent-a1.jsonl")
-        let found = try XCTUnwrap(locate(mainPath))
-
-        let paths = try ClaudeTranscriptLocator.subagentTranscripts(in: found)
-
-        XCTAssertEqual(paths, [realSubagentsDirectory + "/agent-a1.jsonl"])
-    }
-
-    // MARK: - subagentTranscripts: never through a symlink
-
-    func test_subagentTranscripts_subagentsDirectoryIsSymlinkToDirectoryOutsideRoot_returnsEmpty() throws {
-        let outside = realTempPath + "/elsewhere/subagents"
-        try makeFile(outside + "/agent-a1.jsonl")
-        try makeDirectory(realProjectDirectory + "/" + sessionID)
-        try makeSymlink(at: realSubagentsDirectory, to: outside)
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: realSubagentsDirectory + "/agent-a1.jsonl"), "Fixture error")
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_subagentsDirectoryIsSymlinkToDirectoryInsideRoot_returnsEmpty() throws {
-        let inside = realRoot + "/-Users-someone-other/some-session/subagents"
-        try makeFile(inside + "/agent-a1.jsonl")
-        try makeDirectory(realProjectDirectory + "/" + sessionID)
-        try makeSymlink(at: realSubagentsDirectory, to: inside)
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: realSubagentsDirectory + "/agent-a1.jsonl"), "Fixture error")
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_sessionDirectoryIsSymlinkToDirectoryOutsideRoot_returnsEmpty() throws {
-        let outside = realTempPath + "/elsewhere/session"
-        try makeFile(outside + "/subagents/agent-a1.jsonl")
-        try makeSymlink(at: realProjectDirectory + "/" + sessionID, to: outside)
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: realSubagentsDirectory + "/agent-a1.jsonl"), "Fixture error")
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    func test_subagentTranscripts_sessionDirectoryIsSymlinkToDirectoryInsideRoot_returnsEmpty() throws {
-        let inside = realRoot + "/-Users-someone-other/some-session"
-        try makeFile(inside + "/subagents/agent-a1.jsonl")
-        try makeSymlink(at: realProjectDirectory + "/" + sessionID, to: inside)
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: realSubagentsDirectory + "/agent-a1.jsonl"), "Fixture error")
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
-    // MARK: - subagentTranscripts: enumeration failures throw
-
-    private func assertThrowsPOSIX(
-        _ code: Int32, file: StaticString = #filePath, line: UInt = #line, _ body: () throws -> [String]
-    ) {
-        do {
-            let paths = try body()
-            XCTFail("Expected a POSIX error \(code), got \(paths)", file: file, line: line)
-        } catch {
-            let nsError = error as NSError
-            XCTAssertEqual(nsError.domain, NSPOSIXErrorDomain, file: file, line: line)
-            XCTAssertEqual(nsError.code, Int(code), file: file, line: line)
-        }
-    }
-
-    func test_subagentTranscripts_unreadableSubagentsDirectory_throwsEACCES() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        let directory = realSubagentsDirectory
-        XCTAssertEqual(chmod(directory, 0o000), 0, "Fixture error")
-        addTeardownBlock { _ = chmod(directory, 0o700) }
-
-        assertThrowsPOSIX(EACCES) { try ClaudeTranscriptLocator.subagentTranscripts(in: location) }
-    }
-
-    func test_subagentTranscripts_unreadableSessionDirectory_throwsEACCES() throws {
-        try makeFile(realSubagentsDirectory + "/agent-a1.jsonl")
-        let directory = realProjectDirectory + "/" + sessionID
-        XCTAssertEqual(chmod(directory, 0o000), 0, "Fixture error")
-        addTeardownBlock { _ = chmod(directory, 0o700) }
-
-        assertThrowsPOSIX(EACCES) { try ClaudeTranscriptLocator.subagentTranscripts(in: location) }
-    }
-
-    func test_subagentTranscripts_sessionPathIsARegularFile_returnsEmpty() throws {
-        try makeFile(realProjectDirectory + "/" + sessionID)
-
-        XCTAssertEqual(try ClaudeTranscriptLocator.subagentTranscripts(in: location), [])
-    }
-
     // MARK: - locate: the session id is one path component
 
     func test_locate_sessionIDIsDot_returnsNil() throws {
@@ -570,8 +364,7 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
             locate(path, sessionID: id),
             ClaudeTranscriptLocation(
                 mainPath: realProjectDirectory + "/" + id + ".jsonl",
-                sessionID: id,
-                subagentsDirectory: realProjectDirectory + "/" + id + "/subagents"),
+                sessionID: id),
             file: file, line: line)
     }
 
@@ -666,8 +459,7 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
 
         XCTAssertEqual(found, ClaudeTranscriptLocation(
             mainPath: try descriptorPath(realMainPath),
-            sessionID: sessionID,
-            subagentsDirectory: try descriptorPath(realProjectDirectory) + "/" + sessionID + "/subagents"),
+            sessionID: sessionID),
             file: file, line: line)
     }
 
@@ -700,8 +492,7 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
         let name = id ?? searchedID
         return ClaudeTranscriptLocation(
             mainPath: realRoot + "/" + directory + "/" + name + ".jsonl",
-            sessionID: name,
-            subagentsDirectory: realRoot + "/" + directory + "/" + name + "/subagents")
+            sessionID: name)
     }
 
     /// Sets the item's modification time to `seconds` + `nanoseconds`
