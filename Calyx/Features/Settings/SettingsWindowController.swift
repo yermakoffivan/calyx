@@ -26,9 +26,20 @@ class SettingsWindowController: NSWindowController {
     /// The Usage Tracking row's status line, kept current by
     /// `updateUsageTrackingStatus()` (see `usageTrackingRow()`).
     private let usageTrackingStatusLabel = SettingsLayout.statusLabel()
-    /// Bumped whenever the monitor observation is armed anew, so a change
-    /// reported by an earlier arming neither refreshes nor re-arms.
-    private var usageMonitorObservationGeneration = 0
+    /// The row's reception status over this controller's inputs (and its
+    /// DEBUG seams); it calls `updateUsageTrackingStatus()` whenever the
+    /// text may have changed. `weak`, not `unowned`: nothing here may be
+    /// able to trap, also if this controller stops being a singleton. A
+    /// closure run after the controller is gone reads neutral values (no
+    /// server, the shared activation and monitor) and updates nothing.
+    private lazy var usageTelemetryStatusFeed = UsageTelemetryStatusFeed(
+        inputs: UsageTelemetryStatusFeed.Inputs(
+            trackingOn: { UsageTrackingSettings.enabled },
+            ipcEnabled: { IPCSettings.enabled },
+            serverRunning: { [weak self] in self?.usageServerRunning ?? false },
+            activation: { [weak self] in self?.usageTelemetryActivation ?? .shared },
+            monitor: { [weak self] in self?.usageIngestMonitor ?? .shared }),
+        onChange: { [weak self] in self?.updateUsageTrackingStatus() })
     /// State behind the MCP Apps pane (`SettingsPane.mcpServers`), shared by every instance and
     /// held by the type so the composition root configures it at launch
     /// without creating the Settings window. Empty until
@@ -60,11 +71,12 @@ class SettingsWindowController: NSWindowController {
     var _usageTelemetryActivationForTesting: UsageTelemetryActivation?
 
     /// Test seam: the monitor the Usage Tracking row shows, instead of
-    /// `UsageIngestMonitor.shared`. Setting it arms the observation anew
-    /// (the previous one stops). DO NOT use from production code.
+    /// `UsageIngestMonitor.shared`. Setting it moves the feed's
+    /// observation to it (the previous one stops). DO NOT use from
+    /// production code.
     var _usageIngestMonitorForTesting: UsageIngestMonitor? {
         didSet {
-            observeUsageIngestMonitor()
+            usageTelemetryStatusFeed.monitorDidChange()
             updateUsageTrackingStatus()
         }
     }
@@ -100,11 +112,8 @@ class SettingsWindowController: NSWindowController {
             self, selector: #selector(agentIPCStateDidChange),
             name: .calyxIPCStateDidChange, object: nil
         )
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(usageTelemetryStatusDidChange(_:)),
-            name: .calyxUsageTelemetryStatusDidChange, object: nil
-        )
-        observeUsageIngestMonitor()
+        // Arms the feed's observers (status, IPC state, monitor values).
+        _ = usageTelemetryStatusFeed
     }
 
     deinit {
@@ -533,49 +542,16 @@ class SettingsWindowController: NSWindowController {
         #endif
     }
 
-    /// Applies `UsageTelemetryStatusResolver` to the row's status label;
-    /// hidden while the text is empty. Called when the pane is built, when
-    /// the switch changes, on `.calyxIPCStateDidChange`, on
-    /// `.calyxUsageTelemetryStatusDidChange` (after every reconcile run of
-    /// the shared activation), and when the monitor's values change.
+    /// Applies the feed's text (`UsageTelemetryStatusResolver`) to the
+    /// row's status label; hidden while the text is empty. Called when the
+    /// pane is built, when the switch changes, and by the feed on
+    /// `.calyxIPCStateDidChange`, on `.calyxUsageTelemetryStatusDidChange`
+    /// (after every reconcile run of the shared activation), and when the
+    /// monitor's values change.
     private func updateUsageTrackingStatus() {
-        let monitor = usageIngestMonitor
-        let input = UsageTelemetryStatusInput(
-            trackingOn: UsageTrackingSettings.enabled,
-            ipcEnabled: IPCSettings.enabled,
-            serverRunning: usageServerRunning,
-            config: usageTelemetryActivation.status,
-            lastAcceptedAt: monitor.lastAcceptedAt,
-            lastRejection: monitor.lastRejection)
-        let text = UsageTelemetryStatusResolver.text(
-            for: UsageTelemetryStatusResolver.resolve(input),
-            time: UsageTelemetryStatusResolver.defaultTime)
+        let text = usageTelemetryStatusFeed.text
         usageTrackingStatusLabel.isHidden = text.isEmpty
         usageTrackingStatusLabel.attributedStringValue = SettingsLayout.statusText(text)
-    }
-
-    /// Observes the monitor's two values once; a change refreshes the
-    /// label and arms the observation again. Arming anew (a replaced
-    /// monitor) retires every earlier arming through the generation.
-    private func observeUsageIngestMonitor() {
-        usageMonitorObservationGeneration += 1
-        let generation = usageMonitorObservationGeneration
-        let monitor = usageIngestMonitor
-        withObservationTracking {
-            _ = monitor.lastAcceptedAt
-            _ = monitor.lastRejection
-        } onChange: { [weak self] in
-            // Called before the change is applied: read it on the next turn.
-            Task { @MainActor [weak self] in
-                guard let self, generation == self.usageMonitorObservationGeneration else { return }
-                self.observeUsageIngestMonitor()
-                self.updateUsageTrackingStatus()
-            }
-        }
-    }
-
-    @objc private func usageTelemetryStatusDidChange(_ notification: Notification) {
-        updateUsageTrackingStatus()
     }
 
     /// The whole MCP Apps pane below its heading, built from the same
@@ -869,7 +845,6 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentIPCStateDidChange(_ notification: Notification) {
         updateAgentIPCRow()
-        updateUsageTrackingStatus()
         mcpServerSettingsModel.refreshIPCEnabled()
     }
 

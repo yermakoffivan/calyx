@@ -2,18 +2,15 @@
 //  UsageWindowModelLabelTests.swift
 //  CalyxTests
 //
-//  Pins the two texts the Usage window derives from data:
+//  Pins the text the Usage window derives from data:
 //
-//  - `finalPercentText(final:responses:)`, the Final column: the share
-//    of responses whose final transcript line was written, truncated to
-//    a whole percent in integer arithmetic. It never overstates: 999 of
-//    1,000 is 99%, and only "every response is final" shows 100% (a
-//    `Double` ratio rounds (10^18 - 1) / 10^18 up to 100%). No responses
-//    show an em dash; out-of-range pairs Gold never produces do not trap.
 //  - `projectLabel(root:home:)`, the project picker's label: the full
 //    root with the home directory written `~`, component-aware, so two
 //    different roots never share a label (no tooltip is needed to tell
 //    them apart).
+//
+//  (The Final column and its `finalPercentText` were removed with R5c:
+//  Claude Code's own counts have no "final" share.)
 //
 
 import XCTest
@@ -21,41 +18,6 @@ import XCTest
 
 @MainActor
 final class UsageWindowModelLabelTests: XCTestCase {
-
-    private func percent(_ final: Int64, _ responses: Int64) -> String {
-        UsageWindowModel.finalPercentText(final: final, responses: responses)
-    }
-
-    // MARK: - Final column
-
-    func test_finalPercent_noResponses_isAnEmDash() {
-        XCTAssertEqual(percent(0, 0), "\u{2014}")
-        XCTAssertEqual(percent(3, 0), "\u{2014}")
-        XCTAssertEqual(percent(3, -1), "\u{2014}")
-    }
-
-    func test_finalPercent_truncates_neverRoundsUp() {
-        XCTAssertEqual(percent(999, 1_000), "99%")
-        XCTAssertEqual(percent(1, 3), "33%")
-        XCTAssertEqual(percent(2, 3), "66%")
-        XCTAssertEqual(percent(0, 5), "0%")
-    }
-
-    func test_finalPercent_isOneHundredOnlyWhenEveryResponseIsFinal() {
-        XCTAssertEqual(percent(1_000, 1_000), "100%")
-        XCTAssertEqual(percent(Int64.max, Int64.max), "100%")
-    }
-
-    func test_finalPercent_hugeCounts_useIntegerArithmetic() {
-        let quintillion: Int64 = 1_000_000_000_000_000_000
-        XCTAssertEqual(percent(quintillion - 1, quintillion), "99%", "a Double ratio shows 100%")
-        XCTAssertEqual(percent(Int64.max - 1, Int64.max), "99%")
-    }
-
-    func test_finalPercent_outOfRangePairs_clampWithoutTrapping() {
-        XCTAssertEqual(percent(5, 3), "100%")
-        XCTAssertEqual(percent(-1, 5), "0%")
-    }
 
     // MARK: - Project label
 

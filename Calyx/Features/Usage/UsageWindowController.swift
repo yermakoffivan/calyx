@@ -17,6 +17,9 @@ final class UsageWindowController: NSWindowController {
     static let shared = UsageWindowController()
 
     let model: UsageWindowModel
+    /// Held only to keep the feed (and its observers) alive; set once in
+    /// `init`, after `self` exists for its `onChange`.
+    private var statusFeed: UsageTelemetryStatusFeed?
 
     private init() {
         let window = NSWindow(
@@ -34,8 +37,9 @@ final class UsageWindowController: NSWindowController {
         // captured when the window was first opened.
         self.model = UsageWindowModel(
             isEnabled: { UsageLedger.shared.isTracking },
-            reports: { try await UsageLedger.shared.reports($0, calendar: $1) },
+            reports: { try await UsageLedger.shared.tokenReports($0, calendar: $1) },
             deleteAll: { try await UsageLedger.shared.deleteAll() },
+            statusText: { UsageTelemetryStatusFeed.text(inputs: .production) },
             now: Date.init,
             calendar: { Calendar.current }
         )
@@ -43,6 +47,12 @@ final class UsageWindowController: NSWindowController {
         super.init(window: window)
 
         window.contentView = NSHostingView(rootView: UsageWindowView(model: model))
+
+        // Keeps the status line current while the window exists (this
+        // controller, and so its window, lives as long as the app).
+        statusFeed = UsageTelemetryStatusFeed(inputs: .production) { [weak self] in
+            self?.model.refreshStatus()
+        }
     }
 
     /// Never built from a nib; answers nil instead of trapping.

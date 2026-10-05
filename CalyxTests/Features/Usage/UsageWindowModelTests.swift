@@ -3,7 +3,20 @@
 //  CalyxTests
 //
 //  Pins UsageWindowModel, the logic behind the Usage window (a model x
-//  effort table over the usage ledger):
+//  effort table over the ledger's `tokenReports`, R5c):
+//
+//  - Rows carry Claude Code's own token counts (`UsageTokenTotals`) and
+//    whether they are recorded detail or tokens that were not received
+//    (`isUnreported`); a recorded and an unreported row of the same
+//    model never share an id.
+//  - Totals are the field-by-field saturating sum of the totals query's
+//    rows (recorded + unreported); the project list takes roots from both
+//    sources, each once.
+//  - `statusText` (the reception status line) is read from its seam by
+//    `refresh()` before the first suspension, and by `refreshStatus()`
+//    alone, which reads nothing else.
+//
+//  Rules kept from version 1:
 //
 //  - `query`: the period's lower bound is `UsagePeriod.startMs` for 1 / 7
 //    / 30 local days (the rule the MCP tool's `days` uses), nil for All
@@ -43,20 +56,20 @@ import XCTest
 /// once, so an implementation that makes extra calls fails an assertion
 /// instead of hanging the test.
 private final class ReportsStub: Sendable {
-    typealias Answer = Result<[[UsageRow]], any Error>
+    typealias Answer = Result<[[UsageTokenRow]], any Error>
 
     private struct State {
-        var calls: [(queries: [UsageQuery], calendar: Calendar)] = []
+        var calls: [(queries: [UsageTokenQuery], calendar: Calendar)] = []
         var events: [String] = []
         var heldCallCount = 0
-        var respond: @Sendable ([UsageQuery]) -> Answer = { queries in .success(queries.map { _ in [] }) }
-        var held: [Int: CheckedContinuation<[[UsageRow]], any Error>] = [:]
+        var respond: @Sendable ([UsageTokenQuery]) -> Answer = { queries in .success(queries.map { _ in [] }) }
+        var held: [Int: CheckedContinuation<[[UsageTokenRow]], any Error>] = [:]
         var waiters: [(index: Int, expectation: XCTestExpectation)] = []
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    var calls: [(queries: [UsageQuery], calendar: Calendar)] { state.withLock { $0.calls } }
+    var calls: [(queries: [UsageTokenQuery], calendar: Calendar)] { state.withLock { $0.calls } }
     var callCount: Int { state.withLock { $0.calls.count } }
     var events: [String] { state.withLock { $0.events } }
 
@@ -64,7 +77,7 @@ private final class ReportsStub: Sendable {
     func hold(_ count: Int) { state.withLock { $0.heldCallCount = count } }
 
     /// Every later call answers at once with `respond(queries)`.
-    func answer(_ respond: @escaping @Sendable ([UsageQuery]) -> Answer) {
+    func answer(_ respond: @escaping @Sendable ([UsageTokenQuery]) -> Answer) {
         state.withLock {
             $0.respond = respond
         }
@@ -72,7 +85,7 @@ private final class ReportsStub: Sendable {
 
     func noteDelete() { state.withLock { $0.events.append("deleteAll") } }
 
-    func call(_ queries: [UsageQuery], _ calendar: Calendar) async throws -> [[UsageRow]] {
+    func call(_ queries: [UsageTokenQuery], _ calendar: Calendar) async throws -> [[UsageTokenRow]] {
         let (index, holding, respond) = state.withLock { state in
             state.calls.append((queries, calendar))
             state.events.append("reports")
@@ -188,9 +201,17 @@ private final class Environment {
     var isEnabled = true
     var now: Date
     var calendar: Calendar
+    var statusText = ""
     var deleteError: (any Error)?
+    /// How often the model read each closure.
+    var isEnabledReads = 0
+    var nowReads = 0
+    var calendarReads = 0
+    var statusTextReads = 0
 
-    init(now: Date, calendar: Calendar) {
+    /// Nonisolated, so the test case can create one as a property's
+    /// default value.
+    nonisolated init(now: Date, calendar: Calendar) {
         self.now = now
         self.calendar = calendar
     }
@@ -207,7 +228,7 @@ final class UsageWindowModelTests: XCTestCase {
         var calendar = Calendar(identifier: .gregorian)
         // Known zone identifiers; a missing one falls back to GMT and
         // every bound assertion below then fails loudly.
-        calendar.timeZone = TimeZone(identifier: identifier) ?? TimeZone(secondsFromGMT: 0)!
+        calendar.timeZone = TimeZone(identifier: identifier) ?? .gmt
         return calendar
     }
 
@@ -242,52 +263,50 @@ final class UsageWindowModelTests: XCTestCase {
     /// 30 days does not, so `UsagePeriod.startMs(lastDays: 30, …)` is nil.
     private static let calendarEdgeNow = Date(timeIntervalSince1970: -210_865_896_000)
 
+    /// A result row. `input` defaults to 1 so rows differ only where a
+    /// test says so; the other kinds default to 0.
     nonisolated private static func row(
-        _ key: [String?], responses: Int64 = 1, input: Int64 = 0, lastMs: Int64 = 0
-    ) -> UsageRow {
-        UsageRow(
-            key: key, responses: responses, finalResponses: responses, inputTokens: input,
-            cacheReadTokens: 0, cacheCreationTokens: 0, cacheCreation1hTokens: 0,
-            outputTokensFinal: 0, thinkingTokensFinal: 0, lastTimestampMs: lastMs)
+        _ key: [String?], input: Int64 = 1, cacheRead: Int64 = 0, cacheCreation: Int64 = 0,
+        output: Int64 = 0, unreported: Bool = false, lastMs: Int64 = 0
+    ) -> UsageTokenRow {
+        UsageTokenRow(
+            key: key, isUnreported: unreported, inputTokens: input, cacheReadTokens: cacheRead,
+            cacheCreationTokens: cacheCreation, outputTokens: output, lastTimestampMs: lastMs)
+    }
+
+    /// The totals a single totals row of `input` tokens (and nothing else) sums to.
+    nonisolated private static func totals(input: Int64) -> UsageTokenTotals {
+        UsageTokenTotals(input: input, output: 0, cacheRead: 0, cacheCreation: 0)
     }
 
     /// The three results of one refresh, in the order the queries are sent.
     nonisolated private static func answer(
-        rows: [UsageRow], totals: [UsageRow], projects: [UsageRow]
+        rows: [UsageTokenRow], totals: [UsageTokenRow], projects: [UsageTokenRow]
     ) -> ReportsStub.Answer {
         .success([rows, totals, projects])
     }
 
-    private var stub: ReportsStub!
-    private var env: Environment!
-    private var deleteCalls: OSAllocatedUnfairLock<Int>!
-    private var deleteGate: DeleteGate!
-
-    override func setUp() async throws {
-        try await super.setUp()
-        stub = ReportsStub()
-        env = Environment(now: Self.date(ms: Self.tokyoNowMs), calendar: Self.calendar("Asia/Tokyo"))
-        deleteCalls = OSAllocatedUnfairLock(initialState: 0)
-        deleteGate = DeleteGate()
-    }
-
-    override func tearDown() async throws {
-        stub = nil
-        env = nil
-        deleteCalls = nil
-        deleteGate = nil
-        try await super.tearDown()
-    }
+    // A new XCTestCase instance runs each test, so these are fresh per test.
+    private let stub = ReportsStub()
+    /// Starts at `tokyoNowMs` (2026-03-09T15:30:00Z) in Asia/Tokyo.
+    private let env = Environment(
+        now: Date(timeIntervalSince1970: 1_773_070_200),
+        calendar: UsageWindowModelTests.calendar("Asia/Tokyo"))
+    private let deleteCalls = OSAllocatedUnfairLock(initialState: 0)
+    private let deleteGate = DeleteGate()
 
     private func makeModel() -> UsageWindowModel {
-        let stub = stub!
-        let env = env!
-        let deleteCalls = deleteCalls!
-        let deleteGate = deleteGate!
+        let stub = stub
+        let env = env
+        let deleteCalls = deleteCalls
+        let deleteGate = deleteGate
         // Read on the main actor before the delete closure suspends.
         let deleteError: @Sendable () async -> (any Error)? = { await MainActor.run { env.deleteError } }
         return UsageWindowModel(
-            isEnabled: { env.isEnabled },
+            isEnabled: {
+                env.isEnabledReads += 1
+                return env.isEnabled
+            },
             reports: { queries, calendar in try await stub.call(queries, calendar) },
             deleteAll: {
                 deleteCalls.withLock { $0 += 1 }
@@ -295,8 +314,18 @@ final class UsageWindowModelTests: XCTestCase {
                 try await deleteGate.pass()
                 if let error = await deleteError() { throw error }
             },
-            now: { env.now },
-            calendar: { env.calendar }
+            statusText: {
+                env.statusTextReads += 1
+                return env.statusText
+            },
+            now: {
+                env.nowReads += 1
+                return env.now
+            },
+            calendar: {
+                env.calendarReads += 1
+                return env.calendar
+            }
         )
     }
 
@@ -306,12 +335,12 @@ final class UsageWindowModelTests: XCTestCase {
     }
 
     private func expectedQueries(
-        sinceMs: Int64?, project: UsageQuery.ProjectFilter? = nil, thread: UsageRecord.Thread? = nil
-    ) -> [UsageQuery] {
+        sinceMs: Int64?, project: UsageTokenQuery.ProjectFilter? = nil, thread: String? = nil
+    ) -> [UsageTokenQuery] {
         [
-            UsageQuery(groupBy: [.model, .effort], sinceMs: sinceMs, project: project, thread: thread),
-            UsageQuery(groupBy: [], sinceMs: sinceMs, project: project, thread: thread),
-            UsageQuery(groupBy: [.project]),
+            UsageTokenQuery(groupBy: [.model, .effort], sinceMs: sinceMs, project: project, thread: thread),
+            UsageTokenQuery(groupBy: [], sinceMs: sinceMs, project: project, thread: thread),
+            UsageTokenQuery(groupBy: [.project]),
         ]
     }
 
@@ -374,21 +403,38 @@ final class UsageWindowModelTests: XCTestCase {
         let calendar = Self.calendar("Asia/Tokyo")
 
         let root = UsageWindowModel.query(
-            period: .all, project: .root("/work/app"), thread: .subagent,
+            period: .all, project: .root("/work/app"), thread: "subagent",
             groupBy: [.model, .effort], now: now, calendar: calendar)
         XCTAssertEqual(
-            root, UsageQuery(groupBy: [.model, .effort], project: .root("/work/app"), thread: .subagent))
+            root, UsageTokenQuery(groupBy: [.model, .effort], project: .root("/work/app"), thread: "subagent"))
 
         let unattributed = UsageWindowModel.query(
-            period: .today, project: .unattributed, thread: .advisor,
+            period: .today, project: .unattributed, thread: "auxiliary",
             groupBy: [.project], now: now, calendar: calendar)
         XCTAssertEqual(
             unattributed,
-            UsageQuery(groupBy: [.project], sinceMs: Self.tokyoTodayMs, project: .unattributed, thread: .advisor))
+            UsageTokenQuery(
+                groupBy: [.project], sinceMs: Self.tokyoTodayMs, project: .unattributed, thread: "auxiliary"))
 
         let all = UsageWindowModel.query(
             period: .last7Days, project: .all, thread: nil, groupBy: [], now: now, calendar: calendar)
-        XCTAssertEqual(all, UsageQuery(groupBy: [], sinceMs: Self.tokyoLast7Ms))
+        XCTAssertEqual(all, UsageTokenQuery(groupBy: [], sinceMs: Self.tokyoLast7Ms))
+    }
+
+    /// The three thread labels the picker offers reach the query as they are.
+    func test_query_passesEachThreadLabelThrough() {
+        let now = Self.date(ms: Self.tokyoNowMs)
+        let calendar = Self.calendar("Asia/Tokyo")
+        for thread in ["main", "subagent", "auxiliary"] {
+            XCTAssertEqual(
+                UsageWindowModel.query(
+                    period: .all, project: .all, thread: thread, groupBy: [], now: now, calendar: calendar),
+                UsageTokenQuery(groupBy: [], thread: thread), thread)
+        }
+        XCTAssertEqual(
+            UsageWindowModel.query(period: .all, project: .all, thread: nil, groupBy: [], now: now, calendar: calendar)?
+                .thread,
+            .some(nil), "nil: every thread, no filter")
     }
 
     func test_query_aNowTheCalendarCannotStepBackFrom_isNil_forThatPeriodOnly() {
@@ -407,7 +453,7 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(
             UsageWindowModel.query(
                 period: .all, project: .all, thread: nil, groupBy: [], now: now, calendar: calendar),
-            UsageQuery(groupBy: []))
+            UsageTokenQuery(groupBy: []))
     }
 
     // MARK: - Defaults
@@ -423,7 +469,9 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(model.projects, [])
         XCTAssertFalse(model.isLoading)
         XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusText, "")
         XCTAssertEqual(stub.callCount, 0, "creating the model reads nothing")
+        XCTAssertEqual(env.statusTextReads, 0, "creating the model reads nothing")
     }
 
     // MARK: - refresh: the one reports call
@@ -442,26 +490,35 @@ final class UsageWindowModelTests: XCTestCase {
         let model = makeModel()
         model.period = .today
         model.project = .root("/work/app")
-        model.thread = .subagent
+        model.thread = "subagent"
 
         await model.refresh()
 
         XCTAssertEqual(stub.callCount, 1)
         XCTAssertEqual(
             stub.calls.first?.queries,
-            expectedQueries(sinceMs: Self.tokyoTodayMs, project: .root("/work/app"), thread: .subagent))
+            expectedQueries(sinceMs: Self.tokyoTodayMs, project: .root("/work/app"), thread: "subagent"))
     }
 
     func test_refresh_allTimeAndUnattributed_sendNoLowerBound() async {
         let model = makeModel()
         model.period = .all
         model.project = .unattributed
-        model.thread = .main
+        model.thread = "main"
 
         await model.refresh()
 
         XCTAssertEqual(
-            stub.calls.first?.queries, expectedQueries(sinceMs: nil, project: .unattributed, thread: .main))
+            stub.calls.first?.queries, expectedQueries(sinceMs: nil, project: .unattributed, thread: "main"))
+    }
+
+    func test_refresh_auxiliaryThread_filtersRowsAndTotals() async {
+        let model = makeModel()
+        model.thread = "auxiliary"
+
+        await model.refresh()
+
+        XCTAssertEqual(stub.calls.first?.queries, expectedQueries(sinceMs: Self.tokyoLast7Ms, thread: "auxiliary"))
     }
 
     func test_refresh_readsTheClockAndCalendarAtEachRefresh() async {
@@ -483,7 +540,7 @@ final class UsageWindowModelTests: XCTestCase {
 
         model.period = .all
         model.project = .unattributed
-        model.thread = .advisor
+        model.thread = "auxiliary"
         XCTAssertEqual(stub.callCount, 0)
 
         // A refresh started by a filter change would be queued on the main
@@ -493,15 +550,15 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(stub.callCount, 1)
     }
 
-    // MARK: - refresh: results
+    // MARK: - refresh: rows
 
     func test_refresh_rowsKeepTheLedgersOrder_andSplitTheKeyIntoModelAndEffort() async {
         let rows = [
-            Self.row(["claude-opus", nil], responses: 3),
-            Self.row(["claude-opus", "high"], responses: 2),
-            Self.row(["claude-sonnet", "low"], responses: 1),
+            Self.row(["claude-opus", nil], input: 3),
+            Self.row(["claude-opus", "high"], input: 2),
+            Self.row(["claude-sonnet", "low"], input: 1),
         ]
-        stub.answer { _ in Self.answer(rows: rows, totals: [Self.row([], responses: 6)], projects: []) }
+        stub.answer { _ in Self.answer(rows: rows, totals: [Self.row([], input: 6)], projects: []) }
         let model = makeModel()
 
         await model.refresh()
@@ -509,8 +566,43 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(
             modelEffortUsage(model.rows),
             [["claude-opus", nil], ["claude-opus", "high"], ["claude-sonnet", "low"]])
-        XCTAssertEqual(model.rows.map(\.usage), rows)
-        XCTAssertEqual(model.totals, Self.row([], responses: 6))
+        XCTAssertEqual(model.rows.map(\.tokens.input), [3, 2, 1])
+        XCTAssertEqual(model.rows.map(\.isUnreported), [false, false, false])
+        XCTAssertEqual(model.totals, Self.totals(input: 6))
+    }
+
+    /// Each kind lands in its own field: distinct values per kind catch a
+    /// swapped pair.
+    func test_refresh_rowTokens_mapEachKindToItsField() async {
+        stub.answer { _ in
+            Self.answer(
+                rows: [Self.row(["m", "high"], input: 11, cacheRead: 22, cacheCreation: 33, output: 44)],
+                totals: [], projects: [])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(
+            model.rows.map(\.tokens), [UsageTokenTotals(input: 11, output: 44, cacheRead: 22, cacheCreation: 33)])
+    }
+
+    func test_refresh_anUnreportedRow_isMarked_andKeepsItsModel() async {
+        stub.answer { _ in
+            Self.answer(
+                rows: [
+                    Self.row(["claude-opus", "high"], input: 5),
+                    Self.row(["claude-opus", nil], input: 7, unreported: true),
+                ],
+                totals: [], projects: [])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.rows.map(\.isUnreported), [false, true])
+        XCTAssertEqual(modelEffortUsage(model.rows), [["claude-opus", "high"], ["claude-opus", nil]])
+        XCTAssertEqual(model.rows.map(\.tokens.input), [5, 7])
     }
 
     func test_rowIDs_areUniqueWithinAResult_andStablePerModelAndEffort() async {
@@ -518,7 +610,7 @@ final class UsageWindowModelTests: XCTestCase {
         stub.answer { _ in
             Self.answer(
                 rows: [Self.row(["m", nil]), Self.row(["m", ""]), Self.row(["m", "high"]), Self.row([nil, "high"])],
-                totals: [Self.row([], responses: 4)], projects: [])
+                totals: [Self.row([], input: 4)], projects: [])
         }
         let model = makeModel()
         await model.refresh()
@@ -527,7 +619,7 @@ final class UsageWindowModelTests: XCTestCase {
 
         // Same (model, effort) at another position: same id.
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["m", "high"], responses: 9)], totals: [Self.row([], responses: 9)], projects: [])
+            Self.answer(rows: [Self.row(["m", "high"], input: 9)], totals: [Self.row([], input: 9)], projects: [])
         }
         await model.refresh()
 
@@ -537,11 +629,35 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(model.rows.map(\.id), highID.map { [$0] })
     }
 
-    func test_totals_isNilWhenTheTotalsQueryReturnedNoRow() async {
-        stub.answer { _ in Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([])], projects: []) }
+    /// The ledger gives an unreported row the same key as a recorded row
+    /// of that model without an effort: the flag alone tells them apart.
+    func test_rowIDs_aRecordedAndAnUnreportedRowOfTheSameKey_differ_andEachIsStable() async {
+        let pair = [Self.row(["m", nil], input: 1), Self.row(["m", nil], input: 2, unreported: true)]
+        stub.answer { _ in Self.answer(rows: pair, totals: [], projects: []) }
         let model = makeModel()
         await model.refresh()
-        XCTAssertEqual(model.totals, Self.row([]))
+        let first = model.rows
+        XCTAssertEqual(first.count, 2)
+        XCTAssertEqual(Set(first.map(\.id)).count, 2, "ids collide: \(first.map(\.id))")
+
+        // Only the unreported row remains: it keeps its id.
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m", nil], input: 3, unreported: true)], totals: [], projects: [])
+        }
+        await model.refresh()
+
+        let unreportedID = first.first { $0.isUnreported }?.id
+        XCTAssertNotNil(unreportedID)
+        XCTAssertEqual(model.rows.map(\.id), unreportedID.map { [$0] })
+    }
+
+    // MARK: - refresh: totals
+
+    func test_totals_isNilWhenTheTotalsQueryReturnedNoRow() async {
+        stub.answer { _ in Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([], input: 0)], projects: []) }
+        let model = makeModel()
+        await model.refresh()
+        XCTAssertEqual(model.totals, UsageTokenTotals(input: 0, output: 0, cacheRead: 0, cacheCreation: 0))
 
         stub.answer { _ in Self.answer(rows: [], totals: [], projects: []) }
         await model.refresh()
@@ -549,6 +665,59 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertNil(model.totals)
         XCTAssertEqual(model.rows, [])
     }
+
+    /// Recorded {10, 20, 30, 40} + unreported {1, 2, 3, 4} (input, cache
+    /// read, cache write, output) = {11, 22, 33, 44}.
+    func test_totals_areTheFieldByFieldSumOfRecordedAndUnreported() async {
+        stub.answer { _ in
+            Self.answer(
+                rows: [],
+                totals: [
+                    Self.row([], input: 10, cacheRead: 20, cacheCreation: 30, output: 40),
+                    Self.row([], input: 1, cacheRead: 2, cacheCreation: 3, output: 4, unreported: true),
+                ],
+                projects: [])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.totals, UsageTokenTotals(input: 11, output: 44, cacheRead: 22, cacheCreation: 33))
+    }
+
+    func test_totals_withOnlyUnreportedTokens_areThoseTokens() async {
+        stub.answer { _ in
+            Self.answer(rows: [], totals: [Self.row([], input: 0, output: 9, unreported: true)], projects: [])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.totals, UsageTokenTotals(input: 0, output: 9, cacheRead: 0, cacheCreation: 0))
+    }
+
+    /// Each field saturates on its own: (max - 1) + 5 is max, while the
+    /// other fields still add normally (2 + 3 = 5).
+    func test_totals_saturateAtInt64Max_perField_withoutTrapping() async {
+        stub.answer { _ in
+            Self.answer(
+                rows: [],
+                totals: [
+                    Self.row([], input: Int64.max - 1, cacheRead: 2, cacheCreation: Int64.max, output: 0),
+                    Self.row([], input: 5, cacheRead: 3, cacheCreation: Int64.max, output: Int64.max, unreported: true),
+                ],
+                projects: [])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(
+            model.totals,
+            UsageTokenTotals(input: Int64.max, output: Int64.max, cacheRead: 5, cacheCreation: Int64.max))
+    }
+
+    // MARK: - refresh: projects
 
     func test_projects_areRootsInTheLedgersOrder_thenUnattributedLast() async {
         // The ledger sorts the nil key first; the picker puts it last.
@@ -573,6 +742,32 @@ final class UsageWindowModelTests: XCTestCase {
         await model.refresh()
 
         XCTAssertEqual(model.projects, [.root("/a/one"), .root("/b/two")])
+    }
+
+    /// The ledger answers a recorded and an unreported row for the same
+    /// key, recorded first: each root (and Unattributed) is offered once.
+    func test_projects_fromRecordedAndUnreportedRows_eachRootOnce() async {
+        stub.answer { _ in
+            Self.answer(rows: [], totals: [], projects: [
+                Self.row([nil]), Self.row([nil], unreported: true),
+                Self.row(["/a"]), Self.row(["/a"], unreported: true),
+                Self.row(["/b"], unreported: true),
+            ])
+        }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.projects, [.root("/a"), .root("/b"), .unattributed])
+    }
+
+    func test_projects_onlyUnattributedUnreported_offersUnattributed() async {
+        stub.answer { _ in Self.answer(rows: [], totals: [], projects: [Self.row([nil], unreported: true)]) }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.projects, [.unattributed])
     }
 
     func test_aSelectedProjectNoLongerOffered_staysSelected_andKeepsFiltering() async {
@@ -623,13 +818,118 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(model.projects, [.root("/a")])
     }
 
+    // MARK: - Status line
+
+    func test_statusText_isSetByRefresh_beforeTheReportsCallReturns() async {
+        stub.hold(1)
+        env.statusText = "Not receiving: AI Agent IPC is off."
+        let model = makeModel()
+
+        let refresh = Task { await model.refresh() }
+        await waitForCall(0)
+
+        XCTAssertEqual(model.statusText, "Not receiving: AI Agent IPC is off.")
+
+        stub.release(0, with: Self.answer(rows: [], totals: [], projects: []))
+        await refresh.value
+        XCTAssertEqual(model.statusText, "Not receiving: AI Agent IPC is off.")
+    }
+
+    func test_statusText_isReadAgainAtEachRefresh_andMayBecomeEmpty() async {
+        let model = makeModel()
+        env.statusText = "Setting up\u{2026}"
+        await model.refresh()
+        XCTAssertEqual(model.statusText, "Setting up\u{2026}")
+
+        env.statusText = ""
+        await model.refresh()
+
+        XCTAssertEqual(model.statusText, "")
+    }
+
+    /// The status does not depend on the read: it is set even when the
+    /// read fails.
+    func test_statusText_isSetByARefreshWhoseReadFails() async {
+        stub.answer { _ in .failure(StubError(message: "The database is locked.")) }
+        env.statusText = "Setting up\u{2026}"
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.errorMessage, "The database is locked.")
+        XCTAssertEqual(model.statusText, "Setting up\u{2026}")
+    }
+
+    /// Contract reading: `refresh()` sets the status from the seam at its
+    /// start, like the tracking flag, also when the period cannot be
+    /// computed and nothing is read.
+    func test_statusText_isSetByARefreshWhosePeriodCannotBeComputed() async {
+        env.now = Self.calendarEdgeNow
+        env.statusText = "Not receiving: The IPC server is not running."
+        let model = makeModel()
+        model.period = .last30Days
+
+        await model.refresh()
+
+        XCTAssertEqual(stub.callCount, 0, "fixture: nothing is read")
+        XCTAssertEqual(model.statusText, "Not receiving: The IPC server is not running.")
+    }
+
+    func test_refreshStatus_setsTheStatusText_andReadsNothingElse() async {
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m", "high"])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
+        }
+        let model = makeModel()
+        await model.refresh()
+        let rows = model.rows
+        let reads = (env.isEnabledReads, env.nowReads, env.calendarReads)
+        XCTAssertEqual(model.statusText, "", "fixture")
+
+        env.statusText = "Receiving. Last export at 10:00:00."
+        env.isEnabled = false
+        model.refreshStatus()
+
+        XCTAssertEqual(model.statusText, "Receiving. Last export at 10:00:00.")
+        XCTAssertEqual(stub.callCount, 1, "refreshStatus reads no data")
+        XCTAssertEqual(env.isEnabledReads, reads.0, "refreshStatus does not read the tracking flag")
+        XCTAssertEqual(env.nowReads, reads.1, "refreshStatus does not read the clock")
+        XCTAssertEqual(env.calendarReads, reads.2, "refreshStatus does not read the calendar")
+        XCTAssertTrue(model.isTrackingEnabled, "the tracking flag is left as the last refresh read it")
+        XCTAssertEqual(model.rows, rows)
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
+        XCTAssertEqual(model.projects, [.root("/a")])
+        XCTAssertFalse(model.isLoading)
+        XCTAssertNil(model.errorMessage)
+    }
+
+    /// A status change while a read is pending lands at once, and the read
+    /// landing later does not undo it.
+    func test_refreshStatus_duringAPendingRefresh_landsAtOnce_andTheReadKeepsIt() async {
+        stub.hold(1)
+        env.statusText = "Setting up\u{2026}"
+        let model = makeModel()
+        let refresh = Task { await model.refresh() }
+        await waitForCall(0)
+        XCTAssertEqual(model.statusText, "Setting up\u{2026}", "fixture")
+
+        env.statusText = "Not receiving: AI Agent IPC is off."
+        model.refreshStatus()
+        XCTAssertEqual(model.statusText, "Not receiving: AI Agent IPC is off.")
+
+        stub.release(0, with: Self.answer(rows: [], totals: [], projects: []))
+        await refresh.value
+
+        XCTAssertEqual(model.statusText, "Not receiving: AI Agent IPC is off.")
+        XCTAssertEqual(stub.callCount, 1)
+    }
+
     // MARK: - Latest wins
 
     private let olderData = (rows: [UsageWindowModelTests.row(["old", nil])],
-                             totals: [UsageWindowModelTests.row([])],
+                             totals: [UsageWindowModelTests.row([], input: 1)],
                              projects: [UsageWindowModelTests.row(["/old"])])
     private let newerData = (rows: [UsageWindowModelTests.row(["new", "high"])],
-                             totals: [UsageWindowModelTests.row([], responses: 2)],
+                             totals: [UsageWindowModelTests.row([], input: 2)],
                              projects: [UsageWindowModelTests.row(["/new"])])
 
     private func startTwoHeldRefreshes(_ model: UsageWindowModel) async -> (Task<Void, Never>, Task<Void, Never>) {
@@ -654,7 +954,7 @@ final class UsageWindowModelTests: XCTestCase {
         await older.value
 
         XCTAssertEqual(modelEffortUsage(model.rows), [["new", "high"]])
-        XCTAssertEqual(model.totals, Self.row([], responses: 2))
+        XCTAssertEqual(model.totals, Self.totals(input: 2))
         XCTAssertEqual(model.projects, [.root("/new")])
         XCTAssertNil(model.errorMessage)
         XCTAssertFalse(model.isLoading)
@@ -725,7 +1025,7 @@ final class UsageWindowModelTests: XCTestCase {
 
     func test_aFailedRefresh_showsTheErrorAndKeepsThePreviousData_untilTheNextSuccess() async {
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["m", "high"])], totals: [Self.row([], responses: 1)], projects: [Self.row(["/a"])])
+            Self.answer(rows: [Self.row(["m", "high"])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
         }
         let model = makeModel()
         await model.refresh()
@@ -736,7 +1036,7 @@ final class UsageWindowModelTests: XCTestCase {
 
         XCTAssertEqual(model.errorMessage, "The database is locked.")
         XCTAssertEqual(model.rows, rows)
-        XCTAssertEqual(model.totals, Self.row([], responses: 1))
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
         XCTAssertEqual(model.projects, [.root("/a")])
 
         stub.answer { _ in Self.answer(rows: [], totals: [], projects: []) }
@@ -746,11 +1046,30 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(model.rows, [])
     }
 
+    /// `reports` broke its one-result-per-query contract: an error, and
+    /// the previous data stays.
+    func test_aResultWithTheWrongNumberOfAnswers_isAnError_andKeepsThePreviousData() async {
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m", "high"])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
+        }
+        let model = makeModel()
+        await model.refresh()
+        let rows = model.rows
+
+        stub.answer { _ in .success([[Self.row(["x", nil])]]) }
+        await model.refresh()
+
+        XCTAssertEqual(model.errorMessage, "The usage ledger returned 1 results for 3 queries.")
+        XCTAssertEqual(model.rows, rows)
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
+        XCTAssertEqual(model.projects, [.root("/a")])
+    }
+
     func test_aPeriodTheCalendarCannotCompute_readsNothing_andKeepsThePreviousData() async {
         env.now = Self.calendarEdgeNow
         XCTAssertNil(UsagePeriod.startMs(lastDays: 30, now: env.now, calendar: env.calendar), "fixture")
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([])], projects: [Self.row(["/a"])])
+            Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
         }
         let model = makeModel()
         model.period = .today
@@ -764,7 +1083,7 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(stub.callCount, 1, "no read, and in particular no all-time read in its place")
         XCTAssertEqual(model.errorMessage, "The selected period could not be computed.")
         XCTAssertEqual(model.rows, rows)
-        XCTAssertEqual(model.totals, Self.row([]))
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
         XCTAssertEqual(model.projects, [.root("/a")])
         XCTAssertFalse(model.isLoading)
     }
@@ -775,7 +1094,7 @@ final class UsageWindowModelTests: XCTestCase {
     /// longer selected nor replace the message.
     private func runOlderRefreshAcrossANilPeriodRefresh(releasing answer: ReportsStub.Answer) async {
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["before", nil])], totals: [Self.row([])], projects: [Self.row(["/before"])])
+            Self.answer(rows: [Self.row(["before", nil])], totals: [Self.row([], input: 1)], projects: [Self.row(["/before"])])
         }
         let model = makeModel()
         model.period = .today
@@ -799,7 +1118,7 @@ final class UsageWindowModelTests: XCTestCase {
         await older.value
 
         XCTAssertEqual(model.rows, rowsBefore)
-        XCTAssertEqual(model.totals, Self.row([]))
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
         XCTAssertEqual(model.projects, [.root("/before")])
         XCTAssertEqual(model.errorMessage, "The selected period could not be computed.")
         XCTAssertFalse(model.isLoading)
@@ -807,7 +1126,7 @@ final class UsageWindowModelTests: XCTestCase {
 
     func test_anOlderRefreshSucceedingAfterANilPeriodRefresh_isDiscarded() async {
         await runOlderRefreshAcrossANilPeriodRefresh(releasing: Self.answer(
-            rows: [Self.row(["stale", "high"])], totals: [Self.row([], responses: 5)],
+            rows: [Self.row(["stale", "high"])], totals: [Self.row([], input: 5)],
             projects: [Self.row(["/stale"])]))
     }
 
@@ -822,7 +1141,7 @@ final class UsageWindowModelTests: XCTestCase {
     /// Shows rows A, then holds the next `reports` call (index 1).
     private func modelShowingRowsA() async -> UsageWindowModel {
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["a", nil])], totals: [Self.row([])], projects: [Self.row(["/a"])])
+            Self.answer(rows: [Self.row(["a", nil])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
         }
         let model = makeModel()
         await model.refresh()
@@ -832,13 +1151,13 @@ final class UsageWindowModelTests: XCTestCase {
     }
 
     private let rowsB = Answer(rows: [UsageWindowModelTests.row(["b", "high"])],
-                               totals: [UsageWindowModelTests.row([], responses: 2)],
+                               totals: [UsageWindowModelTests.row([], input: 2)],
                                projects: [UsageWindowModelTests.row(["/b"])])
 
     private struct Answer {
-        let rows: [UsageRow]
-        let totals: [UsageRow]
-        let projects: [UsageRow]
+        let rows: [UsageTokenRow]
+        let totals: [UsageTokenRow]
+        let projects: [UsageTokenRow]
         var success: ReportsStub.Answer { .success([rows, totals, projects]) }
     }
 
@@ -864,7 +1183,7 @@ final class UsageWindowModelTests: XCTestCase {
         await refresh.value
 
         XCTAssertEqual(modelEffortUsage(model.rows), [["b", "high"]])
-        XCTAssertEqual(model.totals, Self.row([], responses: 2))
+        XCTAssertEqual(model.totals, Self.totals(input: 2))
         XCTAssertEqual(model.projects, [.root("/b")])
         XCTAssertEqual(model.errorMessage, Self.deleteFailure)
         XCTAssertFalse(model.isLoading)
@@ -924,7 +1243,7 @@ final class UsageWindowModelTests: XCTestCase {
     // MARK: - Delete
 
     func test_deleteAllData_deletesThenRefreshes() async {
-        stub.answer { _ in Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([])], projects: []) }
+        stub.answer { _ in Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([], input: 1)], projects: []) }
         let model = makeModel()
         await model.refresh()
 
@@ -940,7 +1259,7 @@ final class UsageWindowModelTests: XCTestCase {
 
     func test_aFailedDelete_showsTheError_doesNotRefresh_andKeepsTheTable() async {
         stub.answer { _ in
-            Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([])], projects: [Self.row(["/a"])])
+            Self.answer(rows: [Self.row(["m", nil])], totals: [Self.row([], input: 1)], projects: [Self.row(["/a"])])
         }
         let model = makeModel()
         await model.refresh()
@@ -953,7 +1272,7 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(stub.events, ["reports", "deleteAll"])
         XCTAssertEqual(model.errorMessage, "Could not delete the usage database.")
         XCTAssertEqual(model.rows, rows)
-        XCTAssertEqual(model.totals, Self.row([]))
+        XCTAssertEqual(model.totals, Self.totals(input: 1))
         XCTAssertEqual(model.projects, [.root("/a")])
     }
 }

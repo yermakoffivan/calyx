@@ -2,8 +2,9 @@
 // Calyx
 //
 // The logic behind the Usage window (`UsageWindowView`): turns the
-// window's three filters into ledger queries, reads them in one call and
-// keeps the newest result. Every dependency is injected, so the rules
+// window's three filters into ledger token queries (`tokenReports`),
+// reads them in one call and keeps the newest result, plus the reception
+// status line. Every dependency is injected, so the rules
 // below are tested without a database, a clock or a time zone of the
 // machine running the tests.
 
@@ -23,20 +24,24 @@ final class UsageWindowModel {
         case unattributed
     }
 
-    /// One table row: the usage of one model at one effort level.
+    /// One table row: Claude Code's token counts of one model at one
+    /// effort level, or the tokens of one model that Calyx did not
+    /// receive (`isUnreported`, effort unknown).
     struct Row: Identifiable, Equatable, Sendable {
         /// Unique within one result and the same for the same
-        /// (model, effort) in every result, so the table keeps its
-        /// selection and scroll position across refreshes.
+        /// (model, effort, unreported) in every result, so the table keeps
+        /// its selection and scroll position across refreshes.
         let id: String
         /// Optional because the ledger's grouping key is `[String?]`; no
         /// stored record has a nil model (`UsageRecord.model` is not
         /// optional), but the key type allows it, and the view shows `—`
         /// rather than assuming it away.
         let model: String?
-        /// nil: the response had no effort.
+        /// nil: no effort was recorded (always nil for an unreported row).
         let effort: String?
-        let usage: UsageRow
+        /// true: tokens Claude Code counted that Calyx did not receive.
+        let isUnreported: Bool
+        let tokens: UsageTokenTotals
     }
 
     /// Shown instead of reading anything when the selected period's
@@ -45,12 +50,14 @@ final class UsageWindowModel {
 
     var period: Period = .last7Days
     var project: ProjectChoice = .all
-    /// nil: every thread.
-    var thread: UsageRecord.Thread? = nil
+    /// nil: every thread; otherwise a thread label ("main", "subagent",
+    /// "auxiliary").
+    var thread: String? = nil
 
     private(set) var rows: [Row] = []
-    /// nil: nothing matched.
-    private(set) var totals: UsageRow? = nil
+    /// The field-by-field saturating sum of the totals query's rows
+    /// (recorded + unreported); nil: the totals query returned no row.
+    private(set) var totals: UsageTokenTotals? = nil
     /// What the project picker offers besides `.all`: each project root
     /// in the ledger's order, then `.unattributed` when unattributed
     /// usage exists. Never filtered by the selection, so it does not
@@ -58,6 +65,8 @@ final class UsageWindowModel {
     private(set) var projects: [ProjectChoice] = []
     private(set) var isTrackingEnabled = false
     private(set) var isLoading = false
+    /// The reception status line; empty: none is shown.
+    private(set) var statusText = ""
     /// The most recent failure: a refresh's read, a period that cannot be
     /// computed, or a delete. A successful refresh clears it only if that
     /// refresh started after the failure; one already running when the
@@ -65,8 +74,9 @@ final class UsageWindowModel {
     private(set) var errorMessage: String? = nil
 
     private let isEnabled: () -> Bool
-    private let reports: @Sendable ([UsageQuery], Calendar) async throws -> [[UsageRow]]
+    private let reports: @Sendable ([UsageTokenQuery], Calendar) async throws -> [[UsageTokenRow]]
     private let deleteAll: @Sendable () async throws -> Void
+    private let readStatusText: () -> String
     private let now: () -> Date
     private let calendar: () -> Calendar
 
@@ -82,14 +92,16 @@ final class UsageWindowModel {
 
     init(
         isEnabled: @escaping () -> Bool,
-        reports: @escaping @Sendable ([UsageQuery], Calendar) async throws -> [[UsageRow]],
+        reports: @escaping @Sendable ([UsageTokenQuery], Calendar) async throws -> [[UsageTokenRow]],
         deleteAll: @escaping @Sendable () async throws -> Void,
+        statusText: @escaping () -> String,
         now: @escaping () -> Date,
         calendar: @escaping () -> Calendar
     ) {
         self.isEnabled = isEnabled
         self.reports = reports
         self.deleteAll = deleteAll
+        self.readStatusText = statusText
         self.now = now
         self.calendar = calendar
     }
@@ -100,9 +112,9 @@ final class UsageWindowModel {
     /// first of its 1, 7 or 30 calendar days, by `UsagePeriod.startMs`,
     /// the rule the MCP tool's `days` uses; All Time has no start.
     static func query(
-        period: Period, project: ProjectChoice, thread: UsageRecord.Thread?,
-        groupBy: [UsageQuery.Dimension], now: Date, calendar: Calendar
-    ) -> UsageQuery? {
+        period: Period, project: ProjectChoice, thread: String?,
+        groupBy: [UsageTokenQuery.Dimension], now: Date, calendar: Calendar
+    ) -> UsageTokenQuery? {
         var sinceMs: Int64? = nil
         if let lastDays = period.lastDays {
             guard let start = UsagePeriod.startMs(lastDays: lastDays, now: now, calendar: calendar) else {
@@ -110,21 +122,22 @@ final class UsageWindowModel {
             }
             sinceMs = start
         }
-        let projectFilter: UsageQuery.ProjectFilter?
+        let projectFilter: UsageTokenQuery.ProjectFilter?
         switch project {
         case .all: projectFilter = nil
         case .root(let path): projectFilter = .root(path)
         case .unattributed: projectFilter = .unattributed
         }
-        return UsageQuery(groupBy: groupBy, sinceMs: sinceMs, project: projectFilter, thread: thread)
+        return UsageTokenQuery(groupBy: groupBy, sinceMs: sinceMs, project: projectFilter, thread: thread)
     }
 
     /// Reads the table, its totals and the project list in exactly one
     /// `reports` call (one reconcile, one consistent read), with the
     /// clock and calendar read now.
     ///
-    /// - `isTrackingEnabled` is updated before the first suspension, so
-    ///   the tracking-off banner never shows while the read is pending.
+    /// - `isTrackingEnabled` and `statusText` are updated before the first
+    ///   suspension (also when the read fails or nothing is read), so the
+    ///   tracking-off banner never shows while the read is pending.
     ///   Stored data is read whether tracking is on or off.
     /// - Latest wins: every call supersedes the ones started before it,
     ///   including a call that reads nothing; a superseded call discards
@@ -138,6 +151,7 @@ final class UsageWindowModel {
         latestRefresh += 1
         let generation = latestRefresh
         isTrackingEnabled = isEnabled()
+        statusText = readStatusText()
 
         let now = now()
         let calendar = calendar()
@@ -152,7 +166,7 @@ final class UsageWindowModel {
             recordFailure(Self.periodUnavailableMessage)
             return
         }
-        let queries = [rowsQuery, totalsQuery, UsageQuery(groupBy: [.project])]
+        let queries = [rowsQuery, totalsQuery, UsageTokenQuery(groupBy: [.project])]
 
         runningRefreshes += 1
         isLoading = true
@@ -161,7 +175,7 @@ final class UsageWindowModel {
             isLoading = runningRefreshes > 0
         }
 
-        let results: [[UsageRow]]
+        let results: [[UsageTokenRow]]
         do {
             results = try await reports(queries, calendar)
         } catch {
@@ -177,7 +191,7 @@ final class UsageWindowModel {
             return
         }
         rows = results[0].map(Self.row)
-        totals = results[1].first
+        totals = Self.saturatingSum(results[1])
         projects = Self.projectChoices(results[2])
         if generation > failureRecordedAtRefresh {
             errorMessage = nil
@@ -199,20 +213,9 @@ final class UsageWindowModel {
         await refresh()
     }
 
-    /// The Final column: the share of responses whose final transcript
-    /// line was written, truncated to a whole percent, so `100%` appears
-    /// only when every response is final; `—` with no responses.
-    /// Computed in integers (a `Double` ratio rounds 10^18 - 1 of 10^18
-    /// up to 100%) over a full-width product, so no `Int64` pair
-    /// overflows; out-of-range counts clamp to 0% and 100%.
-    nonisolated static func finalPercentText(final: Int64, responses: Int64) -> String {
-        guard responses > 0 else { return "\u{2014}" }
-        let clamped = min(max(final, 0), responses)
-        // clamped * 100 fits in 128 bits, and the quotient is at most
-        // 100 because clamped <= responses, so neither step overflows.
-        let product = clamped.multipliedFullWidth(by: 100)
-        let (quotient, _) = responses.dividingFullWidth(product)
-        return "\(quotient)%"
+    /// Reads the reception status line again, and nothing else.
+    func refreshStatus() {
+        statusText = readStatusText()
     }
 
     /// The project picker's label for `root`: the full path with `home`
@@ -227,22 +230,51 @@ final class UsageWindowModel {
         failureRecordedAtRefresh = latestRefresh
     }
 
-    private static func row(_ usage: UsageRow) -> Row {
-        let model = usage.key.first.flatMap { $0 }
-        let effort = usage.key.dropFirst().first.flatMap { $0 }
-        return Row(id: rowID(model: model, effort: effort), model: model, effort: effort, usage: usage)
+    private static func row(_ source: UsageTokenRow) -> Row {
+        let model = source.key.first.flatMap { $0 }
+        let effort = source.key.dropFirst().first.flatMap { $0 }
+        return Row(
+            id: rowID(model: model, effort: effort, isUnreported: source.isUnreported),
+            model: model, effort: effort, isUnreported: source.isUnreported, tokens: tokens(of: source))
     }
 
-    /// Length-prefixed, so nil, "" and any string content give distinct ids.
-    private static func rowID(model: String?, effort: String?) -> String {
-        [model, effort]
+    private static func tokens(of row: UsageTokenRow) -> UsageTokenTotals {
+        UsageTokenTotals(
+            input: row.inputTokens, output: row.outputTokens,
+            cacheRead: row.cacheReadTokens, cacheCreation: row.cacheCreationTokens)
+    }
+
+    /// Length-prefixed, so nil, "" and any string content give distinct
+    /// ids; the unreported flag is a final element of its own.
+    private static func rowID(model: String?, effort: String?, isUnreported: Bool) -> String {
+        let elements = [model, effort]
             .map { element in element.map { "\($0.count):\($0)" } ?? "-" }
-            .joined(separator: ",")
+        return (elements + [isUnreported ? "u" : "r"]).joined(separator: ",")
     }
 
-    private static func projectChoices(_ rows: [UsageRow]) -> [ProjectChoice] {
+    /// Field by field, each saturating at `Int64.max` (and `Int64.min`);
+    /// nil for no rows.
+    private static func saturatingSum(_ rows: [UsageTokenRow]) -> UsageTokenTotals? {
+        guard !rows.isEmpty else { return nil }
+        return rows.map(tokens(of:)).reduce(into: UsageTokenTotals()) { sum, next in
+            for kind in UsageTokenKind.allCases {
+                sum[kind] = saturatingAdd(sum[kind], next[kind])
+            }
+        }
+    }
+
+    private static func saturatingAdd(_ a: Int64, _ b: Int64) -> Int64 {
+        let (result, overflow) = a.addingReportingOverflow(b)
+        guard overflow else { return result }
+        return b > 0 ? Int64.max : Int64.min
+    }
+
+    /// Each root once, in the ledger's order (a root may come from a
+    /// recorded and an unreported row), then `.unattributed`.
+    private static func projectChoices(_ rows: [UsageTokenRow]) -> [ProjectChoice] {
         let keys = rows.map { $0.key.first.flatMap { $0 } }
-        let roots: [ProjectChoice] = keys.compactMap { $0 }.map { .root($0) }
+        var seen = Set<String>()
+        let roots: [ProjectChoice] = keys.compactMap { $0 }.filter { seen.insert($0).inserted }.map { .root($0) }
         return keys.contains(nil) ? roots + [.unattributed] : roots
     }
 

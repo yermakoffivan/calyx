@@ -334,5 +334,6 @@ enum AccessibilityID {
         static let deleteButton = "calyx.usage.deleteButton"
         static let trackingOffBanner = "calyx.usage.trackingOffBanner"
         static let footnote = "calyx.usage.footnote"
+        static let statusLine = "calyx.usage.statusLine"
     }
 }

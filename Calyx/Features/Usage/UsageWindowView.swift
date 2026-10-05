@@ -1,9 +1,11 @@
 // UsageWindowView.swift
 // Calyx
 //
-// SwiftUI content view for `UsageWindowController`: three filters, a
-// model x effort table with a totals row, and the notes a reader needs
-// to compare these numbers with Claude Code's own. Every read goes
+// SwiftUI content view for `UsageWindowController`: three filters, the
+// reception status line, a model x effort table of Claude Code's own
+// token counts with a totals row, and the note on how to read it. Its
+// texts and row mapping are the static members below (pinned by
+// `UsageWindowViewPinsTests`); the body is built from them. Every read goes
 // through `UsageWindowModel.refresh()`; the view calls it whenever a
 // filter changes, the model never does so by itself.
 
@@ -17,6 +19,13 @@ struct UsageWindowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             filterRow
+            if let statusLine = Self.statusLine(for: model.statusText) {
+                Text(statusLine)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier(AccessibilityID.Usage.statusLine)
+            }
             if !model.isTrackingEnabled {
                 trackingOffBanner
             }
@@ -26,7 +35,7 @@ struct UsageWindowView: View {
                     .textSelection(.enabled)
             }
             if model.rows.isEmpty && model.errorMessage == nil {
-                Text("No usage recorded for this selection.")
+                Text(Self.emptyStateText)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -57,17 +66,94 @@ struct UsageWindowView: View {
                 Task { await model.deleteAllData() }
             }
         } message: {
-            Text(
-                "All recorded usage is deleted. While Usage Tracking is on, sessions that are still running are "
-                    + "read again from the start of their transcripts at their next event, so their usage reappears."
-            )
+            Text(Self.deleteDialogMessage)
         }
     }
 
-    private static let footnote =
-        "Output and thinking count only responses whose final transcript line was written (see the Final "
-        + "column). Requests Claude Code does not write to its transcript are not included, so these numbers "
-        + "are lower than Claude Code's own session totals (output by roughly 1\u{2013}3%, cache reads by more)."
+    // MARK: - Texts and row mapping
+
+    /// The table's column titles, in order.
+    enum Column {
+        static let model = "Model"
+        static let effort = "Effort"
+        static let input = "Input"
+        static let cacheRead = "Cache Read"
+        static let cacheWrite = "Cache Write"
+        static let output = "Output"
+    }
+
+    static let columnTitles = [
+        Column.model, Column.effort, Column.input, Column.cacheRead, Column.cacheWrite, Column.output,
+    ]
+
+    static let footnote =
+        "Token counts are Claude Code's own, received while Calyx is running. Rows marked unreported are "
+        + "tokens Claude Code counted in a tracked session that Calyx did not receive (for example because "
+        + "it was not running); their effort is not known. Thinking tokens are part of Output."
+
+    static let deleteDialogMessage =
+        "All recorded usage is deleted. Sessions that are still running are counted from now on; what they "
+        + "used before is not restored."
+
+    static let trackingOffText = "Usage tracking is off (Settings > Agents > Usage Tracking). Stored data is shown."
+
+    static let emptyStateText = "No usage recorded for this selection."
+
+    /// What an unreported row shows in the Effort column.
+    static let unreportedEffortText = "unreported"
+
+    /// Shown for a missing model or effort.
+    private static let missingText = "\u{2014}"
+
+    /// The totals line's Model column.
+    private static let totalText = "Total"
+
+    /// One entry of the thread picker: its title and the thread label it
+    /// filters by (nil: every thread).
+    struct ThreadChoice: Hashable {
+        let title: String
+        let thread: String?
+    }
+
+    static let threadChoices = [
+        ThreadChoice(title: "All", thread: nil),
+        ThreadChoice(title: "Main", thread: "main"),
+        ThreadChoice(title: "Subagents", thread: "subagent"),
+        ThreadChoice(title: "Auxiliary", thread: "auxiliary"),
+    ]
+
+    static func modelText(for row: UsageWindowModel.Row) -> String {
+        row.model ?? missingText
+    }
+
+    static func effortText(for row: UsageWindowModel.Row) -> String {
+        row.isUnreported ? unreportedEffortText : (row.effort ?? missingText)
+    }
+
+    /// A table line: one row, or the totals.
+    struct Line: Identifiable, Equatable {
+        let id: String
+        let model: String
+        let effort: String
+        let tokens: UsageTokenTotals
+        let isTotal: Bool
+    }
+
+    /// The rows in order, then the totals line when there are totals.
+    static func tableLines(rows: [UsageWindowModel.Row], totals: UsageTokenTotals?) -> [Line] {
+        let rowLines = rows.map { row in
+            Line(
+                id: "row:" + row.id, model: modelText(for: row), effort: effortText(for: row),
+                tokens: row.tokens, isTotal: false)
+        }
+        guard let totals else { return rowLines }
+        return rowLines + [Line(id: "total", model: totalText, effort: "", tokens: totals, isTotal: true)]
+    }
+
+    /// The status line's text; nil (no line) for an empty status.
+    static func statusLine(for statusText: String) -> String? {
+        statusText.isEmpty ? nil : statusText
+    }
 
     private func refresh() {
         Task { await model.refresh() }
@@ -93,10 +179,9 @@ struct UsageWindowView: View {
             .accessibilityIdentifier(AccessibilityID.Usage.projectPicker)
 
             Picker("Thread", selection: $model.thread) {
-                Text("All").tag(UsageRecord.Thread?.none)
-                Text("Main").tag(UsageRecord.Thread?.some(.main))
-                Text("Subagents").tag(UsageRecord.Thread?.some(.subagent))
-                Text("Advisor").tag(UsageRecord.Thread?.some(.advisor))
+                ForEach(Self.threadChoices, id: \.self) { choice in
+                    Text(choice.title).tag(choice.thread)
+                }
             }
             .fixedSize()
             .accessibilityIdentifier(AccessibilityID.Usage.threadPicker)
@@ -135,7 +220,7 @@ struct UsageWindowView: View {
         HStack(spacing: 10) {
             Image(systemName: "pause.circle")
                 .foregroundStyle(.secondary)
-            Text("Usage tracking is off (Settings > Agents > Usage Tracking). Stored data is shown.")
+            Text(Self.trackingOffText)
             Spacer()
             Button("Open Settings") {
                 SettingsWindowController.shared.showSettings()
@@ -162,57 +247,29 @@ extension UsageWindowModel.Period {
 /// The model x effort table, its last line the totals of the selection.
 private struct UsageTable: View {
     let rows: [UsageWindowModel.Row]
-    let totals: UsageRow?
+    let totals: UsageTokenTotals?
 
-    /// A table line: one model x effort row, or the totals.
-    private struct Line: Identifiable {
-        let id: String
-        let model: String
-        let effort: String
-        let usage: UsageRow
-        let isTotal: Bool
-    }
-
-    private var lines: [Line] {
-        let rowLines = rows.map { row in
-            Line(
-                id: "row:" + row.id, model: row.model ?? "\u{2014}", effort: row.effort ?? "\u{2014}",
-                usage: row.usage, isTotal: false)
-        }
-        guard let totals else { return rowLines }
-        return rowLines + [Line(id: "total", model: "Total", effort: "", usage: totals, isTotal: true)]
-    }
+    private typealias Column = UsageWindowView.Column
 
     var body: some View {
-        Table(lines) {
-            TableColumn("Model") { line in cell(line.model, line) }
-            TableColumn("Effort") { line in cell(line.effort, line) }
-                .width(min: 50, ideal: 70)
-            TableColumn("Responses") { line in number(line.usage.responses, line) }
-            TableColumn("Input") { line in number(line.usage.inputTokens, line) }
-            TableColumn("Cache Read") { line in number(line.usage.cacheReadTokens, line) }
-            TableColumn("Cache Write") { line in number(line.usage.cacheCreationTokens, line) }
-            TableColumn("Output") { line in number(line.usage.outputTokensFinal, line) }
-            TableColumn("Thinking") { line in number(line.usage.thinkingTokensFinal, line) }
-            TableColumn("Final") { line in
-                cell(
-                    UsageWindowModel.finalPercentText(
-                        final: line.usage.finalResponses, responses: line.usage.responses),
-                    line
-                )
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .width(min: 44, ideal: 52)
+        Table(UsageWindowView.tableLines(rows: rows, totals: totals)) {
+            TableColumn(Column.model) { line in cell(line.model, line) }
+            TableColumn(Column.effort) { line in cell(line.effort, line) }
+                .width(min: 50, ideal: 80)
+            TableColumn(Column.input) { line in number(line.tokens.input, line) }
+            TableColumn(Column.cacheRead) { line in number(line.tokens.cacheRead, line) }
+            TableColumn(Column.cacheWrite) { line in number(line.tokens.cacheCreation, line) }
+            TableColumn(Column.output) { line in number(line.tokens.output, line) }
         }
         .accessibilityIdentifier(AccessibilityID.Usage.table)
     }
 
-    private func cell(_ text: String, _ line: Line) -> some View {
+    private func cell(_ text: String, _ line: UsageWindowView.Line) -> some View {
         Text(text).fontWeight(line.isTotal ? .semibold : .regular)
     }
 
     /// Grouped by the locale's convention and right-aligned.
-    private func number(_ value: Int64, _ line: Line) -> some View {
+    private func number(_ value: Int64, _ line: UsageWindowView.Line) -> some View {
         cell(value.formatted(.number.grouping(.automatic)), line)
             .monospacedDigit()
             .frame(maxWidth: .infinity, alignment: .trailing)
