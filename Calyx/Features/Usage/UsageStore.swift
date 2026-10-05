@@ -3,12 +3,16 @@
 //
 // The Silver layer of the usage ledger: one row per API response
 // (UsageRecord), per-session metadata, and per-transcript-file read
-// checkpoints, in a SQLite database. SQLite rather than the JSON documents
+// checkpoints, in a SQLite database. Schema version 2 adds the telemetry
+// side: per-series baselines of Claude Code's cumulative token metric,
+// the per-minute token points their increments are added to, the process
+// starts, and the time tracking started from. SQLite rather than the JSON documents
 // used elsewhere because a batch -- records, session meta and the file
 // checkpoint -- must commit atomically on every agent turn, and the data
 // only grows. The store touches nothing outside its own directory; later
 // slices resolve transcript paths and project roots and pass them in.
 
+import CryptoKit
 import Foundation
 import SQLite3
 
@@ -93,11 +97,15 @@ actor UsageStore {
     static let databaseFileName = "usage.sqlite"
 
     /// The schema this build reads and writes (`PRAGMA user_version`).
-    private static let schemaVersion: Int64 = 1
+    private static let schemaVersion: Int64 = 2
 
     /// nil once closed. Never leaves the actor: SQLiteConnection is not
     /// Sendable, and the actor is what serializes access to it.
     private var connection: SQLiteConnection?
+
+    /// The store's clock: read when tracking starts (a new database, the
+    /// migration from version 1, `deleteAll`). Injected so tests can pin it.
+    private let now: @Sendable () -> Date
 
     /// Opens the database in `directory`, creating both as needed.
     ///
@@ -110,11 +118,22 @@ actor UsageStore {
     ///   newer schema version, claims this version without having the
     ///   store's tables and columns, fails `PRAGMA quick_check`, or is a
     ///   symbolic link (never followed) is moved aside to
-    ///   `usage.sqlite.corrupt-<suffix>` and a fresh database is created:
-    ///   Silver can be rebuilt from the transcripts, and refusing to start
-    ///   would be worse than starting empty.
+    ///   `usage.sqlite.corrupt-<suffix>` and a fresh database is created.
+    ///   The version-1 tables can be rebuilt from the transcripts; the
+    ///   telemetry tables (series, points, process starts) cannot: their
+    ///   source is exports Claude Code sends once, so what a moved-aside
+    ///   file held is lost from the ledger (it stays in the moved file).
+    ///   Refusing to start would still be worse than starting empty.
+    /// - A version-1 database is migrated in place; it and a new database
+    ///   get `tracked_from_ns` = `now()` at that moment.
+    init(directory: URL, now: @escaping @Sendable () -> Date) throws {
+        self.now = now
+        connection = try Self.openDatabase(in: directory, now: now)
+    }
+
+    /// As `init(directory:now:)` with the system clock.
     init(directory: URL) throws {
-        connection = try Self.openDatabase(in: directory)
+        try self.init(directory: directory, now: { Date() })
     }
 
     /// Applies one batch in ONE transaction; any failure rolls back all of
@@ -241,13 +260,21 @@ actor UsageStore {
         return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
-    /// Removes every record, session and checkpoint in one transaction.
-    /// The store stays open and usable.
+    /// Removes every record, session, checkpoint, point and series
+    /// baseline in one transaction and restarts tracking at the store's
+    /// clock (see `restartTracking`). The processes heard so far are
+    /// retired, so their later exports only set baselines and deleted
+    /// usage never comes back; only their digests remain. The store stays
+    /// open and usable.
     func deleteAll() throws {
         let connection = try openConnection()
+        let trackedFrom = Self.nanoseconds(now())
         try connection.transaction {
-            try connection.execute(
-                "DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files;")
+            try connection.execute("""
+                DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files; \
+                DELETE FROM usage_points;
+                """)
+            try Self.restartTracking(at: trackedFrom, connection: connection)
         }
     }
 
@@ -306,16 +333,88 @@ actor UsageStore {
         ) WITHOUT ROWID;
         """
 
+    /// Version 2 adds these to version 1's tables, unchanged. A new
+    /// database runs the version-1 and then this step, so the tables have
+    /// a single definition whether created fresh or by migration.
+    ///
+    /// - `usage_series`: one baseline per `(session_id, series_id, start_ns)`:
+    ///   `last_value` / `last_time_ns` are the sender's values, used only
+    ///   to order the series' samples; `kind` and `model` are those of
+    ///   the first sample, `first_heard_ns` its receive time.
+    /// - `usage_points`: token sums per session, minute of the receive
+    ///   time (since the epoch) and label group. A nil effort / thread / agent is stored as NULL,
+    ///   and SQLite treats NULLs as distinct in a UNIQUE constraint, so
+    ///   the uniqueness is declared on `coalesce(label, 0)`: NULL becomes
+    ///   the INTEGER 0, which never equals any TEXT (not even '0'), so all
+    ///   nil labels form one group of their own. The store finds a group
+    ///   with `IS` (NULL-safe equality); the index guards that no second
+    ///   row of a group can ever be inserted.
+    /// - `usage_process_starts`: the processes heard since tracking last
+    ///   (re)started ("active"), one row per start of a session.
+    /// - `usage_retired_processes`: the processes heard before a restart
+    ///   of tracking, and those whose export was ignored inside the
+    ///   settling window because they predate tracking, as digests only, so the table holds no readable
+    ///   identifier. Never deleted: a retired process must predate
+    ///   tracking whatever any clock says.
+    /// - `usage_meta`: `tracked_from_ns`, the time tracking started from.
+    private static let schemaV2Additions = """
+        CREATE TABLE usage_series (
+            session_id TEXT NOT NULL,
+            series_id TEXT NOT NULL,
+            start_ns INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            model TEXT NOT NULL,
+            last_value INTEGER NOT NULL,
+            last_time_ns INTEGER NOT NULL,
+            first_heard_ns INTEGER NOT NULL,
+            PRIMARY KEY (session_id, series_id, start_ns)
+        ) WITHOUT ROWID;
+        CREATE TABLE usage_points (
+            session_id TEXT NOT NULL,
+            minute INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            effort TEXT,
+            thread TEXT,
+            agent TEXT,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cache_read_tokens INTEGER NOT NULL,
+            cache_creation_tokens INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX usage_points_group ON usage_points (
+            session_id, minute, model, coalesce(effort, 0), coalesce(thread, 0), coalesce(agent, 0));
+        CREATE TABLE usage_process_starts (
+            session_id TEXT NOT NULL,
+            start_ns INTEGER NOT NULL,
+            start_type TEXT,
+            PRIMARY KEY (session_id, start_ns)
+        ) WITHOUT ROWID;
+        CREATE TABLE usage_retired_processes (
+            digest TEXT NOT NULL PRIMARY KEY
+        ) WITHOUT ROWID;
+        CREATE TABLE usage_meta (
+            key TEXT NOT NULL PRIMARY KEY,
+            value INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        """
+
     /// Brings a database at `version` up to `schemaVersion`, one step per
     /// version, all in one transaction with the version bump, so a crash
     /// cannot leave a half-migrated file that claims either version.
-    private static func migrate(_ connection: SQLiteConnection, from version: Int64) throws {
+    private static func migrate(
+        _ connection: SQLiteConnection, from version: Int64, now: @Sendable () -> Date
+    ) throws {
         guard version < schemaVersion else { return }
         try connection.transaction {
             if version < 1 {
                 try connection.execute(schemaV1)
             }
-            // A version 2 step goes here: `if version < 2 { ... }`.
+            if version < 2 {
+                try connection.execute(schemaV2Additions)
+                // Tracking starts now: whatever running processes counted
+                // before this moment only sets their baselines.
+                try setTrackedFrom(nanoseconds(now()), connection: connection)
+            }
             try connection.execute("PRAGMA user_version = \(schemaVersion)")
         }
     }
@@ -326,6 +425,9 @@ actor UsageStore {
     private static let fixedStatements = [
         selectRecordSQL, selectSessionRecordsSQL, writeRecordSQL,
         upsertSessionSQL, selectSessionsSQL, selectSessionSQL, upsertFileSQL, selectFileSQL,
+        selectSeriesSQL, insertSeriesSQL, updateSeriesSQL, selectPointSQL, insertPointSQL, updatePointSQL,
+        insertProcessStartSQL, selectProcessStartSQL, selectRetiredSQL, insertRetiredSQL, countRetiredSQL, selectTrackedFromSQL, upsertTrackedFromSQL,
+        selectPointRowsSQL, selectSeriesRowsSQL, selectProcessStartsSQL,
     ]
 
     /// Migrates, then proves the result is the schema this build uses by
@@ -340,9 +442,11 @@ actor UsageStore {
     /// already exists" for a file holding a clashing table -- so only it
     /// becomes `incompatibleSchema`. An I/O or lock error has its own code
     /// and propagates untouched; it must never cost a healthy database.
-    private static func migrateAndValidate(_ connection: SQLiteConnection, from version: Int64) throws {
+    private static func migrateAndValidate(
+        _ connection: SQLiteConnection, from version: Int64, now: @Sendable () -> Date
+    ) throws {
         do {
-            try migrate(connection, from: version)
+            try migrate(connection, from: version, now: now)
             for sql in fixedStatements {
                 try connection.withStatement(sql) { _ in }
             }
@@ -359,8 +463,13 @@ actor UsageStore {
     /// at open instead: one scan per launch (about 10 MB at the measured
     /// transcript volume), cheap next to never recovering. `quick_check`
     /// rather than `integrity_check` because the latter's extra work
-    /// (index-against-table comparison) costs more and guards nothing the
-    /// store cannot rebuild from the transcripts.
+    /// (index-against-table comparison) costs more for little gain here.
+    ///
+    /// A file that fails is moved aside. That loses its telemetry points
+    /// for good (the version-1 tables can be rebuilt from the transcripts;
+    /// the points, series and process starts cannot), but it is still the
+    /// rule: a database that fails its integrity check cannot be trusted
+    /// to answer at all.
     ///
     /// Damage is REPORTED as result rows, so anything but the single row
     /// "ok" is `integrityCheckFailed`. A SQLITE_CORRUPT thrown by the
@@ -379,7 +488,7 @@ actor UsageStore {
 
     // MARK: - Opening
 
-    private static func openDatabase(in directory: URL) throws -> SQLiteConnection {
+    private static func openDatabase(in directory: URL, now: @Sendable () -> Date) throws -> SQLiteConnection {
         let fileManager = FileManager.default
         try fileManager.createDirectory(
             at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -406,11 +515,11 @@ actor UsageStore {
         }
         try ensureOwnerOnlyFile(atPath: path)
         do {
-            return try openAndMigrate(path: path)
+            return try openAndMigrate(path: path, now: now)
         } catch where isUnusableDatabase(error) {
             try moveAside(path)
             try ensureOwnerOnlyFile(atPath: path)
-            return try openAndMigrate(path: path)
+            return try openAndMigrate(path: path, now: now)
         }
     }
 
@@ -462,7 +571,7 @@ actor UsageStore {
     /// schema is then migrated and validated, the content is checked, and
     /// only a database that passed is switched to WAL, so a file about to
     /// be moved aside is not rewritten first.
-    private static func openAndMigrate(path: String) throws -> SQLiteConnection {
+    private static func openAndMigrate(path: String, now: @Sendable () -> Date) throws -> SQLiteConnection {
         let connection = try SQLiteConnection(path: path)
         do {
             let version = try connection.withTransientStatement("PRAGMA user_version") { statement in
@@ -473,12 +582,22 @@ actor UsageStore {
                 throw UsageStoreError.unsupportedSchemaVersion(version)
             }
             try connection.disablePersistentWAL()
-            try migrateAndValidate(connection, from: version)
+            try migrateAndValidate(connection, from: version, now: now)
             try checkIntegrity(connection)
             // WAL: readers (reports) do not block the per-turn writer.
             // NORMAL: in WAL mode a power loss can lose the last commits
-            // but not corrupt the file, and lost Silver is re-read from
-            // the transcripts.
+            // but not corrupt the file. Lost version-1 rows are re-read
+            // from the transcripts. For the telemetry tables, `apply`
+            // moves a series' baseline (`last_value`) in the same
+            // transaction as the points it adds to, so both roll back
+            // together: the next accepted export of a still-running
+            // process adds the lost increment again, in the minute it is
+            // received. Two cases lose it for good: a process that has
+            // exited sends no further export, and if the lost commit was
+            // the first, baseline-only one of a process that predates
+            // tracking, its next export is baseline-only again, so the
+            // growth between the two is not added although the process
+            // is still running.
             try connection.execute("PRAGMA journal_mode = WAL")
             try connection.execute("PRAGMA synchronous = NORMAL")
             return connection
@@ -614,3 +733,551 @@ actor UsageStore {
 /// The actor's synchronous methods satisfy the protocol's `async`
 /// requirements as they are; the ingestor reaches the store through this.
 extension UsageStore: UsageBatchStoring {}
+
+// MARK: - Token series (schema version 2)
+
+/// The tokens of one session, minute and label group. `minute` is minutes
+/// since the epoch of the time Calyx RECEIVED the export (floor-divided
+/// by 60 s), never the sender's own timestamp.
+struct UsagePointRow: Sendable, Equatable {
+    let sessionID: String
+    let minute: Int64
+    let model: String
+    let effort: String?
+    let thread: String?
+    let agent: String?
+    let inputTokens: Int64
+    let outputTokens: Int64
+    let cacheReadTokens: Int64
+    let cacheCreationTokens: Int64
+}
+
+/// What one `apply(samples:processStarts:receivedAtNs:)` did.
+struct UsageSeriesApplyOutcome: Sendable, Equatable {
+    /// The whole call was ignored: it did not carry exactly one process
+    /// start, was received before tracking started (both store nothing),
+    /// or came from a process that predates tracking inside the settling
+    /// window (only that process's retired digest is stored).
+    var ignored = false
+    /// First sample of a series that counts in full: its whole value was
+    /// added.
+    var newSeries = 0
+    /// First sample of a series that may hold usage from before tracking:
+    /// nothing added.
+    var baselineOnly = 0
+    /// A later sample with a larger value: the difference was added and
+    /// the baseline moved.
+    var advancedSeries = 0
+    /// A later sample with the same value: nothing added, nothing written
+    /// (the series keeps its `last_time_ns`).
+    var unchangedSamples = 0
+    /// `timeNs` <= the series' `last_time_ns`: ignored.
+    var staleSamples = 0
+    /// A later sample with a smaller value: nothing added, nothing written
+    /// (the series keeps its largest value and its time).
+    var regressions = 0
+    /// Tokens added by this call (saturating at Int64.max); kinds with 0
+    /// omitted.
+    var added: [UsageTokenKind: Int64] = [:]
+}
+
+/// The stored baseline of one series.
+struct UsageSeriesRow: Sendable, Equatable {
+    let sessionID: String
+    let seriesID: String
+    let startNs: Int64
+    let kind: UsageTokenKind
+    let model: String
+    /// The sender's values, used only to order samples of this series.
+    let lastValue: Int64
+    let lastTimeNs: Int64
+    /// The receive time of the series' first sample; never moved.
+    let firstHeardNs: Int64
+}
+
+extension UsageStore {
+    /// How long after tracking (re)starts exports of processes that were
+    /// already running are ignored: longer than the exporter's delivery
+    /// timeout (10 s by default; it never retries a refused connection),
+    /// so a late delivery of an old export cannot set a baseline.
+    static let trackingSettleNs: Int64 = 15_000_000_000
+
+    /// Applies one decoded export, received at `receivedAtNs` (Calyx's
+    /// clock), in ONE transaction; any failure rolls back all of it and is
+    /// rethrown. Both arrays empty is a no-op (not "ignored").
+    ///
+    /// - The whole call is ignored (`ignored`) when it does not carry
+    ///   exactly one process start (every real export does) or was
+    ///   received before `tracked_from_ns`; then nothing is stored. It is
+    ///   also ignored when its process predates tracking and the call
+    ///   arrived within `trackingSettleNs` of `tracked_from_ns` (it may
+    ///   have been produced before tracking (re)started and delivered
+    ///   late); then only the process's digest is retired, so a later
+    ///   restart still knows it was heard, whatever the clock says then.
+    /// - A process predates tracking when it is not active and either was
+    ///   retired by a restart (identity, not clocks, decides) or started
+    ///   before `tracked_from_ns`. Whether it was active is noted before
+    ///   it is stored as active; a stored row keeps its first `startType`.
+    /// - Each series reports a cumulative count, so only growth since the
+    ///   stored baseline is new usage, and a sample at or before the
+    ///   baseline's time is stale. Only growth is ever written: a later
+    ///   sample with a larger value adds the difference and moves the
+    ///   baseline; one with the same or a smaller value is left alone. So
+    ///   the stored value is always the largest seen, what a series counts
+    ///   can never exceed it whatever the order of arrival, and an idle
+    ///   process re-sending its series every few seconds writes nothing.
+    ///   Samples are applied in ascending `timeNs` (ties keep input order).
+    /// - A series heard for the first time counts in full when its process
+    ///   was already active (it appeared between two tracked exports) or
+    ///   does not predate tracking; otherwise it only sets its baseline.
+    /// - Increments land in the minute of `receivedAtNs`. Sums saturate at
+    ///   Int64.max instead of failing, so one absurd series cannot block
+    ///   every later export of its process.
+    func apply(
+        samples: [UsageSeriesSample], processStarts: [UsageProcessStart] = [], receivedAtNs: Int64
+    ) throws -> UsageSeriesApplyOutcome {
+        let connection = try openConnection()
+        var outcome = UsageSeriesApplyOutcome()
+        guard !samples.isEmpty || !processStarts.isEmpty else { return outcome }
+        guard processStarts.count == 1, let process = processStarts.first else {
+            outcome.ignored = true
+            return outcome
+        }
+
+        let minute = Self.minute(ofNs: receivedAtNs)
+        // `sorted` is not stable, so the input position breaks ties.
+        let ordered = samples.enumerated()
+            .sorted { ($0.element.timeNs, $0.offset) < ($1.element.timeNs, $1.offset) }
+            .map(\.element)
+
+        try connection.transaction {
+            let trackedFrom = try Self.trackedFrom(connection: connection)
+            guard receivedAtNs >= trackedFrom else {
+                outcome.ignored = true
+                return
+            }
+            // Noted before the process is stored as active.
+            let wasActive = try Self.isActive(process, connection: connection)
+            let predatesTracking = try !wasActive
+                && (Self.isRetired(process, connection: connection) || process.startNs < trackedFrom)
+            if predatesTracking, receivedAtNs < Self.saturatingSum(trackedFrom, Self.trackingSettleNs) {
+                // Remembered by identity now: it may be heard only inside
+                // this window before the next restart.
+                try Self.retire(process, connection: connection)
+                outcome.ignored = true
+                return
+            }
+
+            try connection.withStatement(Self.insertProcessStartSQL) { statement in
+                try statement.bind(process.sessionID, at: 1)
+                try statement.bind(process.startNs, at: 2)
+                try statement.bind(process.startType, at: 3)
+                _ = try statement.step()
+            }
+
+            let countsInFull = wasActive || !predatesTracking
+            for sample in ordered {
+                let amount: Int64
+                if let baseline = try Self.seriesBaseline(of: sample, connection: connection) {
+                    guard sample.timeNs > baseline.lastTimeNs else {
+                        outcome.staleSamples += 1
+                        continue
+                    }
+                    if sample.value == baseline.lastValue {
+                        outcome.unchangedSamples += 1
+                        continue
+                    } else if sample.value > baseline.lastValue {
+                        amount = Self.saturatingDifference(sample.value, baseline.lastValue)
+                        outcome.advancedSeries += 1
+                    } else {
+                        // Never written: the stored value stays the largest
+                        // seen, so a late smaller sample cannot lower the
+                        // baseline and let the same growth count twice.
+                        outcome.regressions += 1
+                        continue
+                    }
+                    try Self.updateSeries(with: sample, connection: connection)
+                } else {
+                    if countsInFull {
+                        amount = sample.value
+                        outcome.newSeries += 1
+                    } else {
+                        amount = 0
+                        outcome.baselineOnly += 1
+                    }
+                    try Self.insertSeries(sample, firstHeardNs: receivedAtNs, connection: connection)
+                }
+                guard amount != 0 else { continue }
+                try Self.addToPoint(amount, of: sample, minute: minute, connection: connection)
+                outcome.added[sample.kind] = Self.saturatingSum(outcome.added[sample.kind] ?? 0, amount)
+            }
+        }
+        return outcome
+    }
+
+    /// Every point row, ordered by (sessionID, minute, model, effort,
+    /// thread, agent); nil sorts before any string (SQLite orders NULL
+    /// first).
+    func pointRows() throws -> [UsagePointRow] {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectPointRowsSQL) { statement in
+            var rows: [UsagePointRow] = []
+            while try statement.step() {
+                guard let sessionID = statement.text(at: 0), let model = statement.text(at: 2) else {
+                    throw UsageStoreError.malformedRow
+                }
+                rows.append(UsagePointRow(
+                    sessionID: sessionID, minute: statement.int64(at: 1), model: model,
+                    effort: statement.text(at: 3), thread: statement.text(at: 4), agent: statement.text(at: 5),
+                    inputTokens: statement.int64(at: 6), outputTokens: statement.int64(at: 7),
+                    cacheReadTokens: statement.int64(at: 8), cacheCreationTokens: statement.int64(at: 9)))
+            }
+            return rows
+        }
+    }
+
+    /// Every series baseline, ordered by (sessionID, startNs, seriesID).
+    func seriesRows() throws -> [UsageSeriesRow] {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectSeriesRowsSQL) { statement in
+            var rows: [UsageSeriesRow] = []
+            while try statement.step() {
+                guard let sessionID = statement.text(at: 0), let seriesID = statement.text(at: 1),
+                      let kindName = statement.text(at: 3), let kind = UsageTokenKind(rawValue: kindName),
+                      let model = statement.text(at: 4) else {
+                    throw UsageStoreError.malformedRow
+                }
+                rows.append(UsageSeriesRow(
+                    sessionID: sessionID, seriesID: seriesID, startNs: statement.int64(at: 2), kind: kind,
+                    model: model, lastValue: statement.int64(at: 5), lastTimeNs: statement.int64(at: 6),
+                    firstHeardNs: statement.int64(at: 7)))
+            }
+            return rows
+        }
+    }
+
+    /// Every active process (heard since tracking last (re)started),
+    /// ordered by (sessionID, startNs).
+    func processStarts() throws -> [UsageProcessStart] {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectProcessStartsSQL) { statement in
+            var starts: [UsageProcessStart] = []
+            while try statement.step() {
+                guard let sessionID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+                starts.append(UsageProcessStart(
+                    sessionID: sessionID, startNs: statement.int64(at: 1), startType: statement.text(at: 2)))
+            }
+            return starts
+        }
+    }
+
+    /// The time tracking started from, in nanoseconds since the epoch.
+    func trackedFromNs() throws -> Int64 {
+        let connection = try openConnection()
+        return try Self.trackedFrom(connection: connection)
+    }
+
+    /// How many retired processes are remembered (as digests).
+    func retiredProcessCount() throws -> Int {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.countRetiredSQL) { statement in
+            guard try statement.step() else { throw UsageStoreError.malformedRow }
+            return Int(statement.int64(at: 0))
+        }
+    }
+
+    /// Restarts tracking at the store's clock (see `restartTracking`); the
+    /// points are kept. Called when tracking is switched on, so usage from
+    /// while it was off is never added.
+    func resetTracking() throws {
+        let connection = try openConnection()
+        let trackedFrom = Self.nanoseconds(now())
+        try connection.transaction {
+            try Self.restartTracking(at: trackedFrom, connection: connection)
+        }
+    }
+
+    // MARK: - Series helpers
+
+    private static let nanosecondsPerMinute: Int64 = 60_000_000_000
+    private static let trackedFromKey = "tracked_from_ns"
+
+    /// `date` in whole nanoseconds since the epoch, truncated toward zero
+    /// and saturated to Int64's range, so it never throws and never traps
+    /// (`Date.distantFuture` / `distantPast` are legal clocks). A
+    /// non-finite clock reads as `Int64.max`: nothing counts as tracked,
+    /// the safe side for a clock that cannot be trusted. The single
+    /// conversion for every place the store reads its clock.
+    private static func nanoseconds(_ date: Date) -> Int64 {
+        let nanoseconds = (date.timeIntervalSince1970 * 1_000_000_000).rounded(.towardZero)
+        guard nanoseconds.isFinite else { return Int64.max }
+        // Exact bounds: -2^63 is Int64.min, and 2^63 is the first double
+        // above Int64.max (`Double(Int64.max)` rounds up to it), so the
+        // conversion below only sees values it can represent.
+        if nanoseconds < -9_223_372_036_854_775_808.0 { return Int64.min }
+        if nanoseconds >= 9_223_372_036_854_775_808.0 { return Int64.max }
+        return Int64(nanoseconds)
+    }
+
+    /// `lhs + rhs`, clamped to Int64's range instead of overflowing.
+    private static func saturatingSum(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard overflow else { return sum }
+        return rhs > 0 ? Int64.max : Int64.min
+    }
+
+    /// `lhs - rhs`, clamped to Int64's range instead of overflowing.
+    private static func saturatingDifference(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (difference, overflow) = lhs.subtractingReportingOverflow(rhs)
+        guard overflow else { return difference }
+        return rhs < 0 ? Int64.max : Int64.min
+    }
+
+    /// Floor division, so a time before the epoch falls in the minute that
+    /// contains it (Swift's `/` truncates toward zero). Cannot overflow:
+    /// the divisor is a positive constant above 1.
+    private static func minute(ofNs timeNs: Int64) -> Int64 {
+        let quotient = timeNs / nanosecondsPerMinute
+        return timeNs % nanosecondsPerMinute < 0 ? quotient - 1 : quotient
+    }
+
+    private static func trackedFrom(connection: SQLiteConnection) throws -> Int64 {
+        try connection.withStatement(selectTrackedFromSQL) { statement in
+            try statement.bind(trackedFromKey, at: 1)
+            guard try statement.step(), !statement.isNull(at: 0) else { throw UsageStoreError.malformedRow }
+            return statement.int64(at: 0)
+        }
+    }
+
+    private static func setTrackedFrom(_ nanoseconds: Int64, connection: SQLiteConnection) throws {
+        try connection.withStatement(upsertTrackedFromSQL) { statement in
+            try statement.bind(trackedFromKey, at: 1)
+            try statement.bind(nanoseconds, at: 2)
+            _ = try statement.step()
+        }
+    }
+
+    /// The part of a restart shared by `resetTracking` and `deleteAll`, run
+    /// inside their transaction: every active process is retired (its
+    /// digest added; one already there stays) and the active rows and
+    /// series baselines are deleted, then `tracked_from_ns` becomes
+    /// `trackedFrom`, the clock, which may move back: it is the only
+    /// input, so a value set under a wrong clock is corrected by the next
+    /// restart. A retired process predates tracking whatever any clock
+    /// says, so nothing already counted is added again and nothing
+    /// deleted comes back.
+    private static func restartTracking(at trackedFrom: Int64, connection: SQLiteConnection) throws {
+        let active = try connection.withStatement(selectProcessStartsSQL) { statement in
+            var starts: [UsageProcessStart] = []
+            while try statement.step() {
+                guard let sessionID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+                starts.append(UsageProcessStart(sessionID: sessionID, startNs: statement.int64(at: 1), startType: nil))
+            }
+            return starts
+        }
+        for start in active {
+            try retire(start, connection: connection)
+        }
+        try connection.execute("DELETE FROM usage_process_starts; DELETE FROM usage_series;")
+        try setTrackedFrom(trackedFrom, connection: connection)
+    }
+
+    /// Lowercase hex SHA-256 over the session id's UTF-8 bytes, one 0x00
+    /// byte, and `startNs` in decimal ASCII: a process's identity without
+    /// a readable identifier.
+    private static func digest(of start: UsageProcessStart) -> String {
+        var bytes = Array(start.sessionID.utf8)
+        bytes.append(0)
+        bytes.append(contentsOf: String(start.startNs).utf8)
+        return SHA256.hash(data: bytes).map { byte in
+            let hex = String(byte, radix: 16)
+            return byte < 0x10 ? "0" + hex : hex
+        }.joined()
+    }
+
+    /// Adds the process's digest; one already there stays.
+    private static func retire(_ start: UsageProcessStart, connection: SQLiteConnection) throws {
+        try connection.withStatement(insertRetiredSQL) { statement in
+            try statement.bind(digest(of: start), at: 1)
+            _ = try statement.step()
+        }
+    }
+
+    private static func isActive(_ start: UsageProcessStart, connection: SQLiteConnection) throws -> Bool {
+        try connection.withStatement(selectProcessStartSQL) { statement in
+            try statement.bind(start.sessionID, at: 1)
+            try statement.bind(start.startNs, at: 2)
+            return try statement.step()
+        }
+    }
+
+    private static func isRetired(_ start: UsageProcessStart, connection: SQLiteConnection) throws -> Bool {
+        try connection.withStatement(selectRetiredSQL) { statement in
+            try statement.bind(digest(of: start), at: 1)
+            return try statement.step()
+        }
+    }
+
+    private static func seriesBaseline(
+        of sample: UsageSeriesSample, connection: SQLiteConnection
+    ) throws -> (lastValue: Int64, lastTimeNs: Int64)? {
+        try connection.withStatement(selectSeriesSQL) { statement in
+            try statement.bind(sample.sessionID, at: 1)
+            try statement.bind(sample.seriesID, at: 2)
+            try statement.bind(sample.startNs, at: 3)
+            guard try statement.step() else { return nil }
+            return (statement.int64(at: 0), statement.int64(at: 1))
+        }
+    }
+
+    private static func insertSeries(
+        _ sample: UsageSeriesSample, firstHeardNs: Int64, connection: SQLiteConnection
+    ) throws {
+        try connection.withStatement(insertSeriesSQL) { statement in
+            try statement.bind(sample.sessionID, at: 1)
+            try statement.bind(sample.seriesID, at: 2)
+            try statement.bind(sample.startNs, at: 3)
+            try statement.bind(sample.kind.rawValue, at: 4)
+            try statement.bind(sample.model, at: 5)
+            try statement.bind(sample.value, at: 6)
+            try statement.bind(sample.timeNs, at: 7)
+            try statement.bind(firstHeardNs, at: 8)
+            _ = try statement.step()
+        }
+    }
+
+    /// Moves the baseline; `kind`, `model` and `first_heard_ns` stay those
+    /// of the first sample.
+    private static func updateSeries(with sample: UsageSeriesSample, connection: SQLiteConnection) throws {
+        try connection.withStatement(updateSeriesSQL) { statement in
+            try statement.bind(sample.sessionID, at: 1)
+            try statement.bind(sample.seriesID, at: 2)
+            try statement.bind(sample.startNs, at: 3)
+            try statement.bind(sample.value, at: 4)
+            try statement.bind(sample.timeNs, at: 5)
+            _ = try statement.step()
+        }
+    }
+
+    /// Adds `amount` to the sample's kind in its point row of `minute`,
+    /// creating the row if needed. The sum is computed here, saturating,
+    /// not in SQL: SQLite turns an overflowing integer sum into a REAL.
+    private static func addToPoint(
+        _ amount: Int64, of sample: UsageSeriesSample, minute: Int64, connection: SQLiteConnection
+    ) throws {
+        let existing = try connection.withStatement(selectPointSQL) { statement -> (rowID: Int64, tokens: [Int64])? in
+            try bindGroup(of: sample, minute: minute, to: statement)
+            guard try statement.step() else { return nil }
+            return (statement.int64(at: 0), (1...4).map { statement.int64(at: Int32($0)) })
+        }
+        var tokens = existing?.tokens ?? [0, 0, 0, 0]
+        let column: Int
+        switch sample.kind {
+        case .input: column = 0
+        case .output: column = 1
+        case .cacheRead: column = 2
+        case .cacheCreation: column = 3
+        }
+        tokens[column] = saturatingSum(tokens[column], amount)
+
+        if let existing {
+            try connection.withStatement(updatePointSQL) { statement in
+                try statement.bind(existing.rowID, at: 1)
+                for (offset, value) in tokens.enumerated() {
+                    try statement.bind(value, at: Int32(offset + 2))
+                }
+                _ = try statement.step()
+            }
+        } else {
+            try connection.withStatement(insertPointSQL) { statement in
+                try bindGroup(of: sample, minute: minute, to: statement)
+                for (offset, value) in tokens.enumerated() {
+                    try statement.bind(value, at: Int32(offset + 7))
+                }
+                _ = try statement.step()
+            }
+        }
+    }
+
+    private static func bindGroup(of sample: UsageSeriesSample, minute: Int64, to statement: SQLiteStatement) throws {
+        try statement.bind(sample.sessionID, at: 1)
+        try statement.bind(minute, at: 2)
+        try statement.bind(sample.model, at: 3)
+        try statement.bind(sample.effort, at: 4)
+        try statement.bind(sample.thread, at: 5)
+        try statement.bind(sample.agent, at: 6)
+    }
+
+    // MARK: - Series statements
+
+    private static let selectSeriesSQL = """
+        SELECT last_value, last_time_ns FROM usage_series \
+        WHERE session_id = ?1 AND series_id = ?2 AND start_ns = ?3
+        """
+
+    private static let insertSeriesSQL = """
+        INSERT INTO usage_series \
+        (session_id, series_id, start_ns, kind, model, last_value, last_time_ns, first_heard_ns) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        """
+
+    private static let updateSeriesSQL = """
+        UPDATE usage_series SET last_value = ?4, last_time_ns = ?5 \
+        WHERE session_id = ?1 AND series_id = ?2 AND start_ns = ?3
+        """
+
+    /// `IS` rather than `=` so a NULL label matches the NULL group.
+    private static let selectPointSQL = """
+        SELECT rowid, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM usage_points \
+        WHERE session_id = ?1 AND minute = ?2 AND model = ?3 AND effort IS ?4 AND thread IS ?5 AND agent IS ?6
+        """
+
+    private static let insertPointSQL = """
+        INSERT INTO usage_points (session_id, minute, model, effort, thread, agent, \
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        """
+
+    private static let updatePointSQL = """
+        UPDATE usage_points SET input_tokens = ?2, output_tokens = ?3, cache_read_tokens = ?4, \
+        cache_creation_tokens = ?5 WHERE rowid = ?1
+        """
+
+    /// The first stored start type wins.
+    private static let insertProcessStartSQL = """
+        INSERT INTO usage_process_starts (session_id, start_ns, start_type) VALUES (?1, ?2, ?3) \
+        ON CONFLICT (session_id, start_ns) DO NOTHING
+        """
+
+    private static let selectProcessStartSQL =
+        "SELECT 1 FROM usage_process_starts WHERE session_id = ?1 AND start_ns = ?2"
+
+    private static let selectRetiredSQL = "SELECT 1 FROM usage_retired_processes WHERE digest = ?1"
+
+    /// A digest already there stays.
+    private static let insertRetiredSQL =
+        "INSERT INTO usage_retired_processes (digest) VALUES (?1) ON CONFLICT (digest) DO NOTHING"
+
+    private static let countRetiredSQL = "SELECT count(*) FROM usage_retired_processes"
+
+    private static let selectTrackedFromSQL = "SELECT value FROM usage_meta WHERE key = ?1"
+
+    private static let upsertTrackedFromSQL = """
+        INSERT INTO usage_meta (key, value) VALUES (?1, ?2) \
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value
+        """
+
+    private static let selectPointRowsSQL = """
+        SELECT session_id, minute, model, effort, thread, agent, \
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM usage_points \
+        ORDER BY session_id, minute, model, effort, thread, agent
+        """
+
+    private static let selectSeriesRowsSQL = """
+        SELECT session_id, series_id, start_ns, kind, model, last_value, last_time_ns, first_heard_ns \
+        FROM usage_series ORDER BY session_id, start_ns, series_id
+        """
+
+    private static let selectProcessStartsSQL =
+        "SELECT session_id, start_ns, start_type FROM usage_process_starts ORDER BY session_id, start_ns"
+}

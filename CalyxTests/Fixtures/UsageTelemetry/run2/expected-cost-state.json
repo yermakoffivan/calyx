@@ -1,0 +1,23 @@
+{
+ "claude-fable-5-1": {
+  "cacheCreation": 0,
+  "cacheRead": 0,
+  "input": 41788,
+  "output": 1085,
+  "thinking": 0
+ },
+ "claude-haiku-4-5-20251001": {
+  "cacheCreation": 0,
+  "cacheRead": 0,
+  "input": 944,
+  "output": 11,
+  "thinking": 0
+ },
+ "claude-sonnet-5-5": {
+  "cacheCreation": 91377,
+  "cacheRead": 374464,
+  "input": 1578,
+  "output": 1864,
+  "thinking": 0
+ }
+}

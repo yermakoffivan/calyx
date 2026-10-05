@@ -226,11 +226,11 @@ final class UsageStoreTests: XCTestCase {
         }
     }
 
-    func test_init_freshDatabase_hasUserVersion1() async throws {
+    func test_init_freshDatabase_hasUserVersion2() async throws {
         let store = try openStore()
         await store.close()
 
-        XCTAssertEqual(userVersion(at: databaseURL), 1)
+        XCTAssertEqual(userVersion(at: databaseURL), 2)
     }
 
     // MARK: - Persistence across close / reopen
@@ -281,7 +281,7 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(try mode(of: databaseURL), 0o600)
 
         await store.close()
-        XCTAssertEqual(userVersion(at: databaseURL), 1)
+        XCTAssertEqual(userVersion(at: databaseURL), 2)
     }
 
     func test_init_existingDatabaseWithNewerUserVersion_movesItAsideAndStartsFresh() async throws {
@@ -302,7 +302,7 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(records, [finalLine])
 
         await store.close()
-        XCTAssertEqual(userVersion(at: databaseURL), 1)
+        XCTAssertEqual(userVersion(at: databaseURL), 2)
     }
 
     // MARK: - close()
@@ -884,7 +884,7 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(try mode(of: databaseURL), 0o600)
 
         await store.close()
-        XCTAssertEqual(userVersion(at: databaseURL), 1)
+        XCTAssertEqual(userVersion(at: databaseURL), 2)
         XCTAssertEqual(try corruptSiblings(), [])
     }
 
@@ -930,7 +930,7 @@ final class UsageStoreTests: XCTestCase {
 
         await store.close()
         XCTAssertFalse(tableExists("fixture", at: databaseURL), "The fresh database must not contain the unrelated table")
-        XCTAssertEqual(userVersion(at: databaseURL), 1)
+        XCTAssertEqual(userVersion(at: databaseURL), 2)
     }
 
     // MARK: - Review A1: corrupt data page
