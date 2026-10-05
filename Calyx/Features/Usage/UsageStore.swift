@@ -262,6 +262,22 @@ actor UsageStore {
         return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
+    /// The token Gold query: see `UsageTokenGold.rows`. Of `calendar`
+    /// only the time zone is used (`UsagePeriod.localDayCalendar`).
+    func tokenReport(_ query: UsageTokenQuery, calendar: Calendar) throws -> [UsageTokenRow] {
+        let connection = try openConnection()
+        return try UsageTokenGold.rows(for: query, calendar: calendar, connection: connection)
+    }
+
+    /// Several token Gold queries answered in one actor call, one result
+    /// per query in order. Nothing here suspends, so no batch can be
+    /// applied between two of the answers. Any query that throws fails the
+    /// whole call.
+    func tokenReports(_ queries: [UsageTokenQuery], calendar: Calendar) throws -> [[UsageTokenRow]] {
+        let connection = try openConnection()
+        return try queries.map { try UsageTokenGold.rows(for: $0, calendar: calendar, connection: connection) }
+    }
+
     /// Removes every record, session, checkpoint, point, series baseline,
     /// run log (with its runs and totals) and unreported row in one transaction and restarts tracking at the store's
     /// clock (see `restartTracking`). The processes heard so far are
@@ -372,6 +388,10 @@ actor UsageStore {
     ///   Code's totals hold beyond what was received (`reconcile(session:)`);
     ///   `time_ns` is the run's end. The token columns are named as in
     ///   `usage_points` so one aggregate can read both.
+    /// - `usage_points_minute` / `usage_unreported_time`: the time-range
+    ///   indexes of the token Gold query. A version-2 file created before
+    ///   they existed lacks them; that is only slower, never incompatible,
+    ///   so no fixed statement depends on them.
     private static let schemaV2Additions = """
         CREATE TABLE usage_series (
             session_id TEXT NOT NULL,
@@ -448,6 +468,8 @@ actor UsageStore {
             cache_creation_tokens INTEGER NOT NULL,
             PRIMARY KEY (session_id, sequence, model)
         ) WITHOUT ROWID;
+        CREATE INDEX usage_points_minute ON usage_points (minute);
+        CREATE INDEX usage_unreported_time ON usage_unreported (time_ns);
         """
 
     /// Brings a database at `version` up to `schemaVersion`, one step per
