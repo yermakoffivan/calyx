@@ -36,6 +36,17 @@
 //  from the directory it is given (a per-test directory here, never
 //  Application Support), syncs the tracking flag, and starts a catch-up.
 //
+//  R4b: `startUsageLedger` no longer loads the credential or syncs the
+//  tracking flag itself: its startup task awaits ONE reconcile of the
+//  telemetry activation it is given (which does both), then catches up.
+//  It also requests a reconcile on every `.calyxIPCStateDidChange`.
+//  Every test here gives it a per-test activation (never `.shared`):
+//  inputs "tracking as the ledger says, IPC on, server not running", so
+//  the target is `.untouched` (sync, load creating) with tracking on and
+//  `.removed` (fake remove, sync, load without creating) with tracking
+//  off, which is what the startup did before R4b; its effects reach this
+//  test's ledger and holder and never a settings file.
+//
 //  WAITING. A test waits for a publish that must happen through an
 //  expectation (bound: UsageWiringFixture.waitSeconds, reached only on
 //  failure). Before asserting what was or was not published it calls
@@ -65,6 +76,10 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     /// The startup work of every `start`, awaited before the directories
     /// are removed, so none of it can run after the teardown.
     private var startups: [Task<Void, Never>] = []
+    /// Kept alive for the whole test: the app delegate holds its
+    /// notification observer, which holds the activation weakly.
+    private var appDelegates: [AppDelegate] = []
+    private var activations: [UsageTelemetryActivation] = []
 
     override func setUp() async throws {
         try await super.setUp()
@@ -81,10 +96,10 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     override func tearDown() async throws {
         server?.usageSink = nil
         server?.usageIngest = nil
-        for startup in startups {
-            await startup.value
-        }
+        await awaitStartups()
         startups = []
+        appDelegates = []
+        activations = []
         server?.stop()
         server = nil
         await fixture?.shutDown(ledgers)
@@ -109,19 +124,58 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     /// never Application Support.
     private var credentialDirectory: String { fixture.basePath + "/credential" }
 
+    /// The activation `start` gives the launch: tracking as the ledger
+    /// says, IPC on, server not running; effects over this test's ledger,
+    /// holder and credential directory, and a remove that touches no file.
+    private func makeActivation(_ ledger: UsageLedger, holder: UsageIngestCredentialHolder) -> UsageTelemetryActivation {
+        let credentialDirectory = self.credentialDirectory
+        let activation = UsageTelemetryActivation(
+            inputs: UsageTelemetryActivation.Inputs(
+                trackingOn: { ledger.isTracking },
+                ipcEnabled: { true },
+                serverPort: { nil },
+                mayTouchAgentFiles: { true }),
+            effects: UsageTelemetryActivation.Effects(
+                syncTracking: { await ledger.syncTracking() },
+                loadCredential: { create in try await holder.load(create: create, directory: credentialDirectory) },
+                install: { port, _ in
+                    XCTFail("the server never runs in these tests: nothing may be installed")
+                    return .installed(port: port)
+                },
+                remove: { .removed }),
+            onStatusChange: {})
+        activations.append(activation)
+        return activation
+    }
+
     /// Wires `ledger` to this test's server through a new app delegate,
-    /// as the launch does with the shared pair, with this test's
-    /// credential directory, holder and monitor.
-    private func start(_ ledger: UsageLedger) {
+    /// as the launch does with the shared pair, with this test's holder,
+    /// monitor and activation (by default `makeActivation`, whose loader
+    /// owns this test's credential directory).
+    ///
+    /// The startup task it returns is never discarded: it is kept in
+    /// `startups`, and `awaitStartups()` (called by `settle` and by
+    /// tearDown) waits for it. Since R4b it runs `activation.reconcile()`
+    /// before its ledger work, so its ledger tasks may not exist yet when
+    /// `start` returns.
+    private func start(_ ledger: UsageLedger, activation: UsageTelemetryActivation? = nil) {
         guard let holder = holderStorage, let monitor = monitorStorage else {
             XCTFail("Fixture error: no holder or monitor")
             return
         }
         let appDelegate = AppDelegate()
+        appDelegates.append(appDelegate)
         let startup = appDelegate.startUsageLedger(
-            server: server, ledger: ledger, credentialDirectory: credentialDirectory,
-            credentialHolder: holder, ingestMonitor: monitor)
+            server: server, ledger: ledger, credentialHolder: holder, ingestMonitor: monitor,
+            activation: activation ?? makeActivation(ledger, holder: holder))
         startups.append(startup)
+    }
+
+    /// Waits for the startup work of every `start` so far.
+    private func awaitStartups() async {
+        for startup in startups {
+            await startup.value
+        }
     }
 
     /// A Claude-shaped hook event naming `sessionID`'s synthetic transcript.
@@ -151,7 +205,10 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         await fulfillment(of: [published], timeout: Fixture.waitSeconds)
     }
 
+    /// Waits for every startup task first (only then has each queued its
+    /// ledger work), then closes the ledger behind everything started.
     private func settle(_ ledger: UsageLedger) async {
+        await awaitStartups()
         await fixture.closeBehindEverythingStarted(ledger, in: self)
     }
 
@@ -678,7 +735,8 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         for (offset, reason) in reasons.enumerated() {
             let date = Date(timeIntervalSince1970: 2_000 + Double(offset))
             monitor.note(reason, at: date)
-            XCTAssertEqual(monitor.lastRejection, UsageIngestMonitor.Rejection(reason: reason, at: date), "\(reason)")
+            let stored = try XCTUnwrap(UsageIngestMonitor.ExporterRejection(reason), "\(reason)")
+            XCTAssertEqual(monitor.lastRejection, UsageIngestMonitor.Rejection(reason: stored, at: date), "\(reason)")
         }
         XCTAssertNil(monitor.lastAcceptedAt)
     }
@@ -695,5 +753,109 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
 
         XCTAssertEqual(monitor.lastAcceptedAt, accepted)
         XCTAssertEqual(monitor.lastRejection, UsageIngestMonitor.Rejection(reason: .unauthorized, at: refused))
+    }
+
+    // MARK: - The telemetry activation (R4b)
+
+    private let waitSeconds: TimeInterval = 30
+
+    /// A per-test activation over fakes, kept alive for the test.
+    private func fakeActivation(
+        _ inputs: UsageTelemetryFakeInputs, _ effects: UsageTelemetryFakeEffects,
+        _ counter: UsageTelemetryStatusChangeCounter
+    ) -> UsageTelemetryActivation {
+        let activation = UsageTelemetryActivation(
+            inputs: inputs.inputs, effects: effects.effects, onStatusChange: counter.onStatusChange)
+        activations.append(activation)
+        return activation
+    }
+
+    // The startup task returns only after exactly one reconcile ran.
+    func test_startUsageLedger_awaitsExactlyOneReconcile() async throws {
+        fixture.tracking.set(false)
+        let inputs = UsageTelemetryFakeInputs()
+        inputs.trackingOn = false
+        let effects = UsageTelemetryFakeEffects()
+        let counter = UsageTelemetryStatusChangeCounter()
+        let activation = fakeActivation(inputs, effects, counter)
+
+        start(makeLedger(), activation: activation)
+        await awaitStartups()
+
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertEqual(effects.calls, [.remove, .syncTracking, .loadCredential(create: false)])
+        XCTAssertEqual(activation.status, .removed)
+    }
+
+    // The startup no longer loads the credential or syncs tracking on
+    // its own: with an activation that may not touch agent files, nothing
+    // is loaded or created, even with tracking on.
+    func test_startUsageLedger_loadsNoCredentialItself_onlyThroughTheActivation() async throws {
+        let holder = try theHolder()
+        let inputs = UsageTelemetryFakeInputs()
+        inputs.mayTouchAgentFiles = false
+        let effects = UsageTelemetryFakeEffects()
+        let counter = UsageTelemetryStatusChangeCounter()
+        let activation = fakeActivation(inputs, effects, counter)
+        let ledger = makeLedger()
+
+        start(ledger, activation: activation)
+        await awaitStartups()
+
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertEqual(effects.calls, [])
+        XCTAssertNil(holder.credential)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: credentialDirectory))
+        await settle(ledger)
+    }
+
+    // A posted `.calyxIPCStateDidChange` requests another reconcile,
+    // which reads the inputs afresh.
+    func test_ipcStateDidChange_requestsAnotherReconcile() async throws {
+        fixture.tracking.set(false)
+        let inputs = UsageTelemetryFakeInputs()
+        inputs.trackingOn = false
+        let effects = UsageTelemetryFakeEffects()
+        let counter = UsageTelemetryStatusChangeCounter()
+        let activation = fakeActivation(inputs, effects, counter)
+        start(makeLedger(), activation: activation)
+        await awaitStartups()
+        XCTAssertEqual(counter.count, 1, "Fixture error")
+
+        inputs.trackingOn = true
+        inputs.serverPort = 41830
+        let second = expectation(description: "a second reconcile ran")
+        counter.expect(2, fulfilling: second)
+        NotificationCenter.default.post(name: .calyxIPCStateDidChange, object: nil)
+        await fulfillment(of: [second], timeout: waitSeconds)
+
+        XCTAssertEqual(
+            effects.calls,
+            [.remove, .syncTracking, .loadCredential(create: false),
+             .syncTracking, .loadCredential(create: true),
+             .install(port: 41830, headersFilePath: UsageTelemetryFakeEffects.headersFilePath)])
+        XCTAssertEqual(activation.status, .installed(port: 41830))
+    }
+
+    // MARK: - UsageIngestMonitor.ExporterRejection (R4b)
+
+    func test_exporterRejection_mapsTheFourRefusalsAnExporterCanCause() {
+        XCTAssertEqual(UsageIngestMonitor.ExporterRejection(.unauthorized), .unauthorized)
+        XCTAssertEqual(UsageIngestMonitor.ExporterRejection(.tooLarge), .tooLarge)
+        XCTAssertEqual(UsageIngestMonitor.ExporterRejection(.undecodable), .undecodable)
+        XCTAssertEqual(UsageIngestMonitor.ExporterRejection(.unavailable), .unavailable)
+    }
+
+    func test_exporterRejection_isNilForWhatNoExporterCauses() {
+        XCTAssertNil(UsageIngestMonitor.ExporterRejection(.foreignOrigin))
+        XCTAssertNil(UsageIngestMonitor.ExporterRejection(.noBody))
+    }
+
+    // The stored reason has the narrowed type (a compile-time pin).
+    func test_rejectionReason_isAnExporterRejection() throws {
+        let monitor = try theMonitor()
+        monitor.note(.tooLarge, at: Date(timeIntervalSince1970: 3_000))
+        let reason: UsageIngestMonitor.ExporterRejection? = monitor.lastRejection?.reason
+        XCTAssertEqual(reason, .tooLarge)
     }
 }

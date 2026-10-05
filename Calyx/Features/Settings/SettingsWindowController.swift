@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import OSLog
 
 private let logger = Logger(
@@ -22,6 +23,12 @@ class SettingsWindowController: NSWindowController {
     private let agentIPCSwitch = NSSwitch()
     private let agentIPCRefreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let agentIPCStatusLabel = NSTextField(wrappingLabelWithString: "")
+    /// The Usage Tracking row's status line, kept current by
+    /// `updateUsageTrackingStatus()` (see `usageTrackingRow()`).
+    private let usageTrackingStatusLabel = SettingsLayout.statusLabel()
+    /// Bumped whenever the monitor observation is armed anew, so a change
+    /// reported by an earlier arming neither refreshes nor re-arms.
+    private var usageMonitorObservationGeneration = 0
     /// State behind the MCP Apps pane (`SettingsPane.mcpServers`), shared by every instance and
     /// held by the type so the composition root configures it at launch
     /// without creating the Settings window. Empty until
@@ -46,6 +53,26 @@ class SettingsWindowController: NSWindowController {
     /// Test seam: the ledger `usageTrackingDidChange(_:)` reconciles,
     /// instead of `UsageLedger.shared`. DO NOT use from production code.
     var _usageLedgerForTesting: UsageLedger?
+
+    /// Test seam: the activation the Usage Tracking row reconciles and
+    /// shows, instead of `UsageTelemetryActivation.shared`. DO NOT use
+    /// from production code.
+    var _usageTelemetryActivationForTesting: UsageTelemetryActivation?
+
+    /// Test seam: the monitor the Usage Tracking row shows, instead of
+    /// `UsageIngestMonitor.shared`. Setting it arms the observation anew
+    /// (the previous one stops). DO NOT use from production code.
+    var _usageIngestMonitorForTesting: UsageIngestMonitor? {
+        didSet {
+            observeUsageIngestMonitor()
+            updateUsageTrackingStatus()
+        }
+    }
+
+    /// Test seam: whether the Usage Tracking row takes the IPC server as
+    /// running, instead of `CalyxMCPServer.shared.isRunning`. DO NOT use
+    /// from production code.
+    var _usageServerRunningForTesting: Bool?
     #endif
 
     private init() {
@@ -73,6 +100,11 @@ class SettingsWindowController: NSWindowController {
             self, selector: #selector(agentIPCStateDidChange),
             name: .calyxIPCStateDidChange, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(usageTelemetryStatusDidChange(_:)),
+            name: .calyxUsageTelemetryStatusDidChange, object: nil
+        )
+        observeUsageIngestMonitor()
     }
 
     deinit {
@@ -165,8 +197,10 @@ class SettingsWindowController: NSWindowController {
         case .usageTracking:
             return SectionHeading(
                 title: "Usage Tracking",
-                subtitle: "Records Claude Code token usage per model and effort from its transcripts. Only numbers "
-                    + "and labels are stored, never conversation text. Needs AI Agent IPC."
+                subtitle: "Records Claude Code token usage per model and effort, as counted by Claude Code itself. "
+                    + "While this is on, Calyx adds telemetry settings to ~/.claude/settings.json so that Claude "
+                    + "Code on this Mac sends its token counts to Calyx. Only numbers and labels are stored, never "
+                    + "conversation text. Needs AI Agent IPC."
             )
         case .mcpServers:
             return SectionHeading(
@@ -462,7 +496,86 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.state = Self.sessionToggleInitialState(for: .usageTracking) ? .on : .off
         toggleSwitch.target = self
         toggleSwitch.action = #selector(usageTrackingDidChange(_:))
-        return controlRow(label: "Track Claude Code usage", control: toggleSwitch)
+
+        usageTrackingStatusLabel.setAccessibilityIdentifier(AccessibilityID.Settings.usageTrackingStatusLabel)
+
+        let column = SettingsLayout.column([
+            controlRow(label: "Track Claude Code usage", control: toggleSwitch),
+            usageTrackingStatusLabel,
+        ])
+        updateUsageTrackingStatus()
+        return column
+    }
+
+    // MARK: Usage Tracking status
+
+    private var usageTelemetryActivation: UsageTelemetryActivation {
+        #if DEBUG
+        return _usageTelemetryActivationForTesting ?? .shared
+        #else
+        return .shared
+        #endif
+    }
+
+    private var usageIngestMonitor: UsageIngestMonitor {
+        #if DEBUG
+        return _usageIngestMonitorForTesting ?? .shared
+        #else
+        return .shared
+        #endif
+    }
+
+    private var usageServerRunning: Bool {
+        #if DEBUG
+        return _usageServerRunningForTesting ?? CalyxMCPServer.shared.isRunning
+        #else
+        return CalyxMCPServer.shared.isRunning
+        #endif
+    }
+
+    /// Applies `UsageTelemetryStatusResolver` to the row's status label;
+    /// hidden while the text is empty. Called when the pane is built, when
+    /// the switch changes, on `.calyxIPCStateDidChange`, on
+    /// `.calyxUsageTelemetryStatusDidChange` (after every reconcile run of
+    /// the shared activation), and when the monitor's values change.
+    private func updateUsageTrackingStatus() {
+        let monitor = usageIngestMonitor
+        let input = UsageTelemetryStatusInput(
+            trackingOn: UsageTrackingSettings.enabled,
+            ipcEnabled: IPCSettings.enabled,
+            serverRunning: usageServerRunning,
+            config: usageTelemetryActivation.status,
+            lastAcceptedAt: monitor.lastAcceptedAt,
+            lastRejection: monitor.lastRejection)
+        let text = UsageTelemetryStatusResolver.text(
+            for: UsageTelemetryStatusResolver.resolve(input),
+            time: UsageTelemetryStatusResolver.defaultTime)
+        usageTrackingStatusLabel.isHidden = text.isEmpty
+        usageTrackingStatusLabel.attributedStringValue = SettingsLayout.statusText(text)
+    }
+
+    /// Observes the monitor's two values once; a change refreshes the
+    /// label and arms the observation again. Arming anew (a replaced
+    /// monitor) retires every earlier arming through the generation.
+    private func observeUsageIngestMonitor() {
+        usageMonitorObservationGeneration += 1
+        let generation = usageMonitorObservationGeneration
+        let monitor = usageIngestMonitor
+        withObservationTracking {
+            _ = monitor.lastAcceptedAt
+            _ = monitor.lastRejection
+        } onChange: { [weak self] in
+            // Called before the change is applied: read it on the next turn.
+            Task { @MainActor [weak self] in
+                guard let self, generation == self.usageMonitorObservationGeneration else { return }
+                self.observeUsageIngestMonitor()
+                self.updateUsageTrackingStatus()
+            }
+        }
+    }
+
+    @objc private func usageTelemetryStatusDidChange(_ notification: Notification) {
+        updateUsageTrackingStatus()
     }
 
     /// The whole MCP Apps pane below its heading, built from the same
@@ -638,11 +751,21 @@ class SettingsWindowController: NSWindowController {
     /// sessions' transcripts gained while tracking was off; that runs in
     /// a task on the ledger, never on the main thread, and at utility
     /// priority, since catch-up work must not compete with the UI.
-    /// Flipping OFF does nothing else: stored data stays, and an ingest
-    /// that is already reading finishes.
+    /// Flipping OFF does nothing else here: stored data stays, and an
+    /// ingest that is already reading finishes.
+    ///
+    /// R4b: every flip also refreshes the status line and requests a
+    /// reconcile of the telemetry activation (after the setting is
+    /// written), which writes or removes Calyx's block in Claude Code's
+    /// settings file.
     @objc private func usageTrackingDidChange(_ sender: NSSwitch) {
         let enabled = sender.state == .on
         UsageTrackingSettings.enabled = enabled
+        updateUsageTrackingStatus()
+        let activation = usageTelemetryActivation
+        Task {
+            await activation.reconcile()
+        }
         guard enabled else { return }
         #if DEBUG
         let ledger = _usageLedgerForTesting ?? UsageLedger.shared
@@ -746,6 +869,7 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentIPCStateDidChange(_ notification: Notification) {
         updateAgentIPCRow()
+        updateUsageTrackingStatus()
         mcpServerSettingsModel.refreshIPCEnabled()
     }
 

@@ -124,6 +124,7 @@ enum AccessibilityID {
         static let agentIPCRefreshButton = "calyx.settings.agents.agentIPCRefreshButton"
         static let agentIPCStatusLabel = "calyx.settings.agents.agentIPCStatusLabel"
         static let usageTrackingSwitch = "calyx.settings.agents.usageTrackingSwitch"
+        static let usageTrackingStatusLabel = "calyx.settings.agents.usageTrackingStatusLabel"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }

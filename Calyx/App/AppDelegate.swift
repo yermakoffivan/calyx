@@ -14,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     private var windowControllers: [CalyxWindowController] = []
     private var pendingURLs: [URL] = []
     private var quickTerminalController: QuickTerminalController?
+    /// The `.calyxIPCStateDidChange` observer `startUsageLedger` installs;
+    /// removed when this delegate goes away.
+    private var usageIPCStateObservation: NotificationObservation?
     /// The MCP Apps host (`MCPHostComposition.swift`). Built in
     /// `applicationDidFinishLaunching`, so nil in the unit-test host.
     private(set) var mcpHostComposition: MCPHostComposition?
@@ -1529,18 +1532,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// which accepts the credential `credentialHolder` holds, hands every
     /// export to `ledger.ingestExport` and notes every verdict in
     /// `ingestMonitor`. Its startup work runs in one task, returned so a
-    /// caller can wait for it: the credential is loaded from
-    /// `credentialDirectory` off the main actor (created only while
-    /// tracking is on, decided when the load runs), the store's tracking
-    /// flag is synced, and the catch-up runs next to `reconcileKnown`, at
-    /// utility priority.
+    /// caller can wait for it, at utility priority.
+    ///
+    /// R4b: that task awaits ONE `activation.reconcile()`, which loads the
+    /// credential (its loader owns the directory), syncs the store's
+    /// tracking flag and brings Claude Code's settings file in line with
+    /// the switches; then the catch-up runs next to `reconcileKnown`.
+    /// Every `.calyxIPCStateDidChange` requests another reconcile; that
+    /// observer lives as long as this delegate (or until the next call)
+    /// and holds `activation` weakly.
     @discardableResult
     func startUsageLedger(
         server: CalyxMCPServer,
         ledger: UsageLedger,
-        credentialDirectory: String = AppSupportDirectory.path,
         credentialHolder: UsageIngestCredentialHolder = .shared,
-        ingestMonitor: UsageIngestMonitor = .shared
+        ingestMonitor: UsageIngestMonitor = .shared,
+        activation: UsageTelemetryActivation = .shared
     ) -> Task<Void, Never> {
         server.usageSink = { activity in
             Task {
@@ -1563,25 +1570,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
             note: { ingestMonitor.note($0, at: $1) })
         // Catch-up work: at utility priority it does not compete with the
         // main thread while windows are being restored.
+        usageIPCStateObservation = NotificationObservation(
+            name: .calyxIPCStateDidChange
+        ) { [weak activation] in
+            await activation?.reconcile()
+        }
         return Task(priority: .utility) {
-            // A failed load leaves the route without a credential (401)
-            // until the next load; the failure carries nothing to show.
-            do {
-                try await credentialHolder.load(create: ledger.isTracking, directory: credentialDirectory)
-            } catch {
-                Self.usageLogger.error("""
-                    Usage credential could not be loaded: \
-                    \((error as NSError).domain, privacy: .public) \((error as NSError).code, privacy: .public)
-                    """)
-            }
-            await ledger.syncTracking()
+            await activation.reconcile()
             async let known: Void = ledger.reconcileKnown()
             async let caughtUp: Void = ledger.catchUp()
             _ = await (known, caughtUp)
         }
     }
-
-    private static let usageLogger = Logger(subsystem: "com.calyx.terminal", category: "UsageIngest")
 
     // MARK: - MCP Apps host
 

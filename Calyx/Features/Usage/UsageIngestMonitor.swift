@@ -12,8 +12,24 @@ import Observation
 /// What the Settings pane and the Usage window show about reception.
 @MainActor @Observable
 final class UsageIngestMonitor {
+    /// The refusals an exporter can cause; the only ones kept.
+    enum ExporterRejection: Equatable {
+        case unauthorized, tooLarge, undecodable, unavailable
+
+        /// nil for a refusal that is not from an exporter (`foreignOrigin`, `noBody`).
+        init?(_ rejection: UsageIngestRejection) {
+            switch rejection {
+            case .unauthorized: self = .unauthorized
+            case .tooLarge: self = .tooLarge
+            case .undecodable: self = .undecodable
+            case .unavailable: self = .unavailable
+            case .foreignOrigin, .noBody: return nil
+            }
+        }
+    }
+
     struct Rejection: Equatable {
-        let reason: UsageIngestRejection
+        let reason: ExporterRejection
         let at: Date
     }
 
@@ -36,12 +52,8 @@ final class UsageIngestMonitor {
             lastAcceptedAt = date
             return
         }
-        switch rejection {
-        case .unauthorized, .tooLarge, .undecodable, .unavailable:
-            lastRejection = Rejection(reason: rejection, at: date)
-        case .foreignOrigin, .noBody:
-            break
-        }
+        guard let reason = ExporterRejection(rejection) else { return }
+        lastRejection = Rejection(reason: reason, at: date)
     }
 }
 
@@ -66,8 +78,9 @@ final class UsageIngestCredentialHolder {
     ///   missing or unusable (`UsageIngestCredentialStore.loadOrCreate`).
     /// - `create: false` creates nothing: no usable file holds nil.
     ///
-    /// The file work runs off the main actor (`loadOrCreate` may wait for
-    /// a file lock). A load that throws leaves the held credential as it
+    /// The file work runs on the usage file queue (`UsageFileWork`), off
+    /// the main actor and the concurrency pool (`loadOrCreate` may wait
+    /// for a file lock). A load that throws leaves the held credential as it
     /// was and the error reaches the caller.
     @discardableResult
     func load(create: Bool, directory: String) async throws -> UsageIngestCredential? {
@@ -76,12 +89,13 @@ final class UsageIngestCredentialHolder {
         return loaded
     }
 
-    @concurrent
     private nonisolated static func readCredential(
         create: Bool, directory: String
     ) async throws -> UsageIngestCredential? {
-        guard create else { return UsageIngestCredentialStore.read(directory: directory) }
-        return try UsageIngestCredentialStore.loadOrCreate(
-            directory: directory, makeToken: { try SecureRandomTokenGenerator().makeToken() })
+        try await UsageFileWork.run {
+            guard create else { return UsageIngestCredentialStore.read(directory: directory) }
+            return try UsageIngestCredentialStore.loadOrCreate(
+                directory: directory, makeToken: { try SecureRandomTokenGenerator().makeToken() })
+        }
     }
 }
