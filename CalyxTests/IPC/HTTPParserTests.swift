@@ -238,7 +238,8 @@ final class HTTPParserTests: XCTestCase {
     // MARK: - Edge Case: Content-Length Mismatch (Body Too Short)
 
     func test_contentLengthMismatch_bodyTooShort() {
-        // Content-Length says 100 but actual body is only 5 bytes
+        // Content-Length says 100 but actual body is only 5 bytes: the
+        // request did not fully arrive, which is an error (R3a-0).
         let rawString =
             "POST /data HTTP/1.1\r\n"
             + "Content-Length: 100\r\n"
@@ -246,20 +247,31 @@ final class HTTPParserTests: XCTestCase {
             + "hello"
         let raw = makeRawData(rawString)
 
-        // Parser should either return partial body or throw malformedRequest.
-        // We accept either behavior — the key is it must not crash.
-        do {
-            let request = try HTTPParser.parse(raw)
-            // If it succeeds, body should be what was actually available
-            if let body = request.body {
-                XCTAssertLessThanOrEqual(body.count, 100,
-                    "Body must not exceed claimed Content-Length")
-            }
-        } catch {
-            XCTAssertEqual(error as? HTTPParseError, .malformedRequest,
-                "Content-Length mismatch should throw malformedRequest if treated as error")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
         }
     }
+
+    func test_parse_bodyOneByteShort_throwsIncompleteBody() {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 6\r\n\r\nhello")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
+        }
+    }
+
+    func test_parse_noBodyBytesWithContentLength5_throwsIncompleteBody() {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
+        }
+    }
+
+    func test_parse_bodyOfExactLength_parses() throws {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+        let request = try HTTPParser.parse(raw)
+        XCTAssertEqual(request.body, Data("hello".utf8))
+    }
+
 
     // MARK: - Edge Case: Case-Insensitive Headers
 

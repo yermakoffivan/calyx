@@ -68,6 +68,9 @@ enum HTTPParseError: Error, Equatable {
     case headerTooLarge
     case bodyTooLarge
     case invalidContentLength
+    /// Fewer body bytes are present than the declared `Content-Length`:
+    /// the connection ended (or was answered) before the body arrived.
+    case incompleteBody
     case malformedRequest
     case timeout
 }
@@ -159,13 +162,14 @@ struct HTTPParser {
                 // Content-Length: 0 → nil body
                 body = nil
             } else {
-                // Extract body bytes starting after the separator
-                let bodyStart = separatorRange.upperBound
-                if bodyStart < data.endIndex {
-                    let available = data[bodyStart..<data.endIndex]
-                    let take = min(length, available.count)
-                    body = Data(available.prefix(take))
+                // Extract body bytes starting after the separator. A body
+                // shorter than declared is an error, never a partial body:
+                // a request that did not fully arrive must not reach a route.
+                let available = data[separatorRange.upperBound..<data.endIndex]
+                guard available.count >= length else {
+                    throw HTTPParseError.incompleteBody
                 }
+                body = Data(available.prefix(length))
             }
         }
 

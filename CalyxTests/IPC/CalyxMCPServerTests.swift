@@ -1538,3 +1538,184 @@ private func sendChunkedRequestOverRawSocket(port: Int, chunks: [Data], recvTime
 
     return try readRawSocketStatusCode(fd: fd, errorDomain: errorDomain)
 }
+
+// MARK: - A route never runs on a request that did not fully arrive (R3a-0)
+
+/// Counts how often a route ran. The observable seam: `/calyx-mcp`'s POST
+/// route builds its pane context (`calyxMCPPaneContext`) on every request
+/// that passed `Origin` and the bearer token and found a router, before
+/// anything looks at the body; with an `X-Calyx-Herdr-Pane-ID` header and
+/// no explicit socket that asks `herdrDefaultSocketPath()` exactly once.
+/// Nothing else in the server calls that closure.
+@MainActor
+private final class RouteRunCounter {
+    private(set) var runs = 0
+    func record() { runs += 1 }
+}
+
+extension CalyxMCPServerTests {
+
+    private func makeObservedServer(token: String) -> (CalyxMCPServer, RouteRunCounter) {
+        let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
+        srv.agentRegistry = AgentRegistry()
+        srv.setCalyxMCPRouter(MCPCalyxMCPRouterTestSupport.makeMinimalRouter(bearerToken: { token }))
+        let counter = RouteRunCounter()
+        srv.herdrDefaultSocketPath = {
+            counter.record()
+            return nil
+        }
+        return (srv, counter)
+    }
+
+    /// Waits (bounded) until `sendHTTPResponse` has been entered `count`
+    /// times: a route that runs does so before its response is sent.
+    private func waitForResponseAttempts(_ srv: CalyxMCPServer, count: Int) async {
+        for _ in 0..<250 where srv._testSendHTTPResponseAttemptCount < count {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// Precondition for the tests below: a complete request with the pane
+    /// header is observed as exactly one route run.
+    func test_routeRunSeam_completeCalyxMCPRequest_isObservedOnce() async throws {
+        let token = "route-run-seam-token"
+        let (srv, counter) = makeObservedServer(token: token)
+        defer { srv.stop() }
+        try await srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}".utf8)
+
+        _ = try await Task.detached {
+            try sendObservedCalyxMCPRequest(port: port, token: token, declaredLength: body.count, body: body, closeWriteSide: false)
+        }.value
+
+        XCTAssertEqual(counter.runs, 1)
+    }
+
+    func test_cutOffBody_tenOfThousandBytesThenClose_routeDoesNotRun() async throws {
+        let token = "cut-off-ten-token"
+        let (srv, counter) = makeObservedServer(token: token)
+        defer { srv.stop() }
+        try await srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let response = try await Task.detached {
+            try sendObservedCalyxMCPRequest(port: port, token: token, declaredLength: 1_000, body: Data(repeating: 0x20, count: 10), closeWriteSide: true)
+        }.value
+        await waitForResponseAttempts(srv, count: 1)
+
+        XCTAssertEqual(counter.runs, 0, "a route must not run on a body that did not fully arrive")
+        XCTAssertEqual(statusCode(ofRawResponse: response), 400, "the server answers before it closes")
+    }
+
+    func test_cutOffBody_zeroOfThousandBytesThenClose_routeDoesNotRun() async throws {
+        let token = "cut-off-zero-token"
+        let (srv, counter) = makeObservedServer(token: token)
+        defer { srv.stop() }
+        try await srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let response = try await Task.detached {
+            try sendObservedCalyxMCPRequest(port: port, token: token, declaredLength: 1_000, body: Data(), closeWriteSide: true)
+        }.value
+        await waitForResponseAttempts(srv, count: 1)
+
+        XCTAssertEqual(counter.runs, 0, "a route must not run when none of the declared body arrived")
+        XCTAssertEqual(statusCode(ofRawResponse: response), 400, "the server answers before it closes")
+    }
+
+    /// The deadline's 408 cancels the connection, which completes the
+    /// outstanding receive and hands the partial buffer on (the second
+    /// `sendHTTPResponse` entry, see
+    /// `test_headersOnlyRequest_neverReceivesASecondResponseAfter408`);
+    /// no route may run on it.
+    func test_headersOnlyHeldOpen_408Once_routeDoesNotRunAfterwards() async throws {
+        let token = "held-open-token"
+        let (srv, counter) = makeObservedServer(token: token)
+        defer { srv.stop() }
+        srv.connectionReceiveDeadline = .milliseconds(300)
+        try await srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let response = try await Task.detached {
+            try sendObservedCalyxMCPRequest(port: port, token: token, declaredLength: 1_000, body: Data(), closeWriteSide: false)
+        }.value
+        await waitForResponseAttempts(srv, count: 2)
+
+        XCTAssertEqual(statusCode(ofRawResponse: response), 408)
+        XCTAssertEqual(response.components(separatedBy: "HTTP/1.1 ").count - 1, 1, "exactly one response")
+        XCTAssertEqual(srv._testSendHTTPResponseAttemptCount, 2, "precondition: the stale second entry happened")
+        XCTAssertEqual(srv._testSendHTTPResponseSentCount, 1)
+        XCTAssertEqual(counter.runs, 0, "no route may run after the 408")
+    }
+}
+
+/// The status code of the first status line of `text`, nil when there is none.
+private func statusCode(ofRawResponse text: String) -> Int? {
+    guard let statusLine = text.components(separatedBy: "\r\n").first else { return nil }
+    let parts = statusLine.split(separator: " ", maxSplits: 2)
+    guard parts.count >= 2 else { return nil }
+    return Int(parts[1])
+}
+
+/// POSTs to `/calyx-mcp` with the bearer token and an
+/// `X-Calyx-Herdr-Pane-ID` header (the route-run seam), declaring
+/// `declaredLength` and sending `body`; with `closeWriteSide` the client
+/// then shuts its write side. Reads to EOF and returns the raw response
+/// text (empty when the server closed without answering). File scope, no
+/// actor isolation, for `Task.detached`; never raises SIGPIPE.
+private func sendObservedCalyxMCPRequest(port: Int, token: String, declaredLength: Int, body: Data, closeWriteSide: Bool) throws -> String {
+    let errorDomain = "RouteRunSeamTest"
+    var headerString = "POST /calyx-mcp HTTP/1.1\r\n"
+    headerString += "Host: 127.0.0.1:\(port)\r\n"
+    headerString += "Authorization: Bearer \(token)\r\n"
+    headerString += "Content-Type: application/json\r\n"
+    // A buffered answer (whatever its status) closes the connection; the
+    // seam is asked before the router looks at Accept or the body.
+    headerString += "Accept: application/json\r\n"
+    headerString += "X-Calyx-Herdr-Pane-ID: route-run-seam\r\n"
+    headerString += "Content-Length: \(declaredLength)\r\n"
+    headerString += "\r\n"
+    var toSend = Data(headerString.utf8)
+    toSend.append(body)
+
+    let fd = try openRawSocketToLoopback(port: port, recvTimeoutSeconds: 5, errorDomain: errorDomain)
+    defer { close(fd) }
+    var one: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+
+    try toSend.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+        guard let base = rawBuf.baseAddress else { return }
+        var offset = 0
+        while offset < rawBuf.count {
+            let sent = Darwin.send(fd, base.advanced(by: offset), rawBuf.count - offset, 0)
+            if sent > 0 {
+                offset += sent
+                continue
+            }
+            if sent < 0 && errno == EINTR { continue }
+            throw NSError(domain: errorDomain, code: 3, userInfo: [NSLocalizedDescriptionKey: "send() failed: errno \(errno)"])
+        }
+    }
+    if closeWriteSide {
+        _ = shutdown(fd, SHUT_WR)
+    }
+
+    var responseData = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let received = buffer.withUnsafeMutableBytes { rawBuf -> Int in
+            Darwin.recv(fd, rawBuf.baseAddress, rawBuf.count, 0)
+        }
+        if received > 0 {
+            responseData.append(contentsOf: buffer.prefix(received))
+            continue
+        }
+        if received < 0 && errno == EINTR { continue }
+        if received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+            throw NSError(domain: errorDomain, code: 6, userInfo: [NSLocalizedDescriptionKey: "receive timed out after 5 s"])
+        }
+        break
+    }
+    return String(decoding: responseData, as: UTF8.self)
+}

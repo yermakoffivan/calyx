@@ -1570,13 +1570,9 @@ final class CalyxMCPServer {
     /// `Content-Length`-declared body arrive as separate TCP segments
     /// (more likely under load — see `CalyxMCPServerTests`'s
     /// `test_realHTTPRequest_headersAndBodySplitAcrossTCPSegments_stillParsesCompleteRequest`)
-    /// used to reach `HTTPParser.parse` with the body segment still
-    /// missing. `HTTPParser.parse` doesn't treat that as an error
-    /// either — with no body bytes yet present it silently returns
-    /// `HTTPRequest.body == nil` rather than raising an
-    /// `HTTPParseError` — so `routeMCP`'s `guard let body else { 400 }`
-    /// fired on a request that was actually well-formed, just not
-    /// fully arrived yet.
+    /// would otherwise reach `HTTPParser.parse` with the body segment
+    /// still missing and be answered `.incompleteBody` (400) although it
+    /// was well-formed, just not fully arrived yet.
     ///
     /// `HTTPParser.completeness(of:)` only ever inspects `accumulator.data`
     /// for completeness (and only until `accumulator.requiredTotal` is
@@ -1627,12 +1623,15 @@ final class CalyxMCPServer {
                         // *stale* `receive()` call that only completed
                         // because the receive-deadline `Task` already
                         // sent a 408 and cancelled the connection out
-                        // from under it. Either way, hand whatever
-                        // bytes we do have to the same parse-and-respond
-                        // path a complete request goes through —
-                        // `sendHTTPResponse`'s `accumulator.didRespond`
-                        // guard is what actually decides whether this
-                        // particular call gets to respond.
+                        // from under it. Either way the buffer is not a
+                        // complete request, and `finishRequest` runs no
+                        // route on it: `HTTPParser.parse` rejects a body
+                        // shorter than its `Content-Length`
+                        // (`.incompleteBody`) or a cut-off header block,
+                        // and the resulting 400 goes through
+                        // `sendHTTPResponse`, whose
+                        // `accumulator.didRespond` guard drops it when
+                        // the 408 already went out.
                         deadlineTask.cancel()
                         await self.finishRequest(connection: connection, buffer: accumulator.data, accumulator: accumulator)
                         return
@@ -1657,12 +1656,24 @@ final class CalyxMCPServer {
     /// `route(request:)` takes is never bounded by it.
     ///
     /// Can be entered more than once for the same `accumulator` (see
-    /// `sendHTTPResponse`'s doc comment for how) — every exit path here
-    /// routes through `sendHTTPResponse`, which is what actually
-    /// guarantees only the first call gets to respond.
+    /// `sendHTTPResponse`'s doc comment for how). A parse error always
+    /// goes through `sendHTTPResponse`, which guarantees only the first
+    /// call gets to respond; a request that parsed on a connection already
+    /// answered ends before any route code runs.
     private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
         do {
             let httpRequest = try HTTPParser.parse(buffer, maxBodySize: accumulator.bodyLimit)
+            // A connection that was already answered runs no route, even
+            // for a request that parsed complete: the receive-deadline
+            // `Task` and the receive callback carrying the last body bytes
+            // can both be queued on the main actor, and when the 408 Task
+            // runs first, the callback then finds the buffer `.complete`
+            // and calls here. The client has its answer, so the route's side effects
+            // must not happen behind it, and its response would be dropped
+            // by `sendHTTPResponse` anyway. The check sits after the parse
+            // so a parse error still goes through `sendHTTPResponse`, whose
+            // `didRespond` guard drops it, exactly as before.
+            guard !accumulator.didRespond else { return }
             if httpRequest.path == HTTPParser.calyxMCPPath {
                 await serveCalyxMCP(connection: connection, request: httpRequest, accumulator: accumulator)
                 return
@@ -1673,7 +1684,7 @@ final class CalyxMCPServer {
             let statusCode: Int
             switch error {
             case .headerTooLarge, .bodyTooLarge: statusCode = 413
-            case .invalidContentLength, .malformedRequest: statusCode = 400
+            case .invalidContentLength, .incompleteBody, .malformedRequest: statusCode = 400
             case .timeout: statusCode = 408
             }
             self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: statusCode, body: nil), accumulator: accumulator)
@@ -1847,10 +1858,11 @@ final class CalyxMCPServer {
     /// `connection.cancel()` completes whatever `receive()` call was
     /// still outstanding at that moment. That completion re-enters
     /// `receiveUntilComplete`'s `isComplete || error != nil` branch —
-    /// indistinguishable there from a genuine peer close — which would,
-    /// without this guard, call `finishRequest` and send a second,
-    /// spurious response on a connection already cancelled by the
-    /// first. `deadlineTask.cancel()` at each of `receiveUntilComplete`'s
+    /// indistinguishable there from a genuine peer close — which calls
+    /// `finishRequest` on the partial buffer. That buffer ends in a parse
+    /// error (no route runs on it, see `finishRequest`), and without this
+    /// guard its 400 would go out as a second, spurious response on a
+    /// connection already cancelled by the first. `deadlineTask.cancel()` at each of `receiveUntilComplete`'s
     /// terminal branches narrows the same race in the other direction
     /// but — being only a cooperative-cancellation flag — cannot fully
     /// close it either: this `didRespond` check is the actual
