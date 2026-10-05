@@ -15,7 +15,10 @@
 //  session's project root).
 //
 //  `UsageLedger.shared` is never touched: what it adds to the
-//  composition is the enabling rule, which is a pure function here.
+//  composition is the enabling rule and the choice of store directory,
+//  both pure functions here. The store directory is tested with literal
+//  paths only; nothing is created in the real Application Support or
+//  temporary directories.
 //  Nothing waits by polling or sleeping: `note` registers the read before
 //  it returns, so `waitUntilIdle()` ends after that read was published.
 //
@@ -76,6 +79,41 @@ final class UsageLedgerProductionTests: XCTestCase {
             "a launch that must not touch the real agent paths keeps tracking off whatever the setting says")
         XCTAssertFalse(UsageLedger.isTrackingEnabled(setting: false, launchMayTouchAgentPaths: true))
         XCTAssertFalse(UsageLedger.isTrackingEnabled(setting: false, launchMayTouchAgentPaths: false))
+    }
+
+    // MARK: - The store directory
+
+    /// A literal stand-in for `AppSupportDirectory.usagePath`; nothing
+    /// exists or is created there.
+    private let literalUsagePath = "/Users/nobody/Library/Application Support/Calyx/usage"
+
+    func test_productionStoreDirectory_whenTheLaunchMayTouchAgentPaths_isUsagePathAsADirectory() {
+        let url = UsageLedger.productionStoreDirectory(launchMayTouchAgentPaths: true, usagePath: literalUsagePath)
+
+        XCTAssertEqual(url, URL(fileURLWithPath: literalUsagePath, isDirectory: true))
+        XCTAssertTrue(url.hasDirectoryPath)
+    }
+
+    /// A UI-test launch without a scoped path root keeps tracking off,
+    /// but the Usage window still reads and can delete through the
+    /// ledger: its store must not be the developer's real one.
+    func test_productionStoreDirectory_whenTheLaunchMayNotTouchAgentPaths_isANonexistentTemporaryDirectory()
+        throws
+    {
+        let url = UsageLedger.productionStoreDirectory(launchMayTouchAgentPaths: false, usagePath: literalUsagePath)
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let temporary = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+
+        XCTAssertTrue(url.isFileURL)
+        XCTAssertTrue(url.hasDirectoryPath)
+        XCTAssertFalse(path.hasPrefix(literalUsagePath), "\(path) is the real usage directory or inside it")
+        XCTAssertTrue(path.hasPrefix(temporary + "/"), "\(path) is not under \(temporary)")
+        XCTAssertNotEqual(path, temporary, "a directory of its own, not the temporary directory itself")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "nothing creates it")
+        XCTAssertEqual(
+            UsageLedger.productionStoreDirectory(launchMayTouchAgentPaths: false, usagePath: literalUsagePath), url,
+            "one directory per process")
     }
 
     // MARK: - Ingest and publish

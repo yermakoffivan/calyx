@@ -538,11 +538,14 @@ extension UsageLedger {
         )
     }
 
-    /// The app's ledger, over Claude Code's projects directory and the
-    /// usage directory in Application Support. Created at its first use,
-    /// on whichever thread that is; creating it only computes paths. The
-    /// setting and the launch policy are read at every call of
-    /// `isEnabled`, so a change of the setting applies to the next event.
+    /// The app's ledger, over Claude Code's projects directory. Its store
+    /// directory (`productionStoreDirectory`) is the usage directory in
+    /// Application Support, or a per-process temporary directory in a
+    /// launch that may not touch the developer's paths; it is decided
+    /// once, when this is created. Created at its first use, on whichever
+    /// thread that is; creating it only computes paths. The setting and
+    /// the launch policy are read at every call of `isEnabled`, so a
+    /// change of the setting applies to the next event.
     static let shared = makeProduction(
         isEnabled: {
             isTrackingEnabled(
@@ -551,9 +554,36 @@ extension UsageLedger {
             )
         },
         projectsRoot: { AgentToolPaths.claudeProjectsDirectory },
-        storeDirectory: URL(fileURLWithPath: AppSupportDirectory.usagePath, isDirectory: true),
+        storeDirectory: productionStoreDirectory(
+            launchMayTouchAgentPaths: LaunchEnvironmentPolicy.mayPerformAgentIPCActivation(),
+            usagePath: AppSupportDirectory.usagePath
+        ),
         summaries: .shared
     )
+
+    /// The directory of the app's usage database: `usagePath` when this
+    /// launch may touch the developer's real paths; otherwise a directory
+    /// of this process's own under `NSTemporaryDirectory()`, which this
+    /// function does not create.
+    ///
+    /// Reading and deleting open an existing database whatever the
+    /// tracking setting, so a launch that may not touch the real paths
+    /// (a `--uitesting` launch without a scoped path root) must not point
+    /// them at the real one. The temporary directory is safe only because
+    /// tracking is off in exactly that launch (`isTrackingEnabled(setting:
+    /// launchMayTouchAgentPaths:)` with `launchMayTouchAgentPaths` false),
+    /// so nothing creates it or writes there: reads find no database and
+    /// a delete removes nothing. Allowing tracking in such a launch would
+    /// start writing into the temporary directory, so that rule and this
+    /// one must change together.
+    static func productionStoreDirectory(launchMayTouchAgentPaths: Bool, usagePath: String) -> URL {
+        guard launchMayTouchAgentPaths else {
+            return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent(
+                    "Calyx-usage-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        }
+        return URL(fileURLWithPath: usagePath, isDirectory: true)
+    }
 
     /// One log line per diagnostic. Session ids, paths and a failure's
     /// description (which may name a path) keep the default private

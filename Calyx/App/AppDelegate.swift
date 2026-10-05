@@ -2677,6 +2677,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         sessionBrowserItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(sessionBrowserItem)
 
+        viewMenu.addItem(
+            withTitle: "Usage",
+            action: #selector(openUsageWindow(_:)),
+            keyEquivalent: ""
+        )
+
         // Window menu
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
@@ -4534,6 +4540,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// palette command `session.attach`, the Settings panel button).
     @objc private func openSessionBrowser(_ sender: Any?) {
         SessionBrowserWindowController.shared.showBrowser()
+    }
+
+    /// View menu's "Usage" item (no key equivalent; the palette's
+    /// `usage.show` command is the keyboard path).
+    @objc private func openUsageWindow(_ sender: Any?) {
+        UsageWindowController.shared.showUsage()
     }
 }
 

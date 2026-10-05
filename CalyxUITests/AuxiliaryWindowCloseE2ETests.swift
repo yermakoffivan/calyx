@@ -51,7 +51,7 @@
 //
 // THIS FILE COVERS (one scenario per test, mirroring this directory's
 // established style, e.g. `LastWindowCloseDoesNotQuitE2ETests`): for
-// each of About / Settings / Session Browser, opened via its own real
+// each of About / Settings / Session Browser / Usage, opened via its own real
 // menu item (the ordinary way any of these becomes the frontmost,
 // user-focused panel -- all three are today plain `NSWindow`s that DO
 // become main the moment they become key, but still never the terminal's
@@ -332,6 +332,59 @@ final class AuxiliaryWindowCloseE2ETests: CalyxUITestCase {
         XCTAssertEqual(
             waitForCount(countTabBarTabs, toEqual: 2), 2,
             "Terminal tab count changed after Cmd+W closed the Session Browser -- the terminal's tabs must be untouched."
+        )
+    }
+
+    /// The Usage window (`UsageWindowController`) is a plain `NSWindow`
+    /// like Settings and the Session Browser, opened by its own View menu
+    /// item: Cmd+W with it key must close it and leave the terminal's
+    /// tabs alone.
+    ///
+    /// Touches no real usage data: this launch passes `--uitesting`
+    /// without `--calyx-path-root=`, so
+    /// `LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()` is false.
+    /// That keeps tracking off (`UsageLedger.isTrackingEnabled`) and points
+    /// the shared ledger's store at a per-process temporary directory
+    /// (`UsageLedger.productionStoreDirectory`) that does not exist, so the
+    /// window's read opens nothing and the developer's database in
+    /// Application Support is never opened.
+    ///
+    /// Unlike its siblings this case does not pause after `app.activate()`;
+    /// it waits for the menu bar instead.
+    func test_cmdW_withUsageKey_closesUsage_andLeavesTerminalTabsIntact() {
+        ensureMenuBarReady()
+        fixTabCountAtTwo()
+
+        let windowCountBeforeUsage = app.windows.count
+        XCTAssertEqual(windowCountBeforeUsage, 1, "Precondition: only the terminal window should be open before Usage.")
+
+        app.activate()
+        XCTAssertTrue(waitFor(app.menuBars.firstMatch, timeout: 10), "Calyx's menu bar is not available.")
+        menuAction("View", item: "Usage")
+
+        let usageWindow = app.windows["Usage"]
+        XCTAssertTrue(waitFor(usageWindow, timeout: 10), "Usage window (titled \"Usage\") did not appear.")
+        logWindowsSnapshot("after opening Usage")
+        saveScreenshot(name: "auxiliary-close-usage-open")
+
+        XCTAssertEqual(
+            app.windows.count, windowCountBeforeUsage + 1,
+            "Usage should open exactly one additional window."
+        )
+
+        app.typeKey("w", modifierFlags: .command)
+
+        // Part 1: the Usage window must actually close.
+        waitForNonExistence(usageWindow, timeout: 5)
+        XCTAssertEqual(
+            app.windows.count, windowCountBeforeUsage,
+            "Usage window did not close after Cmd+W while it was key."
+        )
+
+        // Part 2: the terminal's tabs, fixed at 2, are untouched.
+        XCTAssertEqual(
+            waitForCount(countTabBarTabs, toEqual: 2), 2,
+            "Terminal tab count changed after Cmd+W closed the Usage window -- the terminal's tabs must be untouched."
         )
     }
 }

@@ -769,6 +769,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.toggleMissionMap()
         })
+        commandRegistry.register(PaletteCommand(id: "usage.show", title: "Usage…", category: "View") {
+            UsageWindowController.shared.showUsage()
+        })
         commandRegistry.register(PaletteCommand(id: "browser.open", title: "Open Browser Tab", category: "Browser") { [weak self] in
             self?.promptAndOpenBrowserTab()
         })

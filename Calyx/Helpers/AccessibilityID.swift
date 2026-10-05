@@ -321,4 +321,17 @@ enum AccessibilityID {
         static let importParseError = "calyx.settings.mcpServers.import.parseError"
         static let importConfirmButton = "calyx.settings.mcpServers.import.confirmButton"
     }
+    /// Usage window (UsageWindowView, Calyx/Features/Usage/): its
+    /// filter pickers, the model x effort table, its two buttons, the
+    /// tracking-off banner and the footnote under the table.
+    enum Usage {
+        static let periodPicker = "calyx.usage.periodPicker"
+        static let projectPicker = "calyx.usage.projectPicker"
+        static let threadPicker = "calyx.usage.threadPicker"
+        static let table = "calyx.usage.table"
+        static let refreshButton = "calyx.usage.refreshButton"
+        static let deleteButton = "calyx.usage.deleteButton"
+        static let trackingOffBanner = "calyx.usage.trackingOffBanner"
+        static let footnote = "calyx.usage.footnote"
+    }
 }

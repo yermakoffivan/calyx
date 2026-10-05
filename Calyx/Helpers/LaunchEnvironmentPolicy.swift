@@ -65,6 +65,11 @@ enum LaunchEnvironmentPolicy {
     /// (`UsageLedger.isTrackingEnabled`), for the same reason: where this
     /// is false, the transcripts the ledger would read and the directory
     /// its database would be created in are the developer's real ones.
+    /// Where it is false the shared ledger's store is also moved to a
+    /// per-process temporary directory
+    /// (`UsageLedger.productionStoreDirectory`), because reading and
+    /// deleting (the Usage window) open an existing database even with
+    /// tracking off.
     static func mayPerformAgentIPCActivation(arguments: [String], hasScopedPathRoot: Bool) -> Bool {
         !(arguments.contains("--uitesting") && !hasScopedPathRoot)
     }
