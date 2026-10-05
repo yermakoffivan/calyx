@@ -39,6 +39,9 @@
 //    focusSurfaceID:) -- an explicit focusSurfaceID always wins over the
 //    pane's own surfaceID
 //  - cwd label abbreviation, via MissionMapCwdAbbreviator directly
+//  - a card's usage is `usage[entry.sessionID]`; nil
+//    for an entry with another or no session id, a pane with no entry,
+//    or an empty `usage`; the agent kind is not consulted
 //
 
 import XCTest
@@ -63,11 +66,12 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
 
     private func entry(
         surfaceID: UUID, source: AgentSource = .hooks, state: AgentState = .working,
-        unreadCount: Int = 0, focusSurfaceID: UUID? = nil
+        unreadCount: Int = 0, focusSurfaceID: UUID? = nil, sessionID: String? = "session-1",
+        kind: String = AgentEntry.claudeCodeKind
     ) -> AgentEntry {
         AgentEntry(
-            surfaceID: surfaceID, sessionID: "session-1", source: source, state: state,
-            cwd: "/Users/dev/project", kind: AgentEntry.claudeCodeKind, lastEventAt: Date(),
+            surfaceID: surfaceID, sessionID: sessionID, source: source, state: state,
+            cwd: "/Users/dev/project", kind: kind, lastEventAt: Date(),
             unreadCount: unreadCount, focusSurfaceID: focusSurfaceID
         )
     }
@@ -109,13 +113,26 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         ipcEvents: [IPCMessageEvent] = [], peerToSurface: [UUID: UUID] = [:],
         appPeerID: UUID? = nil, editedFiles: [AgentEditedFile] = [],
         git: [String: MissionMapGitBadge] = [:], now: Date = Date(),
-        conflictWindow: TimeInterval = 300, ipcEdgeLifetime: TimeInterval = 30
+        conflictWindow: TimeInterval = 300, ipcEdgeLifetime: TimeInterval = 30,
+        usage: [String: UsageRow] = [:]
     ) -> MissionMapInput {
-        MissionMapInput(
+        var input = MissionMapInput(
             panes: panes, entries: entries, children: children, pendingApprovals: pendingApprovals,
             ipcEvents: ipcEvents, peerToSurface: peerToSurface, appPeerID: appPeerID,
             editedFiles: editedFiles, git: git, now: now, conflictWindow: conflictWindow,
             ipcEdgeLifetime: ipcEdgeLifetime
+        )
+        input.usage = usage
+        return input
+    }
+
+    /// A session total; `output` makes rows for different sessions
+    /// distinguishable.
+    private func usageRow(output: Int64 = 1_500) -> UsageRow {
+        UsageRow(
+            key: [], responses: 2, finalResponses: 1, inputTokens: 100, cacheReadTokens: 20,
+            cacheCreationTokens: 3, cacheCreation1hTokens: 0, outputTokensFinal: output,
+            thinkingTokensFinal: 0, lastTimestampMs: 1_700_000_000_000
         )
     }
 
@@ -702,5 +719,107 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         let result = MissionMapCwdAbbreviator.abbreviate("/var/tmp", home: "/Users/dev", maxComponents: 2)
 
         XCTAssertEqual(result, "/var/tmp")
+    }
+
+    // MARK: - Usage
+
+    /// A pane whose agent entry's session has a usage row carries that row.
+    func test_build_usage_isTheSessionsRow_whenEntrySessionHasARow() {
+        let surfaceID = UUID()
+        let row = usageRow()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: surfaceID)],
+            entries: [surfaceID: entry(surfaceID: surfaceID, sessionID: "session-1")],
+            usage: ["session-1": row]
+        ))
+
+        XCTAssertEqual(result.cards.first?.usage, row)
+    }
+
+    /// Each pane gets its own session's row, not another pane's.
+    func test_build_usage_followsEachPanesOwnSession() {
+        let a = UUID()
+        let b = UUID()
+        let rowA = usageRow(output: 1_500)
+        let rowB = usageRow(output: 2_700)
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: a), pane(surfaceID: b)],
+            entries: [
+                a: entry(surfaceID: a, sessionID: "session-a"),
+                b: entry(surfaceID: b, sessionID: "session-b"),
+            ],
+            usage: ["session-a": rowA, "session-b": rowB]
+        ))
+
+        let rows = Dictionary(uniqueKeysWithValues: result.cards.map { ($0.id, $0.usage) })
+        XCTAssertEqual(rows[a], rowA)
+        XCTAssertEqual(rows[b], rowB)
+    }
+
+    func test_build_usage_isNil_whenEntrySessionHasNoRow() {
+        let surfaceID = UUID()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: surfaceID)],
+            entries: [surfaceID: entry(surfaceID: surfaceID, sessionID: "session-2")],
+            usage: ["session-1": usageRow()]
+        ))
+
+        XCTAssertEqual(result.cards.count, 1)
+        XCTAssertNil(result.cards.first?.usage)
+    }
+
+    func test_build_usage_isNil_whenEntryHasNoSessionID() {
+        let surfaceID = UUID()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: surfaceID)],
+            entries: [surfaceID: entry(surfaceID: surfaceID, sessionID: nil)],
+            usage: ["session-1": usageRow(), "": usageRow()]
+        ))
+
+        XCTAssertEqual(result.cards.count, 1)
+        XCTAssertNil(result.cards.first?.usage)
+    }
+
+    /// A pane no agent has reported from has no session, even when its
+    /// pane carries a Calyx session id that matches a usage key.
+    func test_build_usage_isNil_whenPaneHasNoEntry() {
+        let surfaceID = UUID()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: surfaceID, agentKind: AgentEntry.claudeCodeKind, calyxSessionID: "session-1")],
+            usage: ["session-1": usageRow()]
+        ))
+
+        XCTAssertEqual(result.cards.count, 1)
+        XCTAssertNil(result.cards.first?.usage)
+    }
+
+    func test_build_usage_isNilOnEveryCard_whenUsageIsEmpty() {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: a), pane(surfaceID: b), pane(surfaceID: c)],
+            entries: [
+                a: entry(surfaceID: a, sessionID: "session-1"),
+                b: entry(surfaceID: b, sessionID: "session-2"),
+            ]
+        ))
+
+        XCTAssertEqual(result.cards.count, 3)
+        XCTAssertEqual(result.cards.map(\.usage), [nil, nil, nil])
+    }
+
+    /// The agent kind is not checked: a row keyed by the entry's session
+    /// is carried whatever the kind.
+    func test_build_usage_doesNotDependOnAgentKind() {
+        let surfaceID = UUID()
+        let row = usageRow()
+        let result = MissionMapSnapshotBuilder.build(input: input(
+            panes: [pane(surfaceID: surfaceID)],
+            entries: [surfaceID: entry(surfaceID: surfaceID, sessionID: "session-1", kind: AgentEntry.codexKind)],
+            usage: ["session-1": row]
+        ))
+
+        XCTAssertEqual(result.cards.first?.usage, row)
     }
 }

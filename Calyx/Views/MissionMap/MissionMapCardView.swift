@@ -47,6 +47,9 @@ struct MissionMapCardView: View {
             if let git = card.git {
                 gitLine(git)
             }
+            if let usage = card.usage {
+                usageLine(usage)
+            }
             if let toolLine = card.toolLine {
                 Text(toolLine)
                     .font(.caption.monospaced())
@@ -148,6 +151,21 @@ struct MissionMapCardView: View {
         }
         .font(.caption2)
         .foregroundStyle(.secondary)
+    }
+
+    /// The session's token summary, read as one element with the spoken
+    /// form of the same numbers.
+    private func usageLine(_ usage: UsageRow) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "chart.bar")
+            Text(UsageCardLine.text(for: usage))
+                .lineLimit(1)
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(UsageCardLine.accessibilityLabel(for: usage))
+        .accessibilityIdentifier(AccessibilityID.MissionMap.cardUsage(card.id))
     }
 
     private func childRow(_ child: MissionMapChildCard) -> some View {

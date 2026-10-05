@@ -14,6 +14,10 @@
 //  - Group bands: cards of two different groups never share a row
 //  - Children extend a card's own frame height beyond a childless card's
 //  - No two placed frames overlap
+//  - Usage adds exactly `usageRowHeight` (16) to a card's height,
+//    on top of any children; frames still never overlap when only some
+//    cards carry it
+//  - MissionMapView.cardSize stays 260 x 150
 //
 
 import XCTest
@@ -26,14 +30,20 @@ final class MissionMapLayoutTests: XCTestCase {
 
     private func card(
         id: UUID = UUID(), groupID: UUID, groupName: String = "Default", tabID: UUID = UUID(),
-        children: [MissionMapChildCard] = []
+        children: [MissionMapChildCard] = [], usage: UsageRow? = nil
     ) -> MissionMapCard {
         MissionMapCard(
             id: id, groupID: groupID, groupName: groupName, tabID: tabID, kindLabel: "claude-code",
             paneTitle: "Shell", cwdLabel: "~/project", state: .working, toolLine: nil,
-            children: children, unreadCount: 0, approval: nil, git: nil, focusTarget: id
+            children: children, unreadCount: 0, approval: nil, git: nil, focusTarget: id,
+            usage: usage
         )
     }
+
+    private let row = UsageRow(
+        key: [], responses: 1, finalResponses: 1, inputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0,
+        cacheCreation1hTokens: 0, outputTokensFinal: 1, thinkingTokensFinal: 0, lastTimestampMs: 0
+    )
 
     private func childCard(id: String = "sub-1") -> MissionMapChildCard {
         MissionMapChildCard(id: id, agentType: "explore", state: .working, toolLine: "ls -la")
@@ -148,5 +158,81 @@ final class MissionMapLayoutTests: XCTestCase {
 
         XCTAssertFalse(from.insetBy(dx: 1, dy: 1).contains(start), "Start anchor must not be strictly interior to `from`")
         XCTAssertFalse(to.insetBy(dx: 1, dy: 1).contains(end), "End anchor must not be strictly interior to `to`")
+    }
+
+    // MARK: - Usage line height
+
+    func test_usageRowHeight_is16() {
+        XCTAssertEqual(MissionMapLayout.usageRowHeight, 16)
+    }
+
+    func test_cardHeight_withoutUsage_isTheBaseHeight() {
+        let plain = card(groupID: UUID())
+
+        XCTAssertEqual(MissionMapLayout.cardHeight(for: plain, baseHeight: 120), 120)
+    }
+
+    func test_cardHeight_withUsage_isExactlyOneUsageRowTaller() {
+        let withUsage = card(groupID: UUID(), usage: row)
+
+        XCTAssertEqual(MissionMapLayout.cardHeight(for: withUsage, baseHeight: 120), 136)
+    }
+
+    /// Children and usage each add their own rows.
+    func test_cardHeight_withChildrenAndUsage_addsBoth() {
+        let both = card(groupID: UUID(), children: [childCard(), childCard(id: "sub-2")], usage: row)
+        let childrenOnly = card(groupID: UUID(), children: [childCard(), childCard(id: "sub-2")])
+
+        XCTAssertEqual(MissionMapLayout.cardHeight(for: childrenOnly, baseHeight: 120), 160)
+        XCTAssertEqual(MissionMapLayout.cardHeight(for: both, baseHeight: 120), 176)
+    }
+
+    /// The laid-out frame uses the same height: a card with usage
+    /// is exactly 16 points taller than its neighbour without one.
+    func test_layout_cardWithUsage_frameIsExactlyOneUsageRowTaller() {
+        let groupID = UUID()
+        let group = MissionMapGroup(id: groupID, name: "Default")
+        let plain = card(groupID: groupID)
+        let withUsage = card(groupID: groupID, usage: row)
+
+        let frames = MissionMapLayout.layout(
+            cards: [plain, withUsage], groups: [group], in: CGSize(width: 1200, height: 800),
+            cardSize: cardSize, spacing: spacing
+        )
+
+        XCTAssertEqual(frames[plain.id]?.height, 120)
+        XCTAssertEqual(frames[withUsage.id]?.height, 136)
+    }
+
+    /// Rows mixing cards with and without usage: every frame has
+    /// its own exact height and none overlaps another, so the row below
+    /// clears the tallest card.
+    func test_layout_noTwoFramesOverlap_whenSomeCardsHaveUsage() {
+        let groupID = UUID()
+        let group = MissionMapGroup(id: groupID, name: "Default")
+        let cards = (0..<8).map { index in
+            card(groupID: groupID, usage: index % 3 == 1 ? row : nil)
+        }
+
+        let frames = MissionMapLayout.layout(
+            cards: cards, groups: [group], in: CGSize(width: 700, height: 2000), cardSize: cardSize, spacing: spacing
+        )
+
+        for card in cards {
+            XCTAssertEqual(frames[card.id]?.height, card.usage == nil ? 120 : 136)
+        }
+        let placed = cards.compactMap { frames[$0.id] }
+        XCTAssertEqual(placed.count, cards.count)
+        for i in 0..<placed.count {
+            for j in (i + 1)..<placed.count {
+                XCTAssertFalse(placed[i].intersects(placed[j]), "Frames \(placed[i]) and \(placed[j]) must not overlap")
+            }
+        }
+    }
+
+    /// Usage grows the card instead of the base card size.
+    @MainActor
+    func test_missionMapView_cardSize_staysUnchanged() {
+        XCTAssertEqual(MissionMapView.cardSize, CGSize(width: 260, height: 150))
     }
 }

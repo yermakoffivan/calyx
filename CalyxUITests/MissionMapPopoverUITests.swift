@@ -119,6 +119,42 @@ final class MissionMapPopoverUITests: CalyxUITestCase {
         waitForNonExistence(container)
     }
 
+    /// The fixture's a4 card carries a usage row: its usage line is one
+    /// accessibility element with the spoken label, drawn inside that
+    /// card directly below the git line (`main`) and above the tool line
+    /// (`Bash: swift test`).
+    func test_fixtureMap_cardUsageLine_isLabelledAndSitsBetweenGitAndToolLines() throws {
+        menuAction("View", item: "Mission Map")
+
+        let container = missionMapContainer()
+        XCTAssertTrue(waitFor(container, timeout: 5), "Mission Map should appear after View > Mission Map")
+
+        let usagePrefix = "calyx.missionMap.cardUsage."
+        let usageQuery = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", usagePrefix))
+        let usage = usageQuery.firstMatch
+        XCTAssertTrue(waitFor(usage, timeout: 5), "The fixture card with usage should show its usage line")
+        XCTAssertEqual(usageQuery.count, 1, "Only the fixture's a4 card carries usage")
+
+        XCTAssertEqual(usage.label, "Usage: at least 45.2k output tokens, 1.2M input tokens")
+
+        let uuid = String(usage.identifier.dropFirst(usagePrefix.count))
+        let card = app.descendants(matching: .any).matching(identifier: "calyx.missionMap.card.\(uuid)").firstMatch
+        XCTAssertTrue(card.exists, "The usage line's card should exist")
+        XCTAssertTrue(
+            card.frame.contains(usage.frame),
+            "Usage line \(usage.frame) must lie inside its card \(card.frame)"
+        )
+
+        let gitText = card.staticTexts["main"]
+        let toolText = card.staticTexts["Bash: swift test"]
+        XCTAssertTrue(gitText.exists, "The card's git line should show the branch")
+        XCTAssertTrue(toolText.exists, "The card's tool line should be shown")
+        // XCUI frames grow downward: below means a larger y.
+        XCTAssertGreaterThanOrEqual(usage.frame.minY, gitText.frame.maxY, "usage line below the git line")
+        XCTAssertLessThanOrEqual(usage.frame.maxY, toolText.frame.minY, "usage line above the tool line")
+    }
+
     private func missionMapContainer() -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: "calyx.missionMap").firstMatch
     }

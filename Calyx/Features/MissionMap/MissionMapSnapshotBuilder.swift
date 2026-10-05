@@ -82,7 +82,11 @@ enum MissionMapSnapshotBuilder {
             // surface is the target, exactly as for a `.hooks` row.
             focusTarget: entry.map {
                 AgentRowFocusTarget.resolve(source: $0.source, surfaceID: $0.surfaceID, focusSurfaceID: $0.focusSurfaceID)
-            } ?? pane.surfaceID
+            } ?? pane.surfaceID,
+            // Only an agent's own session id is looked up: a pane with no
+            // agent row has no session, whatever its Calyx session id is.
+            // No kind check, since only Claude Code sessions get a row.
+            usage: entry?.sessionID.flatMap { input.usage[$0] }
         )
     }
 

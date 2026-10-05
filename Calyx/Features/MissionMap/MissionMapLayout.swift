@@ -16,13 +16,17 @@ enum MissionMapLayout {
     static let bandHeaderHeight: CGFloat = 24
     /// Extra card height per subagent row.
     static let childRowHeight: CGFloat = 20
+    /// Extra card height for the usage line, so a card that shows one
+    /// grows instead of squeezing its other rows.
+    static let usageRowHeight: CGFloat = 16
     /// The width of the obstacle each band's header text occupies, so
     /// routed lines do not run through the group's name.
     static let bandHeaderObstacleWidth: CGFloat = 200
 
-    /// A card's height: `baseHeight` plus one `childRowHeight` per child.
+    /// A card's height: `baseHeight` plus one `childRowHeight` per child,
+    /// plus `usageRowHeight` when the card has a usage line.
     static func cardHeight(for card: MissionMapCard, baseHeight: CGFloat) -> CGFloat {
-        baseHeight + CGFloat(card.children.count) * childRowHeight
+        baseHeight + CGFloat(card.children.count) * childRowHeight + (card.usage == nil ? 0 : usageRowHeight)
     }
 
     /// The top-left of each band's header, keyed by group ID -- where the

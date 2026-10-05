@@ -182,7 +182,7 @@ struct MissionMapView: View {
                 children[pane.surfaceID] = paneChildren
             }
         }
-        return MissionMapSnapshotBuilder.build(input: MissionMapInput(
+        var input = MissionMapInput(
             panes: paneList,
             entries: registry.entries,
             children: children,
@@ -195,7 +195,11 @@ struct MissionMapView: View {
             now: now,
             conflictWindow: MissionMapConflictDetector.recentWindow,
             ipcEdgeLifetime: Self.ipcEdgeLifetime
-        ))
+        )
+        // Read here, inside `body`'s snapshot path, so the map redraws
+        // when a session's summary changes.
+        input.usage = UsageLiveSummaries.shared.bySession
+        return MissionMapSnapshotBuilder.build(input: input)
     }
 
     /// See `MissionMapSnapshot.nextIPCExpiry(in:lifetime:)`: the tick
