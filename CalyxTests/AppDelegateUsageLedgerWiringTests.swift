@@ -47,6 +47,10 @@
 //  off, which is what the startup did before R4b; its effects reach this
 //  test's ledger and holder and never a settings file.
 //
+//  R5b: the bridge it installs answers `usage_report` from
+//  `ledger.tokenReports`: a fixture export posted to the usage route
+//  appears in the tool's rows and totals.
+//
 //  WAITING. A test waits for a publish that must happen through an
 //  expectation (bound: UsageWiringFixture.waitSeconds, reached only on
 //  failure). Before asserting what was or was not published it calls
@@ -444,67 +448,90 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         XCTAssertNotNil(server.usageBridge)
     }
 
-    // Two panes, each running its own session. Both events are read and
-    // `settle` closes the ledger behind every read they started, so the
-    // store holds both sessions before the tool is called; the tool's own
-    // reconcile then re-reads fixed transcripts and changes nothing.
+    // R5b: the bridge reads `ledger.tokenReports`. The database is created
+    // first with tracking from the epoch, so run1's last export, posted to
+    // the usage route, is stored in full. Pane A's hook event names the
+    // export's session, pane B's another session. The route answers only
+    // once the export is committed (`ingestExport`, r3b contract C), so
+    // the store holds it before the tool is called; `settle` comes last
+    // and only closes the ledger behind every task started. Neither
+    // session has a transcript, so the tool's catch-up only finds them
+    // missing and adds no unreported row.
     //
     // The registry is replaced AFTER `startUsageLedger`: `current` must be
     // looked up in whatever registry the server holds at call time. The
     // usage setting in the test suite is never written (so it reads off):
     // only the ledger's own switch decides.
-    func test_usageReport_trackingOn_reportsTheStoredRows_andCurrentIsTheCallingPanesSession() async throws {
-        try fixture.write(
-            [Fixture.assistantLine("msg_a1"), Fixture.assistantLine("msg_a2")], to: fixture.mainPath(sessionA))
-        try fixture.write([Fixture.assistantLine("msg_b1", sessionID: sessionB)], to: fixture.mainPath(sessionB))
+    func test_usageReport_reportsTheStoredExport_andCurrentIsTheCallingPanesSession() async throws {
+        let holder = try theHolder()
+        let seeded = try UsageStore(directory: fixture.storeURL, now: UsageTestClock(Date(timeIntervalSince1970: 0)).now)
+        await seeded.close()
+        let credential = try writeCredential()
+        let body = try XCTUnwrap(try UsageTelemetryFixtures.exports(run: "run1").last)
+        let exportSessions = Set(try UsageTelemetryFixtures.rawTokenPoints(in: body).map(\.sessionID))
+        XCTAssertEqual(exportSessions.count, 1, "Fixture error: run1 is one session")
+        let exportSession = try XCTUnwrap(exportSessions.first)
+        XCTAssertNotEqual(exportSession, sessionB, "Fixture error")
+        let expected = try UsageTelemetryFixtures.expectedTotals(run: "run1")
         let ledger = makeLedger()
         start(ledger)
         server.agentRegistry = AgentRegistry()
+        _ = try await holder.load(create: false, directory: credentialDirectory)
+        XCTAssertEqual(holder.credential, credential, "Fixture error")
         let paneA = UUID()
         let paneB = UUID()
 
-        let eventA = await server.route(request: try eventRequest("Stop", sessionA, surfaceID: paneA))
+        let posted = await server.route(request: usageRequest(body, token: credential.token))
+        let eventA = await server.route(request: try eventRequest("Stop", exportSession, surfaceID: paneA))
         let eventB = await server.route(request: try eventRequest("Stop", sessionB, surfaceID: paneB))
+        XCTAssertEqual(posted.statusCode, 200, "Fixture error")
         XCTAssertEqual(eventA.statusCode, 204)
         XCTAssertEqual(eventB.statusCode, 204)
-        await settle(ledger)
-        XCTAssertEqual(publishedRows, rows(entry(sessionA, 2), entry(sessionB, 1)), "Fixture error")
         XCTAssertFalse(UsageTrackingSettings.enabled, "Fixture error: the suite's setting is off")
 
-        let bySession = try await usageReport(["group_by": ["session"]])
-        let fromPaneA = try await usageReport(["session_id": "current", "group_by": ["model"]], from: paneA)
+        let byModel = try await usageReport(["group_by": ["model"]])
+        let fromPaneA = try await usageReport(["session_id": "current", "group_by": ["session"]], from: paneA)
         let fromPaneB = try await usageReport(["session_id": "current", "group_by": [String]()], from: paneB)
+        await settle(ledger)
 
-        XCTAssertFalse(bySession.isError, bySession.text)
-        let all = try object(bySession.text)
-        let allRows = try XCTUnwrap(all["rows"] as? [[String: Any]])
-        XCTAssertEqual(allRows.map { ($0["key"] as? [String: Any])?["session"] as? String }, [sessionA, sessionB])
-        XCTAssertEqual(allRows.map { number($0["responses"]) }, [2, 1])
-        XCTAssertEqual(number((all["totals"] as? [String: Any])?["responses"]), 3)
+        XCTAssertFalse(byModel.isError, byModel.text)
+        let all = try object(byModel.text)
+        let rows = try XCTUnwrap(all["rows"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["unreported"] as? Bool }, [Bool?](repeating: false, count: rows.count))
+        let reported = UsageTelemetryFixtures.sumByModel(rows.flatMap { row -> [(String, String, Int64)] in
+            let model = (row["key"] as? [String: Any])?["model"] as? String ?? ""
+            return [
+                (model, "input", number(row["input_tokens"]) ?? Int64.min),
+                (model, "output", number(row["output_tokens"]) ?? Int64.min),
+                (model, "cacheRead", number(row["cache_read_tokens"]) ?? Int64.min),
+                (model, "cacheCreation", number(row["cache_creation_tokens"]) ?? Int64.min),
+            ]
+        })
+        XCTAssertEqual(reported, expected)
+        let totals = try XCTUnwrap(all["totals"] as? [String: Any])
+        let expectedSum = { (kind: String) -> Int64 in expected.values.reduce(0) { $0 &+ ($1[kind] ?? 0) } }
+        XCTAssertEqual(number(totals["input_tokens"]), expectedSum("input"))
+        XCTAssertEqual(number(totals["output_tokens"]), expectedSum("output"))
+        XCTAssertEqual(number(totals["cache_read_tokens"]), expectedSum("cacheRead"))
+        XCTAssertEqual(number(totals["cache_creation_tokens"]), expectedSum("cacheCreation"))
+        let unreported = try XCTUnwrap(totals["unreported"] as? [String: Any])
+        for name in ["input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens"] {
+            XCTAssertEqual(number(unreported[name]), 0, name)
+        }
         XCTAssertEqual(all["time_zone"] as? String, Calendar.current.timeZone.identifier)
 
         XCTAssertFalse(fromPaneA.isError, fromPaneA.text)
         let a = try object(fromPaneA.text)
         let aRows = try XCTUnwrap(a["rows"] as? [[String: Any]])
-        XCTAssertEqual(aRows.count, 1)
-        XCTAssertEqual((aRows.first?["key"] as? [String: Any])?["model"] as? String, "claude-opus-5-5")
-        // By hand: two final responses of input 3, output 420, thinking
-        // 150, cache read 90,000, cache creation 1,200 (1,000 of it 1h).
-        let row = try XCTUnwrap(aRows.first)
-        XCTAssertEqual(number(row["responses"]), 2)
-        XCTAssertEqual(number(row["final_responses"]), 2)
-        XCTAssertEqual(number(row["input_tokens"]), 6)
-        XCTAssertEqual(number(row["cache_read_tokens"]), 180_000)
-        XCTAssertEqual(number(row["cache_creation_tokens"]), 2_400)
-        XCTAssertEqual(number(row["cache_creation_1h_tokens"]), 2_000)
-        XCTAssertEqual(number(row["output_tokens_final"]), 840)
-        XCTAssertEqual(number(row["thinking_tokens_final"]), 300)
-        XCTAssertEqual(row["last_timestamp"] as? String, "2026-10-02T10:27:29.765Z")
+        XCTAssertEqual(aRows.map { ($0["key"] as? [String: Any])?["session"] as? String }, [exportSession])
+        XCTAssertEqual(number((a["totals"] as? [String: Any])?["output_tokens"]), expectedSum("output"))
 
         XCTAssertFalse(fromPaneB.isError, fromPaneB.text)
         let b = try object(fromPaneB.text)
-        XCTAssertEqual((b["rows"] as? [[String: Any]])?.map { number($0["responses"]) }, [1])
-        XCTAssertEqual(number((b["totals"] as? [String: Any])?["output_tokens_final"]), 420)
+        XCTAssertEqual(number(b["row_count"]), 0)
+        let bTotals = try XCTUnwrap(b["totals"] as? [String: Any])
+        XCTAssertEqual(number(bTotals["output_tokens"]), 0)
+        XCTAssertTrue(bTotals["last_timestamp"] is NSNull)
     }
 
     // The pane's agent row knows no session: `current` cannot be resolved.

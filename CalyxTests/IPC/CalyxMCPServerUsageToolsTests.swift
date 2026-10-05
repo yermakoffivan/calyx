@@ -27,11 +27,11 @@ import XCTest
 private final class UsageBridgeProbe: Sendable {
     private struct State: Sendable {
         var enabled = true
-        var reportCalls: [[UsageQuery]] = []
+        var reportCalls: [[UsageTokenQuery]] = []
         var surfacesAsked: [UUID] = []
         var sessions: [UUID: String] = [:]
         var failure: (any Error & Sendable)?
-        var rows: [UsageRow] = []
+        var rows: [UsageTokenRow] = []
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -41,14 +41,14 @@ private final class UsageBridgeProbe: Sendable {
         set { state.withLock { $0.enabled = newValue } }
     }
 
-    var reportCalls: [[UsageQuery]] { state.withLock { $0.reportCalls } }
+    var reportCalls: [[UsageTokenQuery]] { state.withLock { $0.reportCalls } }
     var surfacesAsked: [UUID] { state.withLock { $0.surfacesAsked } }
 
     func setSession(_ sessionID: String, for surfaceID: UUID) { state.withLock { $0.sessions[surfaceID] = sessionID } }
     func fail(with error: any Error & Sendable) { state.withLock { $0.failure = error } }
-    func answerRows(_ rows: [UsageRow]) { state.withLock { $0.rows = rows } }
+    func answerRows(_ rows: [UsageTokenRow]) { state.withLock { $0.rows = rows } }
 
-    func reports(_ queries: [UsageQuery]) throws -> [[UsageRow]] {
+    func reports(_ queries: [UsageTokenQuery]) throws -> [[UsageTokenRow]] {
         let (failure, rows) = state.withLock { state in
             state.reportCalls.append(queries)
             return (state.failure, state.rows)
@@ -98,9 +98,9 @@ final class CalyxMCPServerUsageToolsTests: XCTestCase {
     // MARK: - Helpers
 
     private func installBridge() {
-        let probe = self.probe!
+        guard let probe = self.probe else { return XCTFail("Fixture error: no probe") }
         var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        utc.timeZone = TimeZone(secondsFromGMT: 0) ?? utc.timeZone
         server.usageBridge = MCPUsageBridge(
             isEnabled: { probe.enabled },
             reports: { queries, _ in try probe.reports(queries) },
@@ -208,6 +208,26 @@ final class CalyxMCPServerUsageToolsTests: XCTestCase {
         XCTAssertTrue(usageParagraphs(plain).first?.contains("usage_") == true)
     }
 
+    // R5b: the paragraph is the contract's exact text, and nothing of the
+    // transcript-based version 1 remains in it.
+    func test_instructions_usageParagraph_isTheContractsText() throws {
+        let paragraph = try XCTUnwrap(usageParagraphs(MCPRouter.instructions).first)
+        let lowered = paragraph.lowercased()
+
+        XCTAssertEqual(
+            paragraph,
+            "Usage tools (usage_*) report Claude Code token usage as counted by Claude Code itself and received by "
+                + "Calyx over its telemetry, and work only while Settings > Agents > Usage Tracking is on. Use "
+                + "usage_report to aggregate input, cache and output tokens by model, effort, thread, agent_type, "
+                + "day, project or session, optionally limited to the last N days, a since/until range, one session "
+                + "(session_id \"current\" is the session in your own pane), a project or a thread. Rows with "
+                + "unreported true are tokens Calyx knows were used but did not receive in detail; the notes field "
+                + "explains them.")
+        for gone in ["transcript", "lower bound", "lower than", "branch", "advisor", "responses", "thinking_tokens"] {
+            XCTAssertFalse(lowered.contains(gone), "\(gone) in \(paragraph)")
+        }
+    }
+
     private static func instructions(_ result: AnyCodable) -> String? {
         guard let data = try? JSONEncoder().encode(result),
               let decoded = try? JSONDecoder().decode(CalyxIPCInitializeResult.self, from: data) else { return nil }
@@ -220,10 +240,9 @@ final class CalyxMCPServerUsageToolsTests: XCTestCase {
         installBridge()
         let pane = UUID()
         probe.setSession("session-of-pane", for: pane)
-        probe.answerRows([UsageRow(
-            key: ["claude-opus-5-5"], responses: 4, finalResponses: 3, inputTokens: 12, cacheReadTokens: 360_000,
-            cacheCreationTokens: 4_800, cacheCreation1hTokens: 4_000, outputTokensFinal: 1_260,
-            thinkingTokensFinal: 450, lastTimestampMs: 1_790_936_849_765)])
+        probe.answerRows([UsageTokenRow(
+            key: ["claude-opus-5-5"], isUnreported: false, inputTokens: 12, cacheReadTokens: 360_000,
+            cacheCreationTokens: 4_800, outputTokens: 1_260, lastTimestampMs: 1_790_936_849_765)])
 
         let (text, isError) = try await callUsageReport(
             ["session_id": "current", "group_by": ["model"]], surfaceID: pane)
@@ -231,15 +250,20 @@ final class CalyxMCPServerUsageToolsTests: XCTestCase {
         XCTAssertFalse(isError, text)
         XCTAssertEqual(probe.surfacesAsked, [pane])
         XCTAssertEqual(probe.reportCalls, [[
-            UsageQuery(groupBy: [.model], sessionID: "session-of-pane"),
-            UsageQuery(groupBy: [], sessionID: "session-of-pane"),
+            UsageTokenQuery(groupBy: [.model], sessionID: "session-of-pane"),
+            UsageTokenQuery(groupBy: [], sessionID: "session-of-pane"),
         ]])
         let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
         let rows = try XCTUnwrap(object["rows"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual((rows.first?["key"] as? [String: Any])?["model"] as? String, "claude-opus-5-5")
-        XCTAssertEqual((rows.first?["output_tokens_final"] as? NSNumber)?.int64Value, 1_260)
-        XCTAssertEqual(((object["totals"] as? [String: Any])?["responses"] as? NSNumber)?.int64Value, 4)
+        XCTAssertEqual((rows.first?["output_tokens"] as? NSNumber)?.int64Value, 1_260)
+        XCTAssertEqual(rows.first?["unreported"] as? Bool, false)
+        // The probe answers the same row to the totals query.
+        let totals = try XCTUnwrap(object["totals"] as? [String: Any])
+        XCTAssertEqual((totals["input_tokens"] as? NSNumber)?.int64Value, 12)
+        XCTAssertEqual((totals["cache_read_tokens"] as? NSNumber)?.int64Value, 360_000)
+        XCTAssertEqual(((totals["unreported"] as? [String: Any])?["output_tokens"] as? NSNumber)?.int64Value, 0)
     }
 
     func test_toolsCall_withoutASurfaceHeader_currentIsAToolError() async throws {

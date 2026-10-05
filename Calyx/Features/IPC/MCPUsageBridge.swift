@@ -2,8 +2,8 @@
 // Calyx
 //
 // Bridges the MCP tool surface onto the usage ledger's Gold query:
-// exposes `usage_report`, which aggregates the token usage Calyx has
-// recorded from Claude Code transcripts. Same shape as
+// exposes `usage_report`, which aggregates the token usage Claude Code
+// counted itself and Calyx received over its telemetry. Same shape as
 // MCPCommandLogBridge (thrown LocalizedError, plain switch dispatch,
 // JSON text result); the ledger is reached through closures, so the
 // bridge holds no store and reads nothing on its own.
@@ -51,7 +51,7 @@ enum MCPUsageBridgeError: Error, LocalizedError, Equatable {
 final class MCPUsageBridge {
 
     private let isEnabled: () -> Bool
-    private let reports: ([UsageQuery], Calendar) async throws -> [[UsageRow]]
+    private let reports: ([UsageTokenQuery], Calendar) async throws -> [[UsageTokenRow]]
     private let currentSessionID: (UUID) -> String?
     private let now: () -> Date
     private let calendar: () -> Calendar
@@ -66,7 +66,7 @@ final class MCPUsageBridge {
     ///   used (`UsagePeriod.localDayCalendar`).
     init(
         isEnabled: @escaping () -> Bool,
-        reports: @escaping ([UsageQuery], Calendar) async throws -> [[UsageRow]],
+        reports: @escaping ([UsageTokenQuery], Calendar) async throws -> [[UsageTokenRow]],
         currentSessionID: @escaping (UUID) -> String?,
         now: @escaping () -> Date,
         calendar: @escaping () -> Calendar
@@ -83,7 +83,7 @@ final class MCPUsageBridge {
     /// Wire name of each `group_by` dimension. An exhaustive switch
     /// rather than the raw value, so the Swift case names (such as
     /// `agentType`) are not accepted on the wire.
-    nonisolated private static func wireName(_ dimension: UsageQuery.Dimension) -> String {
+    nonisolated private static func wireName(_ dimension: UsageTokenQuery.Dimension) -> String {
         switch dimension {
         case .model: return "model"
         case .effort: return "effort"
@@ -91,16 +91,15 @@ final class MCPUsageBridge {
         case .agentType: return "agent_type"
         case .day: return "day"
         case .project: return "project"
-        case .branch: return "branch"
         case .session: return "session"
         }
     }
 
     /// Every dimension by its wire name, in the order the schema lists them.
-    nonisolated private static let dimensions: [(wire: String, dimension: UsageQuery.Dimension)] =
-        UsageQuery.Dimension.allCases.map { (wireName($0), $0) }
+    nonisolated private static let dimensions: [(wire: String, dimension: UsageTokenQuery.Dimension)] =
+        UsageTokenQuery.Dimension.allCases.map { (wireName($0), $0) }
 
-    private static let defaultGroupBy: [UsageQuery.Dimension] = [.model, .effort]
+    private static let defaultGroupBy: [UsageTokenQuery.Dimension] = [.model, .effort]
     private static let defaultLimit = 200
     private static let limitRange = 1...1_000
     /// The `session_id` value that means the calling pane's session.
@@ -112,12 +111,11 @@ final class MCPUsageBridge {
     nonisolated static let tools: [MCPTool] = [
         MCPTool(
             name: "usage_report",
-            description: "Report the Claude Code token usage Calyx has recorded from session transcripts, "
-                + "aggregated by the group_by dimensions (default model and effort). Each row carries "
-                + "responses, final_responses, input, cache read, cache creation (and its 1h part), output "
-                + "and thinking token sums, and the last timestamp; totals covers every matching record, "
-                + "also when limit cut the rows. Requires Settings > Agents > Usage Tracking. The notes "
-                + "field explains which numbers are lower bounds.",
+            description: "Report Claude Code token usage as counted by Claude Code itself and received by Calyx, "
+                + "aggregated by the group_by dimensions (default model and effort). Each row carries input, "
+                + "cache read, cache creation and output token sums and the last timestamp; rows with unreported "
+                + "true are tokens Calyx knows were used but did not receive in detail. totals covers every "
+                + "matching row, also when limit cut the rows. Requires Settings > Agents > Usage Tracking.",
             inputSchema: MCPRouter.schema(
                 properties: [
                     "group_by": AnyCodable([
@@ -128,7 +126,8 @@ final class MCPUsageBridge {
                         ] as [String: AnyCodable]),
                         "description": AnyCodable(
                             "Dimensions to group by, in key order: model, effort, thread, agent_type, day, "
-                                + "project, branch, session. Default [\"model\", \"effort\"]; [] gives one total row"),
+                                + "project, session. Default [\"model\", \"effort\"]; [] gives the totals as at most two rows "
+                                + "(recorded, unreported)"),
                     ] as [String: AnyCodable]),
                     "days": MCPRouter.prop(
                         "integer", "Only the last N local calendar days, today included (1 = today), "
@@ -138,7 +137,7 @@ final class MCPUsageBridge {
                     "session_id": MCPRouter.prop(
                         "string", "Only this Claude Code session; \"current\" is the session running in the calling pane"),
                     "project": MCPRouter.prop("string", "Only sessions whose project root is exactly this path"),
-                    "thread": MCPRouter.prop("string", "Only this thread: main, subagent or advisor"),
+                    "thread": MCPRouter.prop("string", "Only this thread: main, subagent or auxiliary"),
                     "limit": MCPRouter.prop("integer", "Maximum rows returned, 1 to 1000 (default 200)"),
                 ]
             )
@@ -147,10 +146,12 @@ final class MCPUsageBridge {
 
     /// Fixed notes attached to every result: what the numbers cover.
     private static let notes = [
-        "output_tokens_final and thinking_tokens_final count only responses whose final transcript line was "
-            + "written; compare final_responses with responses to see how much of a group they cover.",
-        "Requests Claude Code does not write to its transcript are not counted, so these numbers are lower than "
-            + "Claude Code's own session totals (output by roughly 1-3%, cache reads by more).",
+        "Token counts are Claude Code's own, received over its telemetry while Calyx was running. "
+            + "Thinking tokens are part of output_tokens.",
+        "Rows with unreported true are tokens Claude Code counted in a tracked session that Calyx did not "
+            + "receive (for example because Calyx was not running). Their model is known; effort, thread and "
+            + "agent are not, so they are missing from results filtered by thread.",
+        "A session is counted only if it was started while usage tracking was on.",
     ]
 
     // MARK: - Dispatch
@@ -211,7 +212,7 @@ final class MCPUsageBridge {
             resolvedSessionID = current
         }
 
-        let rowsQuery = UsageQuery(
+        let rowsQuery = UsageTokenQuery(
             groupBy: groupBy, sinceMs: sinceMs, untilMs: until, sessionID: resolvedSessionID,
             project: project.map { .root($0) }, thread: thread)
         var totalsQuery = rowsQuery
@@ -220,9 +221,10 @@ final class MCPUsageBridge {
         // One read for rows and totals, so both describe the same stored
         // state and the totals are not affected by `limit`.
         let results = try await reports([rowsQuery, totalsQuery], calendar)
-        // `reports` returns exactly one result per query.
-        let rows = results[0]
-        let totals = results[1]
+        // `reports` returns one result per query; read without subscripts
+        // so a short answer cannot trap.
+        let rows = results.first ?? []
+        let totals = results.dropFirst().first ?? []
 
         let wireNames = groupBy.map(Self.wireName)
         let result: [String: Any] = [
@@ -241,12 +243,12 @@ final class MCPUsageBridge {
 
     // MARK: - Argument decoding
 
-    private func decodeGroupBy(_ arguments: [String: Any]) throws -> [UsageQuery.Dimension] {
+    private func decodeGroupBy(_ arguments: [String: Any]) throws -> [UsageTokenQuery.Dimension] {
         guard let value = arguments["group_by"] else { return Self.defaultGroupBy }
         guard let names = value as? [String] else {
             throw MCPUsageBridgeError.invalidArgument(name: "group_by", reason: "expected an array of strings")
         }
-        var dimensions: [UsageQuery.Dimension] = []
+        var dimensions: [UsageTokenQuery.Dimension] = []
         for name in names {
             guard let dimension = Self.dimensions.first(where: { $0.wire == name })?.dimension else {
                 throw MCPUsageBridgeError.invalidArgument(name: "group_by", reason: "unknown dimension \(name)")
@@ -259,19 +261,22 @@ final class MCPUsageBridge {
         return dimensions
     }
 
-    private func decodeThread(_ arguments: [String: Any]) throws -> UsageRecord.Thread? {
+    /// The thread labels a `thread` filter accepts.
+    private static let threads: Set<String> = ["main", "subagent", "auxiliary"]
+
+    private func decodeThread(_ arguments: [String: Any]) throws -> String? {
         guard let raw = try optionalString(arguments, "thread") else { return nil }
-        guard let thread = UsageRecord.Thread(rawValue: raw) else {
-            throw MCPUsageBridgeError.invalidArgument(name: "thread", reason: "expected main, subagent or advisor")
+        guard Self.threads.contains(raw) else {
+            throw MCPUsageBridgeError.invalidArgument(name: "thread", reason: "expected main, subagent or auxiliary")
         }
-        return thread
+        return raw
     }
 
-    /// Optional timestamp argument in the one shape the transcripts use,
-    /// parsed by the transcript parser itself: epoch milliseconds.
+    /// Optional timestamp argument, parsed to epoch milliseconds by
+    /// `TranscriptTimestamp`.
     private func optionalTimestamp(_ arguments: [String: Any], _ key: String) throws -> Int64? {
         guard let text = try optionalString(arguments, key) else { return nil }
-        guard let ms = ClaudeTranscriptParser.epochMilliseconds(fromISO8601: text) else {
+        guard let ms = TranscriptTimestamp.epochMilliseconds(fromISO8601: text) else {
             throw MCPUsageBridgeError.invalidArgument(name: key, reason: "expected YYYY-MM-DDTHH:MM:SS[.fff]Z")
         }
         return ms
@@ -312,50 +317,70 @@ final class MCPUsageBridge {
     // MARK: - Result serialization
 
     /// One row: its key as an object keyed by the `group_by` wire names
-    /// (a nil group is JSON null) plus the nine fields.
-    private static func rowDict(_ row: UsageRow, wireNames: [String]) -> [String: Any] {
+    /// (a nil group is JSON null), its source and its token fields.
+    private static func rowDict(_ row: UsageTokenRow, wireNames: [String]) -> [String: Any] {
         var key: [String: Any] = [:]
         for (name, value) in zip(wireNames, row.key) {
             key[name] = value ?? NSNull()
         }
-        var dict = fieldsDict(row)
-        dict["key"] = key
-        return dict
-    }
-
-    /// The totals query's single row; with nothing matched Gold returns
-    /// no row, which is zero everywhere and no last timestamp.
-    private static func totalsDict(_ totals: [UsageRow]) -> [String: Any] {
-        guard let row = totals.first else {
-            var dict: [String: Any] = [:]
-            for name in numericFieldNames {
-                dict[name] = Int64(0)
-            }
-            dict["last_timestamp"] = NSNull()
-            return dict
-        }
-        return fieldsDict(row)
-    }
-
-    private static let numericFieldNames = [
-        "responses", "final_responses", "input_tokens", "cache_read_tokens", "cache_creation_tokens",
-        "cache_creation_1h_tokens", "output_tokens_final", "thinking_tokens_final",
-    ]
-
-    /// The nine fields of a row. Counts stay `Int64`, which
-    /// `JSONSerialization` writes exactly.
-    private static func fieldsDict(_ row: UsageRow) -> [String: Any] {
-        [
-            "responses": row.responses,
-            "final_responses": row.finalResponses,
+        return [
+            "key": key,
+            "unreported": row.isUnreported,
             "input_tokens": row.inputTokens,
             "cache_read_tokens": row.cacheReadTokens,
             "cache_creation_tokens": row.cacheCreationTokens,
-            "cache_creation_1h_tokens": row.cacheCreation1hTokens,
-            "output_tokens_final": row.outputTokensFinal,
-            "thinking_tokens_final": row.thinkingTokensFinal,
+            "output_tokens": row.outputTokens,
             "last_timestamp": timestamp(row.lastTimestampMs),
         ]
+    }
+
+    /// Saturating token sums. Counts stay `Int64`, which
+    /// `JSONSerialization` writes exactly.
+    private struct TokenSums {
+        var input: Int64 = 0
+        var cacheRead: Int64 = 0
+        var cacheCreation: Int64 = 0
+        var output: Int64 = 0
+
+        mutating func add(_ row: UsageTokenRow) {
+            input = Self.saturatingAdd(input, row.inputTokens)
+            cacheRead = Self.saturatingAdd(cacheRead, row.cacheReadTokens)
+            cacheCreation = Self.saturatingAdd(cacheCreation, row.cacheCreationTokens)
+            output = Self.saturatingAdd(output, row.outputTokens)
+        }
+
+        var dict: [String: Any] {
+            [
+                "input_tokens": input,
+                "cache_read_tokens": cacheRead,
+                "cache_creation_tokens": cacheCreation,
+                "output_tokens": output,
+            ]
+        }
+
+        private static func saturatingAdd(_ a: Int64, _ b: Int64) -> Int64 {
+            let (sum, overflow) = a.addingReportingOverflow(b)
+            guard overflow else { return sum }
+            return b > 0 ? Int64.max : Int64.min
+        }
+    }
+
+    /// Every row of the totals query summed (recorded and unreported), the
+    /// latest timestamp among them (null when nothing matched), and the
+    /// unreported part on its own.
+    private static func totalsDict(_ totals: [UsageTokenRow]) -> [String: Any] {
+        var all = TokenSums()
+        var unreported = TokenSums()
+        var last: Int64?
+        for row in totals {
+            all.add(row)
+            if row.isUnreported { unreported.add(row) }
+            last = max(last ?? row.lastTimestampMs, row.lastTimestampMs)
+        }
+        var dict = all.dict
+        dict["unreported"] = unreported.dict
+        dict["last_timestamp"] = last.map(timestamp) ?? NSNull()
+        return dict
     }
 
     /// `YYYY-MM-DDTHH:MM:SS.fffZ` in UTC, in integer arithmetic only, so

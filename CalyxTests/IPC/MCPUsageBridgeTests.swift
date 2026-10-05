@@ -3,7 +3,8 @@
 //  CalyxTests
 //
 //  Pins MCPUsageBridge, the `usage_report` MCP tool over the usage
-//  ledger's Gold query, driven through handleToolCall(name:arguments:
+//  ledger's token Gold query (`UsageTokenQuery` / `UsageTokenRow`, R5b),
+//  driven through handleToolCall(name:arguments:
 //  surfaceID:) with stub closures (no server, no store, no files):
 //
 //  - Tracking off is reported first, before any argument is looked at,
@@ -16,12 +17,15 @@
 //    and no grouping, so the totals describe the same state as the rows
 //    and are not affected by `limit`.
 //  - `days` becomes the local midnight N - 1 days back in the injected
-//    calendar; `since` / `until` go through the transcript parser,
+//    calendar; `since` / `until` go through `TranscriptTimestamp`,
 //    millisecond exact; `session_id: "current"` is the calling pane's
 //    agent session, resolved at each call.
 //  - The result is a JSON object (rows, row_count before `limit`,
-//    truncated, totals, two notes, the time zone), timestamps written as
-//    `YYYY-MM-DDTHH:MM:SS.fffZ`.
+//    truncated, totals, three notes, the time zone), timestamps written
+//    as `YYYY-MM-DDTHH:MM:SS.fffZ`. A row carries `unreported` and four
+//    token sums; `totals` sums EVERY row of the totals query (recorded
+//    and unreported, saturating at Int64.max) and adds an `unreported`
+//    object with the unreported part alone.
 //
 //  Expected epoch values were computed independently (Python) and are
 //  written out as literals next to the instants they stand for.
@@ -38,13 +42,13 @@ import XCTest
 /// gives them.
 private final class ReportsRecorder: Sendable {
     struct Call: Sendable {
-        let queries: [UsageQuery]
+        let queries: [UsageTokenQuery]
         let calendar: Calendar
     }
 
     private struct State: Sendable {
         var calls: [Call] = []
-        var answer: (@Sendable ([UsageQuery]) throws -> [[UsageRow]])?
+        var answer: (@Sendable ([UsageTokenQuery]) throws -> [[UsageTokenRow]])?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -52,19 +56,19 @@ private final class ReportsRecorder: Sendable {
     var calls: [Call] { state.withLock { $0.calls } }
 
     /// Answers every later call; without one, each query answers `[]`.
-    func answer(_ body: @escaping @Sendable ([UsageQuery]) throws -> [[UsageRow]]) {
+    func answer(_ body: @escaping @Sendable ([UsageTokenQuery]) throws -> [[UsageTokenRow]]) {
         state.withLock { $0.answer = body }
     }
 
     /// The rows query answers `rows`, the totals query `totals`.
-    func answer(rows: [UsageRow], totals: [UsageRow]) {
+    func answer(rows: [UsageTokenRow], totals: [UsageTokenRow]) {
         answer { queries in
             queries.map { $0.groupBy.isEmpty ? totals : rows }
         }
     }
 
-    func run(_ queries: [UsageQuery], _ calendar: Calendar) throws -> [[UsageRow]] {
-        let answer = state.withLock { state -> (@Sendable ([UsageQuery]) throws -> [[UsageRow]])? in
+    func run(_ queries: [UsageTokenQuery], _ calendar: Calendar) throws -> [[UsageTokenRow]] {
+        let answer = state.withLock { state -> (@Sendable ([UsageTokenQuery]) throws -> [[UsageTokenRow]])? in
             state.calls.append(Call(queries: queries, calendar: calendar))
             return state.answer
         }
@@ -106,12 +110,12 @@ private final class SessionTable: Sendable {
 @MainActor
 final class MCPUsageBridgeTests: XCTestCase {
 
-    private var recorder: ReportsRecorder!
-    private var enabled: Setting<Bool>!
-    private var sessions: SessionTable!
+    private var recorder = ReportsRecorder()
+    private var enabled = Setting(true)
+    private var sessions = SessionTable()
     /// 2026-10-02T10:27:29.765Z unless a test moves it.
-    private var now: Setting<Date>!
-    private var calendar: Setting<Calendar>!
+    private var now = Setting(Date(timeIntervalSince1970: 0))
+    private var calendar = Setting(Calendar(identifier: .gregorian))
 
     private static let nowMs: Int64 = 1_790_936_849_765
 
@@ -122,15 +126,6 @@ final class MCPUsageBridgeTests: XCTestCase {
         sessions = SessionTable()
         now = Setting(Self.date(ms: Self.nowMs))
         calendar = Setting(try Self.calendar("UTC"))
-    }
-
-    override func tearDown() async throws {
-        recorder = nil
-        enabled = nil
-        sessions = nil
-        now = nil
-        calendar = nil
-        try await super.tearDown()
     }
 
     // MARK: - Helpers
@@ -146,11 +141,11 @@ final class MCPUsageBridgeTests: XCTestCase {
     }
 
     private func makeBridge() -> MCPUsageBridge {
-        let recorder = self.recorder!
-        let enabled = self.enabled!
-        let sessions = self.sessions!
-        let now = self.now!
-        let calendar = self.calendar!
+        let recorder = self.recorder
+        let enabled = self.enabled
+        let sessions = self.sessions
+        let now = self.now
+        let calendar = self.calendar
         return MCPUsageBridge(
             isEnabled: { enabled.value },
             reports: { queries, calendar in try recorder.run(queries, calendar) },
@@ -183,7 +178,7 @@ final class MCPUsageBridgeTests: XCTestCase {
     }
 
     /// The rows query of the one `reports` call.
-    private func rowsQuery(file: StaticString = #filePath, line: UInt = #line) throws -> UsageQuery {
+    private func rowsQuery(file: StaticString = #filePath, line: UInt = #line) throws -> UsageTokenQuery {
         try XCTUnwrap(try onlyCall(file: file, line: line).queries.first, file: file, line: line)
     }
 
@@ -220,21 +215,27 @@ final class MCPUsageBridgeTests: XCTestCase {
         XCTAssertEqual(recorder.calls.count, 0, "nothing is read for \(arguments)", file: file, line: line)
     }
 
-    /// A row whose nine numbers all differ from each other and from any
+    /// A row whose four numbers all differ from each other and from any
     /// other row built with another `base`, so a field written under the
     /// wrong name, or taken from the wrong row, shows.
-    private func row(_ key: [String?], base: Int64, lastMs: Int64 = 1_790_936_849_765) -> UsageRow {
-        UsageRow(
+    private func row(
+        _ key: [String?], base: Int64, unreported: Bool = false, lastMs: Int64 = 1_790_936_849_765
+    ) -> UsageTokenRow {
+        UsageTokenRow(
             key: key,
-            responses: base + 1,
-            finalResponses: base + 2,
-            inputTokens: base + 3,
-            cacheReadTokens: base + 4,
-            cacheCreationTokens: base + 5,
-            cacheCreation1hTokens: base + 6,
-            outputTokensFinal: base + 7,
-            thinkingTokensFinal: base + 8,
+            isUnreported: unreported,
+            inputTokens: base + 1,
+            cacheReadTokens: base + 2,
+            cacheCreationTokens: base + 3,
+            outputTokens: base + 4,
             lastTimestampMs: lastMs)
+    }
+
+    /// A row with all four numbers equal to `value`.
+    private func flatRow(_ value: Int64, unreported: Bool, lastMs: Int64 = 1_790_936_849_765) -> UsageTokenRow {
+        UsageTokenRow(
+            key: [], isUnreported: unreported, inputTokens: value, cacheReadTokens: value,
+            cacheCreationTokens: value, outputTokens: value, lastTimestampMs: lastMs)
     }
 
     /// A JSON boolean parses as an NSNumber backed by CFBoolean; a JSON
@@ -261,35 +262,73 @@ final class MCPUsageBridgeTests: XCTestCase {
         return number.int64Value
     }
 
-    /// Asserts a row / totals object carries `expected`'s nine fields
-    /// under their wire names, with `lastTimestamp` as text.
+    /// Asserts an object carries the four token sums, in the order input,
+    /// cache read, cache creation, output, under their wire names.
+    private func assertSums(
+        _ object: Any?, _ expected: [Int64], file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let dict = object as? [String: Any] else {
+            return XCTFail("expected an object, got \(String(describing: object))", file: file, line: line)
+        }
+        XCTAssertEqual(expected.count, Self.sumNames.count, "Fixture error", file: file, line: line)
+        for (name, value) in zip(Self.sumNames, expected) {
+            XCTAssertEqual(int64(dict[name], file: file, line: line), value, name, file: file, line: line)
+        }
+    }
+
+    /// Asserts a row object carries `expected`'s four sums, its
+    /// `unreported` flag as a JSON boolean, and `lastTimestamp` as text.
     private func assertFields(
-        _ object: Any?, _ expected: UsageRow, lastTimestamp: String,
+        _ object: Any?, _ expected: UsageTokenRow, lastTimestamp: String,
         file: StaticString = #filePath, line: UInt = #line
     ) {
         guard let dict = object as? [String: Any] else {
             return XCTFail("expected an object, got \(String(describing: object))", file: file, line: line)
         }
-        let numbers: [(String, Int64)] = [
-            ("responses", expected.responses),
-            ("final_responses", expected.finalResponses),
-            ("input_tokens", expected.inputTokens),
-            ("cache_read_tokens", expected.cacheReadTokens),
-            ("cache_creation_tokens", expected.cacheCreationTokens),
-            ("cache_creation_1h_tokens", expected.cacheCreation1hTokens),
-            ("output_tokens_final", expected.outputTokensFinal),
-            ("thinking_tokens_final", expected.thinkingTokensFinal),
-        ]
-        for (name, value) in numbers {
-            XCTAssertEqual(int64(dict[name], file: file, line: line), value, name, file: file, line: line)
-        }
+        assertSums(
+            dict,
+            [expected.inputTokens, expected.cacheReadTokens, expected.cacheCreationTokens, expected.outputTokens],
+            file: file, line: line)
+        XCTAssertEqual(bool(dict["unreported"], file: file, line: line), expected.isUnreported, file: file, line: line)
         XCTAssertEqual(dict["last_timestamp"] as? String, lastTimestamp, file: file, line: line)
     }
 
-    private static let numericFieldNames: Set<String> = [
-        "responses", "final_responses", "input_tokens", "cache_read_tokens", "cache_creation_tokens",
-        "cache_creation_1h_tokens", "output_tokens_final", "thinking_tokens_final",
-    ]
+    /// Asserts the `totals` object: exactly its six members, the four
+    /// sums, the last timestamp (nil: JSON null) and the `unreported`
+    /// object with exactly its four sums.
+    private func assertTotals(
+        _ object: Any?, sums: [Int64], unreported: [Int64], lastTimestamp: String?,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let totals = object as? [String: Any] else {
+            return XCTFail("expected an object, got \(String(describing: object))", file: file, line: line)
+        }
+        XCTAssertEqual(Set(totals.keys), Self.totalsMembers, file: file, line: line)
+        assertSums(totals, sums, file: file, line: line)
+        if let lastTimestamp {
+            XCTAssertEqual(totals["last_timestamp"] as? String, lastTimestamp, file: file, line: line)
+        } else {
+            XCTAssertTrue(
+                totals["last_timestamp"] is NSNull, "last_timestamp: \(String(describing: totals["last_timestamp"]))",
+                file: file, line: line)
+        }
+        let part = totals["unreported"] as? [String: Any]
+        XCTAssertEqual(part.map { Set($0.keys) }, Set(Self.sumNames), "totals.unreported", file: file, line: line)
+        assertSums(part, unreported, file: file, line: line)
+    }
+
+    /// The four token sums, in the order `assertSums` takes them.
+    private static let sumNames = ["input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens"]
+    /// Exactly the members of a row.
+    private static let rowMembers: Set<String> = Set(sumNames).union(["key", "unreported", "last_timestamp"])
+    /// Exactly the members of `totals`.
+    private static let totalsMembers: Set<String> = Set(sumNames).union(["unreported", "last_timestamp"])
+
+    private func schemaProperties(file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        let tool = try XCTUnwrap(MCPUsageBridge.tools.first, file: file, line: line)
+        let schema = try JSONSerialization.jsonObject(with: JSONEncoder().encode(tool.inputSchema)) as? [String: Any]
+        return try XCTUnwrap(schema?["properties"] as? [String: Any], file: file, line: line)
+    }
 
     // MARK: - Catalogue
 
@@ -305,6 +344,39 @@ final class MCPUsageBridgeTests: XCTestCase {
         XCTAssertEqual(
             Set(properties.keys),
             ["group_by", "days", "since", "until", "session_id", "project", "thread", "limit"])
+    }
+
+    func test_tool_description_isExactlyTheContractsText() throws {
+        let tool = try XCTUnwrap(MCPUsageBridge.tools.first)
+
+        XCTAssertEqual(
+            tool.description,
+            "Report Claude Code token usage as counted by Claude Code itself and received by Calyx, aggregated "
+                + "by the group_by dimensions (default model and effort). Each row carries input, cache read, "
+                + "cache creation and output token sums and the last timestamp; rows with unreported true are "
+                + "tokens Calyx knows were used but did not receive in detail. totals covers every matching row, "
+                + "also when limit cut the rows. Requires Settings > Agents > Usage Tracking.")
+    }
+
+    // The enum is exactly the seven wire names, in schema order; `branch`
+    // is gone. The description is the contract's exact text.
+    func test_groupBySchema_enumIsTheSevenWireNames_andTheDescriptionNamesThem() throws {
+        let groupBy = try XCTUnwrap(try schemaProperties()["group_by"] as? [String: Any])
+        let items = try XCTUnwrap(groupBy["items"] as? [String: Any])
+        let seven = ["model", "effort", "thread", "agent_type", "day", "project", "session"]
+
+        XCTAssertEqual(items["enum"] as? [String], seven)
+        XCTAssertEqual(
+            groupBy["description"] as? String,
+            "Dimensions to group by, in key order: model, effort, thread, agent_type, day, project, session. "
+                + "Default [\"model\", \"effort\"]; [] gives the totals as at most two rows (recorded, unreported)")
+    }
+
+    func test_threadSchema_descriptionIsExact() throws {
+        let thread = try XCTUnwrap(try schemaProperties()["thread"] as? [String: Any])
+
+        XCTAssertEqual(thread["type"] as? String, "string")
+        XCTAssertEqual(thread["description"] as? String, "Only this thread: main, subagent or auxiliary")
     }
 
     func test_unknownToolName_throwsUnknownTool_andReadsNothing() async throws {
@@ -378,12 +450,12 @@ final class MCPUsageBridgeTests: XCTestCase {
 
         let call = try onlyCall()
         XCTAssertEqual(call.queries, [
-            UsageQuery(
+            UsageTokenQuery(
                 groupBy: [.model], sinceMs: 1_790_858_096_789, untilMs: 1_791_072_000_000,
-                sessionID: "session-x", project: .root("/work/repo"), thread: .subagent),
-            UsageQuery(
+                sessionID: "session-x", project: .root("/work/repo"), thread: "subagent"),
+            UsageTokenQuery(
                 groupBy: [], sinceMs: 1_790_858_096_789, untilMs: 1_791_072_000_000,
-                sessionID: "session-x", project: .root("/work/repo"), thread: .subagent),
+                sessionID: "session-x", project: .root("/work/repo"), thread: "subagent"),
         ])
     }
 
@@ -418,9 +490,9 @@ final class MCPUsageBridgeTests: XCTestCase {
     }
 
     func test_groupBy_eachWireName_mapsToItsDimension_andNamesItsKey() async throws {
-        let pairs: [(String, UsageQuery.Dimension)] = [
+        let pairs: [(String, UsageTokenQuery.Dimension)] = [
             ("model", .model), ("effort", .effort), ("thread", .thread), ("agent_type", .agentType),
-            ("day", .day), ("project", .project), ("branch", .branch), ("session", .session),
+            ("day", .day), ("project", .project), ("session", .session),
         ]
         recorder.answer(rows: [row(["value"], base: 0)], totals: [row([], base: 0)])
 
@@ -472,6 +544,23 @@ final class MCPUsageBridgeTests: XCTestCase {
         await assertInvalid(["group_by": "model"], name: "group_by")
         await assertInvalid(["group_by": ["model", 1] as [Any]], name: "group_by")
         await assertInvalid(["group_by": ["model": true]], name: "group_by")
+    }
+
+    // `branch` is no dimension of the token data: an unknown dimension,
+    // alone or among valid ones, and nothing is read.
+    func test_groupBy_branch_isAnUnknownDimension() async throws {
+        for groupBy in [["branch"], ["model", "branch"]] {
+            do {
+                _ = try await makeBridge().handleToolCall(
+                    name: "usage_report", arguments: ["group_by": groupBy], surfaceID: nil)
+                XCTFail("Expected invalidArgument for \(groupBy)")
+            } catch {
+                XCTAssertEqual(
+                    error as? MCPUsageBridgeError,
+                    .invalidArgument(name: "group_by", reason: "unknown dimension branch"), "\(groupBy)")
+            }
+        }
+        XCTAssertEqual(recorder.calls.count, 0)
     }
 
     // MARK: - days
@@ -639,6 +728,7 @@ final class MCPUsageBridgeTests: XCTestCase {
 
         let calls = recorder.calls
         XCTAssertEqual(calls.count, cases.count * 2)
+        guard calls.count == cases.count * 2 else { return }
         for (index, (text, expected)) in cases.enumerated() {
             XCTAssertEqual(calls[2 * index].queries.first?.sinceMs, expected, "since \(text)")
             XCTAssertEqual(calls[2 * index + 1].queries.first?.untilMs, expected, "until \(text)")
@@ -744,13 +834,13 @@ final class MCPUsageBridgeTests: XCTestCase {
     func test_thread_eachValue_isTheThreadFilter() async throws {
         let bridge = makeBridge()
 
-        for value in ["main", "subagent", "advisor"] {
+        for value in ["main", "subagent", "auxiliary"] {
             _ = try await report(["thread": value], bridge: bridge)
         }
 
         XCTAssertEqual(
             recorder.calls.map { $0.queries.map(\.thread) },
-            [[.main, .main], [.subagent, .subagent], [.advisor, .advisor]])
+            [["main", "main"], ["subagent", "subagent"], ["auxiliary", "auxiliary"]])
     }
 
     func test_thread_invalid_isRejected() async throws {
@@ -760,21 +850,39 @@ final class MCPUsageBridgeTests: XCTestCase {
         await assertInvalid(["thread": 1], name: "thread")
     }
 
+    // `advisor` was a version-1 thread; the token data names it
+    // `auxiliary`. Any other string is rejected with the contract's reason.
+    func test_thread_unknownLabel_isRejectedWithTheThreeAllowedValues() async throws {
+        for value in ["advisor", "Auxiliary", "sidechain"] {
+            do {
+                _ = try await makeBridge().handleToolCall(
+                    name: "usage_report", arguments: ["thread": value], surfaceID: nil)
+                XCTFail("Expected invalidArgument for \(value)")
+            } catch {
+                XCTAssertEqual(
+                    error as? MCPUsageBridgeError,
+                    .invalidArgument(name: "thread", reason: "expected main, subagent or auxiliary"), value)
+            }
+        }
+        XCTAssertEqual(recorder.calls.count, 0)
+    }
+
     func test_unknownArgumentNames_areIgnored() async throws {
         _ = try await report(["group_by": ["model"], "format": "csv", "verbose": true])
 
-        XCTAssertEqual(try rowsQuery(), UsageQuery(groupBy: [.model]))
+        XCTAssertEqual(try rowsQuery(), UsageTokenQuery(groupBy: [.model]))
     }
 
-    // MARK: - limit, row_count, truncated, totals
+    // MARK: - limit, row_count, truncated
 
     // `row_count` counts the groups before `limit`; `rows` are the first
     // `limit` in the order the store gave; `totals` comes from the totals
-    // query, so it is not the sum of the rows that were kept.
+    // query (recorded 9,001.. plus unreported 50,001..), so it is neither
+    // the sum of the rows kept nor of all three rows.
     func test_limit_truncatesRows_rowCountIsBeforeLimit_totalsComeFromTheTotalsQuery() async throws {
         let rows = [row([nil], base: 100), row(["a"], base: 200), row(["b"], base: 300)]
-        let totals = row([], base: 9_000)
-        recorder.answer(rows: rows, totals: [totals])
+        recorder.answer(
+            rows: rows, totals: [row([], base: 9_000), row([], base: 50_000, unreported: true)])
 
         let result = try await report(["group_by": ["effort"], "limit": 2])
 
@@ -786,7 +894,9 @@ final class MCPUsageBridgeTests: XCTestCase {
         assertFields(output.last, rows[1], lastTimestamp: "2026-10-02T10:27:29.765Z")
         XCTAssertEqual(int64(result["row_count"]), 3)
         XCTAssertEqual(bool(result["truncated"]), true)
-        assertFields(result["totals"], totals, lastTimestamp: "2026-10-02T10:27:29.765Z")
+        assertTotals(
+            result["totals"], sums: [59_002, 59_004, 59_006, 59_008], unreported: [50_001, 50_002, 50_003, 50_004],
+            lastTimestamp: "2026-10-02T10:27:29.765Z")
     }
 
     func test_limit_default_is200() async throws {
@@ -834,59 +944,168 @@ final class MCPUsageBridgeTests: XCTestCase {
         await assertInvalid(["limit": true], name: "limit")
     }
 
+    // MARK: - totals
+
+    // Nothing matched: the totals query answers no row. Zeros everywhere,
+    // a null timestamp, and an all-zero `unreported` object.
     func test_nothingMatched_totalsAreZeroWithANullTimestamp() async throws {
         let result = try await report()
 
         XCTAssertEqual((result["rows"] as? [Any])?.count, 0)
         XCTAssertEqual(int64(result["row_count"]), 0)
         XCTAssertEqual(bool(result["truncated"]), false)
-        let totals = try XCTUnwrap(result["totals"] as? [String: Any])
-        XCTAssertEqual(Set(totals.keys), Self.numericFieldNames.union(["last_timestamp"]))
-        for name in Self.numericFieldNames {
-            XCTAssertEqual(int64(totals[name]), 0, name)
+        assertTotals(result["totals"], sums: [0, 0, 0, 0], unreported: [0, 0, 0, 0], lastTimestamp: nil)
+    }
+
+    // Recorded 101/102/103/104 + unreported 1,001/1,002/1,003/1,004. The
+    // later timestamp is taken whichever row carries it: first on the
+    // recorded row, then on the unreported one.
+    func test_totals_sumRecordedAndUnreported_andTakeTheLaterTimestamp() async throws {
+        let later: Int64 = 1_790_936_849_765 // 2026-10-02T10:27:29.765Z
+        let earlier: Int64 = 1_790_899_200_000 // 2026-10-02T00:00:00.000Z
+        let bridge = makeBridge()
+
+        for (recordedMs, unreportedMs) in [(later, earlier), (earlier, later)] {
+            recorder.answer(
+                rows: [],
+                totals: [
+                    row([], base: 100, lastMs: recordedMs),
+                    row([], base: 1_000, unreported: true, lastMs: unreportedMs),
+                ])
+
+            let result = try await report(["group_by": ["model"]], bridge: bridge)
+
+            assertTotals(
+                result["totals"], sums: [1_102, 1_104, 1_106, 1_108], unreported: [1_001, 1_002, 1_003, 1_004],
+                lastTimestamp: "2026-10-02T10:27:29.765Z")
         }
-        XCTAssertTrue(totals["last_timestamp"] is NSNull)
+    }
+
+    // Every totals row is summed, however many: recorded 11.. + recorded
+    // 201.. + unreported 3,001.. The latest of the three timestamps wins.
+    func test_totals_sumEveryRowOfTheTotalsQuery_threeRows() async throws {
+        recorder.answer(
+            rows: [],
+            totals: [
+                row([], base: 10, lastMs: 1_790_899_200_000),
+                row([], base: 200, lastMs: 1_790_936_849_765),
+                row([], base: 3_000, unreported: true, lastMs: 1_790_899_200_000),
+            ])
+
+        let result = try await report(["group_by": ["model"]])
+
+        assertTotals(
+            result["totals"], sums: [3_213, 3_216, 3_219, 3_222], unreported: [3_001, 3_002, 3_003, 3_004],
+            lastTimestamp: "2026-10-02T10:27:29.765Z")
+    }
+
+    // Only recorded tokens matched: the `unreported` object is zeros.
+    func test_totals_withoutAnUnreportedRow_haveAZeroUnreportedPart() async throws {
+        recorder.answer(rows: [], totals: [row([], base: 700, lastMs: 1_790_899_200_000)])
+
+        let result = try await report(["group_by": ["model"]])
+
+        assertTotals(
+            result["totals"], sums: [701, 702, 703, 704], unreported: [0, 0, 0, 0],
+            lastTimestamp: "2026-10-02T00:00:00.000Z")
+    }
+
+    // Only unreported tokens matched: the sums and the unreported part
+    // are the same numbers.
+    func test_totals_withOnlyAnUnreportedRow_areThatRowTwice() async throws {
+        recorder.answer(rows: [], totals: [row([], base: 40, unreported: true, lastMs: 1_790_899_200_000)])
+
+        let result = try await report(["group_by": ["model"]])
+
+        assertTotals(
+            result["totals"], sums: [41, 42, 43, 44], unreported: [41, 42, 43, 44],
+            lastTimestamp: "2026-10-02T00:00:00.000Z")
+    }
+
+    // (Int64.max - 1) + 5 and Int64.max + Int64.max are not representable:
+    // each sum stops at Int64.max instead of wrapping or trapping.
+    func test_totals_saturateAtInt64Max() async throws {
+        let bridge = makeBridge()
+
+        recorder.answer(rows: [], totals: [flatRow(Int64.max - 1, unreported: false), flatRow(5, unreported: true)])
+        let nearMax = try await report(["group_by": ["model"]], bridge: bridge)
+        recorder.answer(
+            rows: [], totals: [flatRow(Int64.max, unreported: false), flatRow(Int64.max, unreported: true)])
+        let bothMax = try await report(["group_by": ["model"]], bridge: bridge)
+
+        let max = Int64.max
+        assertTotals(
+            nearMax["totals"], sums: [max, max, max, max], unreported: [5, 5, 5, 5],
+            lastTimestamp: "2026-10-02T10:27:29.765Z")
+        assertTotals(
+            bothMax["totals"], sums: [max, max, max, max], unreported: [max, max, max, max],
+            lastTimestamp: "2026-10-02T10:27:29.765Z")
     }
 
     // MARK: - Result shape
 
     func test_result_hasExactlyTheDocumentedFields() async throws {
-        recorder.answer(rows: [row(["claude-opus-5-5", "max", nil], base: 0)], totals: [row([], base: 0)])
+        recorder.answer(
+            rows: [row(["claude-opus-5-5", "max", nil], base: 0)], totals: [row([], base: 0)])
 
-        let result = try await report(["group_by": ["model", "effort", "branch"]])
+        let result = try await report(["group_by": ["model", "effort", "agent_type"]])
 
         XCTAssertEqual(
             Set(result.keys),
             ["group_by", "since", "until", "time_zone", "rows", "row_count", "truncated", "totals", "notes"])
         let rows = try XCTUnwrap(result["rows"] as? [[String: Any]])
-        XCTAssertEqual(Set(rows[0].keys), Self.numericFieldNames.union(["key", "last_timestamp"]))
-        let key = try XCTUnwrap(rows[0]["key"] as? [String: Any])
-        XCTAssertEqual(Set(key.keys), ["model", "effort", "branch"])
+        let first = try XCTUnwrap(rows.first)
+        XCTAssertEqual(Set(first.keys), Self.rowMembers)
+        let key = try XCTUnwrap(first["key"] as? [String: Any])
+        XCTAssertEqual(Set(key.keys), ["model", "effort", "agent_type"])
         XCTAssertEqual(key["model"] as? String, "claude-opus-5-5")
         XCTAssertEqual(key["effort"] as? String, "max")
-        XCTAssertTrue(key["branch"] is NSNull, "a nil group is JSON null")
+        XCTAssertTrue(key["agent_type"] is NSNull, "a nil group is JSON null")
         let totals = try XCTUnwrap(result["totals"] as? [String: Any])
-        XCTAssertEqual(Set(totals.keys), Self.numericFieldNames.union(["last_timestamp"]))
+        XCTAssertEqual(Set(totals.keys), Self.totalsMembers)
+        XCTAssertEqual((totals["unreported"] as? [String: Any]).map { Set($0.keys) }, Set(Self.sumNames))
+    }
+
+    // `unreported` is the row's own `isUnreported`, as a JSON boolean; an
+    // unreported row's unknown effort is JSON null.
+    func test_result_unreportedFlag_isEachRowsOwn() async throws {
+        let rows = [
+            row(["claude-opus-5-5", "high"], base: 0),
+            row(["claude-opus-5-5", nil], base: 10, unreported: true, lastMs: 1_790_899_200_000),
+        ]
+        recorder.answer(rows: rows, totals: [row([], base: 0)])
+
+        let result = try await report(["group_by": ["model", "effort"]])
+
+        let output = try XCTUnwrap(result["rows"] as? [[String: Any]])
+        XCTAssertEqual(output.count, 2)
+        guard output.count == 2 else { return }
+        assertFields(output[0], rows[0], lastTimestamp: "2026-10-02T10:27:29.765Z")
+        assertFields(output[1], rows[1], lastTimestamp: "2026-10-02T00:00:00.000Z")
+        XCTAssertEqual(bool(output[0]["unreported"]), false)
+        XCTAssertEqual(bool(output[1]["unreported"]), true)
+        XCTAssertEqual((output[1]["key"] as? [String: Any])?["model"] as? String, "claude-opus-5-5")
+        XCTAssertTrue((output[1]["key"] as? [String: Any])?["effort"] is NSNull)
     }
 
     func test_result_rowsKeepTheStoresOrder_andEveryNumberIsExact() async throws {
         // 2^53 + 1 does not survive a trip through Double.
-        let big = UsageRow(
-            key: ["z"], responses: 9_007_199_254_740_993, finalResponses: 2, inputTokens: 3, cacheReadTokens: 4,
-            cacheCreationTokens: 5, cacheCreation1hTokens: 6, outputTokensFinal: 7, thinkingTokensFinal: 8,
-            lastTimestampMs: 1_790_899_200_000)
-        let rows = [big, row([nil], base: 10), row(["a"], base: 20)]
+        let big = UsageTokenRow(
+            key: ["z"], isUnreported: false, inputTokens: 9_007_199_254_740_993, cacheReadTokens: 2,
+            cacheCreationTokens: 3, outputTokens: 9_007_199_254_740_995, lastTimestampMs: 1_790_899_200_000)
+        let rows = [big, row([nil], base: 10, unreported: true), row(["a"], base: 20)]
         recorder.answer(rows: rows, totals: [row([], base: 30)])
 
-        let result = try await report(["group_by": ["branch"]])
+        let result = try await report(["group_by": ["agent_type"]])
 
         let output = try XCTUnwrap(result["rows"] as? [[String: Any]])
         XCTAssertEqual(output.count, 3)
+        guard output.count == 3 else { return }
         assertFields(output[0], big, lastTimestamp: "2026-10-02T00:00:00.000Z")
         assertFields(output[1], rows[1], lastTimestamp: "2026-10-02T10:27:29.765Z")
         assertFields(output[2], rows[2], lastTimestamp: "2026-10-02T10:27:29.765Z")
-        XCTAssertEqual((output[0]["key"] as? [String: Any])?["branch"] as? String, "z")
-        XCTAssertTrue((output[1]["key"] as? [String: Any])?["branch"] is NSNull)
+        XCTAssertEqual((output[0]["key"] as? [String: Any])?["agent_type"] as? String, "z")
+        XCTAssertTrue((output[1]["key"] as? [String: Any])?["agent_type"] is NSNull)
     }
 
     func test_result_timeZone_isTheInjectedCalendars() async throws {
@@ -898,21 +1117,21 @@ final class MCPUsageBridgeTests: XCTestCase {
         XCTAssertEqual(try onlyCall().calendar.timeZone.identifier, "Asia/Kolkata")
     }
 
-    func test_result_notes_areTheTwoFixedNotes() async throws {
+    func test_result_notes_areTheThreeFixedNotes() async throws {
         let first = try await report()
-        recorder.answer(rows: [row(["a"], base: 0)], totals: [row([], base: 0)])
+        recorder.answer(rows: [row(["a"], base: 0, unreported: true)], totals: [row([], base: 0, unreported: true)])
         let second = try await report(["group_by": ["model"], "days": 3])
 
-        let notes = try XCTUnwrap(first["notes"] as? [String])
-        XCTAssertEqual(notes.count, 2)
-        XCTAssertEqual(second["notes"] as? [String], notes, "the notes do not depend on the query")
-        // The first note says which numbers cover final responses only.
-        XCTAssertTrue(notes[0].contains("output_tokens_final"), notes[0])
-        XCTAssertTrue(notes[0].contains("thinking_tokens_final"), notes[0])
-        XCTAssertTrue(notes[0].contains("final_responses"), notes[0])
-        // The second says the totals are below Claude Code's own.
-        XCTAssertTrue(notes[1].contains("Claude Code"), notes[1])
-        XCTAssertNotEqual(notes[0], notes[1])
+        let expected = [
+            "Token counts are Claude Code's own, received over its telemetry while Calyx was running. Thinking "
+                + "tokens are part of output_tokens.",
+            "Rows with unreported true are tokens Claude Code counted in a tracked session that Calyx did not "
+                + "receive (for example because Calyx was not running). Their model is known; effort, thread and "
+                + "agent are not, so they are missing from results filtered by thread.",
+            "A session is counted only if it was started while usage tracking was on.",
+        ]
+        XCTAssertEqual(first["notes"] as? [String], expected)
+        XCTAssertEqual(second["notes"] as? [String], expected, "the notes do not depend on the query")
     }
 
     // JSONSerialization with sorted keys: the top-level keys appear in

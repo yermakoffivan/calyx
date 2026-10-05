@@ -1559,7 +1559,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // server is alive whenever the closure runs.
         server.usageBridge = MCPUsageBridge(
             isEnabled: { ledger.isTracking },
-            reports: { queries, calendar in try await ledger.reports(queries, calendar: calendar) },
+            reports: { queries, calendar in try await ledger.tokenReports(queries, calendar: calendar) },
             currentSessionID: { [weak server] surfaceID in server?.agentRegistry.entries[surfaceID]?.sessionID },
             now: { Date() },
             calendar: { Calendar.current })
