@@ -6,7 +6,8 @@
 // checkpoints, in a SQLite database. Schema version 2 adds the telemetry
 // side: per-series baselines of Claude Code's cumulative token metric,
 // the per-minute token points their increments are added to, the process
-// starts, and the time tracking started from. SQLite rather than the JSON documents
+// starts, and the time tracking started from, and the run logs read from
+// Claude Code's own `cost-state` lines. SQLite rather than the JSON documents
 // used elsewhere because a batch -- records, session meta and the file
 // checkpoint -- must commit atomically on every agent turn, and the data
 // only grows. The store touches nothing outside its own directory; later
@@ -260,8 +261,8 @@ actor UsageStore {
         return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
-    /// Removes every record, session, checkpoint, point and series
-    /// baseline in one transaction and restarts tracking at the store's
+    /// Removes every record, session, checkpoint, point, series baseline
+    /// and run log (with its runs and totals) in one transaction and restarts tracking at the store's
     /// clock (see `restartTracking`). The processes heard so far are
     /// retired, so their later exports only set baselines and deleted
     /// usage never comes back; only their digests remain. The store stays
@@ -272,7 +273,8 @@ actor UsageStore {
         try connection.transaction {
             try connection.execute("""
                 DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files; \
-                DELETE FROM usage_points;
+                DELETE FROM usage_points; DELETE FROM usage_run_logs; DELETE FROM usage_runs; \
+                DELETE FROM usage_run_totals;
                 """)
             try Self.restartTracking(at: trackedFrom, connection: connection)
         }
@@ -357,6 +359,14 @@ actor UsageStore {
     ///   identifier. Never deleted: a retired process must predate
     ///   tracking whatever any clock says.
     /// - `usage_meta`: `tracked_from_ns`, the time tracking started from.
+    /// - `usage_run_logs`: one row per session whose main transcript was
+    ///   read for its `cost-state` lines: the transcript path, where
+    ///   reading stopped (`inode` / `offset`, a UInt64's bit pattern), the
+    ///   open run and the first cwd. Its own checkpoint, not `usage_files`:
+    ///   the version-1 reader reads the same file for something else, and
+    ///   neither may move the other's position.
+    /// - `usage_runs`: the closed runs of a session, by `sequence`.
+    /// - `usage_run_totals`: each closed run's totals per model.
     private static let schemaV2Additions = """
         CREATE TABLE usage_series (
             session_id TEXT NOT NULL,
@@ -396,6 +406,32 @@ actor UsageStore {
             key TEXT NOT NULL PRIMARY KEY,
             value INTEGER NOT NULL
         ) WITHOUT ROWID;
+        CREATE TABLE usage_run_logs (
+            session_id TEXT NOT NULL PRIMARY KEY,
+            path TEXT NOT NULL,
+            inode INTEGER NOT NULL,
+            offset INTEGER NOT NULL,
+            open_begin_ns INTEGER,
+            open_end_ns INTEGER,
+            cwd TEXT
+        ) WITHOUT ROWID;
+        CREATE TABLE usage_runs (
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            begin_ns INTEGER,
+            end_ns INTEGER,
+            PRIMARY KEY (session_id, sequence)
+        ) WITHOUT ROWID;
+        CREATE TABLE usage_run_totals (
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cache_read_tokens INTEGER NOT NULL,
+            cache_creation_tokens INTEGER NOT NULL,
+            PRIMARY KEY (session_id, sequence, model)
+        ) WITHOUT ROWID;
         """
 
     /// Brings a database at `version` up to `schemaVersion`, one step per
@@ -428,6 +464,8 @@ actor UsageStore {
         selectSeriesSQL, insertSeriesSQL, updateSeriesSQL, selectPointSQL, insertPointSQL, updatePointSQL,
         insertProcessStartSQL, selectProcessStartSQL, selectRetiredSQL, insertRetiredSQL, countRetiredSQL, selectTrackedFromSQL, upsertTrackedFromSQL,
         selectPointRowsSQL, selectSeriesRowsSQL, selectProcessStartsSQL,
+        selectRunLogSQL, selectRunsSQL, selectRunTotalsSQL, upsertRunLogSQL, deleteRunSQL, deleteRunTotalsSQL,
+        insertRunSQL, insertRunTotalSQL, selectSessionsWithSeriesSQL,
     ]
 
     /// Migrates, then proves the result is the schema this build uses by
@@ -1280,4 +1318,217 @@ extension UsageStore {
 
     private static let selectProcessStartsSQL =
         "SELECT session_id, start_ns, start_type FROM usage_process_starts ORDER BY session_id, start_ns"
+}
+
+// MARK: - Run logs (schema version 2)
+
+/// The transcript a stored run log was read from, and where reading
+/// stopped.
+struct UsageRunLogFile: Sendable, Equatable {
+    let path: String
+    let checkpoint: TranscriptCheckpoint
+}
+
+extension UsageStore {
+    /// The stored log of a session and where reading stopped; nil when
+    /// nothing was stored for it. Runs come back in `sequence` order with
+    /// the sequences as stored.
+    func runLog(forSession sessionID: String) throws -> (log: UsageRunLog, file: UsageRunLogFile)? {
+        let connection = try openConnection()
+        return try Self.runLog(forSession: sessionID, connection: connection)
+    }
+
+    private static func runLog(
+        forSession sessionID: String, connection: SQLiteConnection
+    ) throws -> (log: UsageRunLog, file: UsageRunLogFile)? {
+        let head = try connection.withStatement(Self.selectRunLogSQL) {
+            statement -> (file: UsageRunLogFile, openBeginNs: Int64?, openEndNs: Int64?, cwd: String?)? in
+            try statement.bind(sessionID, at: 1)
+            guard try statement.step() else { return nil }
+            guard let path = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+            let file = UsageRunLogFile(path: path, checkpoint: TranscriptCheckpoint(
+                inode: UInt64(bitPattern: statement.int64(at: 1)), offset: UInt64(bitPattern: statement.int64(at: 2))))
+            return (file, Self.optionalInt64(statement, at: 3), Self.optionalInt64(statement, at: 4), statement.text(at: 5))
+        }
+        guard let head else { return nil }
+
+        var totals: [Int64: [String: UsageTokenTotals]] = [:]
+        try connection.withStatement(Self.selectRunTotalsSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            while try statement.step() {
+                guard let model = statement.text(at: 1) else { throw UsageStoreError.malformedRow }
+                totals[statement.int64(at: 0), default: [:]][model] = UsageTokenTotals(
+                    input: statement.int64(at: 2), output: statement.int64(at: 3),
+                    cacheRead: statement.int64(at: 4), cacheCreation: statement.int64(at: 5))
+            }
+        }
+        let runs = try connection.withStatement(Self.selectRunsSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            var runs: [UsageRun] = []
+            while try statement.step() {
+                let sequence = statement.int64(at: 0)
+                guard let storedSequence = Int(exactly: sequence) else { throw UsageStoreError.malformedRow }
+                runs.append(UsageRun(
+                    sequence: storedSequence, beginNs: Self.optionalInt64(statement, at: 1),
+                    endNs: Self.optionalInt64(statement, at: 2), totals: totals.removeValue(forKey: sequence) ?? [:]))
+            }
+            return runs
+        }
+        // A total whose run is not stored cannot be placed in the log.
+        guard totals.isEmpty else { throw UsageStoreError.malformedRow }
+        let log = UsageRunLog(runs: runs, openBeginNs: head.openBeginNs, openEndNs: head.openEndNs, cwd: head.cwd)
+        return (log, head.file)
+    }
+
+    /// Replaces the session's stored log and checkpoint with these, in one
+    /// transaction. The path is stored as given (it is not checked), and
+    /// no `usage_sessions` row is created or changed.
+    ///
+    /// Only what changed is written, because the reader saves after every
+    /// bounded read of every session it looks at, and most of those saves
+    /// change little or nothing: an unchanged log and file write nothing at
+    /// all (not a byte of the database or its WAL); otherwise the log row
+    /// is written when its fields differ, and the runs and their totals
+    /// from the first run that differs from the stored one on. What is
+    /// stored afterwards equals replacing everything.
+    func saveRunLog(_ log: UsageRunLog, file: UsageRunLogFile, forSession sessionID: String) throws {
+        let connection = try openConnection()
+        // Read, compare and write in one transaction, so the comparison is
+        // against exactly the state the writes apply to. A transaction that
+        // writes nothing leaves the database and its WAL untouched.
+        try connection.transaction {
+            let stored = try Self.runLog(forSession: sessionID, connection: connection)
+            if let stored, stored.log == log, stored.file == file { return }
+            let storedLog = stored?.log
+            let headChanged = stored?.file != file || storedLog?.openBeginNs != log.openBeginNs
+                || storedLog?.openEndNs != log.openEndNs || storedLog?.cwd != log.cwd
+            if headChanged {
+                try connection.withStatement(Self.upsertRunLogSQL) { statement in
+                    try statement.bind(sessionID, at: 1)
+                    try statement.bind(file.path, at: 2)
+                    try statement.bind(Int64(bitPattern: file.checkpoint.inode), at: 3)
+                    try statement.bind(Int64(bitPattern: file.checkpoint.offset), at: 4)
+                    try Self.bind(log.openBeginNs, at: 5, to: statement)
+                    try Self.bind(log.openEndNs, at: 6, to: statement)
+                    try statement.bind(log.cwd, at: 7)
+                    _ = try statement.step()
+                }
+            }
+            let storedRuns = storedLog?.runs ?? []
+            let firstChange = zip(storedRuns, log.runs).prefix { $0 == $1 }.count
+            for run in storedRuns.dropFirst(firstChange) {
+                for sql in [Self.deleteRunSQL, Self.deleteRunTotalsSQL] {
+                    try connection.withStatement(sql) { statement in
+                        try statement.bind(sessionID, at: 1)
+                        try statement.bind(Int64(run.sequence), at: 2)
+                        _ = try statement.step()
+                    }
+                }
+            }
+            for run in log.runs.dropFirst(firstChange) {
+                let sequence = Int64(run.sequence)
+                try connection.withStatement(Self.insertRunSQL) { statement in
+                    try statement.bind(sessionID, at: 1)
+                    try statement.bind(sequence, at: 2)
+                    try Self.bind(run.beginNs, at: 3, to: statement)
+                    try Self.bind(run.endNs, at: 4, to: statement)
+                    _ = try statement.step()
+                }
+                for (model, totals) in run.totals {
+                    try connection.withStatement(Self.insertRunTotalSQL) { statement in
+                        try statement.bind(sessionID, at: 1)
+                        try statement.bind(sequence, at: 2)
+                        try statement.bind(model, at: 3)
+                        try statement.bind(totals.input, at: 4)
+                        try statement.bind(totals.output, at: 5)
+                        try statement.bind(totals.cacheRead, at: 6)
+                        try statement.bind(totals.cacheCreation, at: 7)
+                        _ = try statement.step()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every session with at least one stored series, ascending: the
+    /// sessions Calyx has heard from since tracking (re)started, whose
+    /// transcripts are worth looking at (a read of an unchanged file
+    /// costs one `fstat`).
+    func sessionsWithSeries() throws -> [String] {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectSessionsWithSeriesSQL) { statement in
+            var sessions: [String] = []
+            while try statement.step() {
+                guard let sessionID = statement.text(at: 0) else { throw UsageStoreError.malformedRow }
+                sessions.append(sessionID)
+            }
+            return sessions
+        }
+    }
+
+    /// Sets the session's project root unless one is already stored (the
+    /// first stored root wins), creating the session row when there is
+    /// none. The same statement a version-1 batch uses, with no transcript
+    /// path, so a stored path is kept and the rule has one definition.
+    func setProjectRootIfUnset(_ root: String, forSession sessionID: String) throws {
+        let connection = try openConnection()
+        try connection.withStatement(Self.upsertSessionSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            try statement.bind(nil, at: 2)
+            try statement.bind(root, at: 3)
+            _ = try statement.step()
+        }
+    }
+
+    // MARK: - Run log helpers
+
+    /// `nil` binds SQL NULL.
+    private static func bind(_ value: Int64?, at index: Int32, to statement: SQLiteStatement) throws {
+        if let value {
+            try statement.bind(value, at: index)
+        } else {
+            try statement.bind(nil as String?, at: index)
+        }
+    }
+
+    private static func optionalInt64(_ statement: SQLiteStatement, at index: Int32) -> Int64? {
+        statement.isNull(at: index) ? nil : statement.int64(at: index)
+    }
+
+    // MARK: - Run log statements
+
+    private static let selectRunLogSQL = """
+        SELECT path, inode, offset, open_begin_ns, open_end_ns, cwd FROM usage_run_logs WHERE session_id = ?1
+        """
+
+    private static let selectRunsSQL =
+        "SELECT sequence, begin_ns, end_ns FROM usage_runs WHERE session_id = ?1 ORDER BY sequence"
+
+    private static let selectRunTotalsSQL = """
+        SELECT sequence, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens \
+        FROM usage_run_totals WHERE session_id = ?1 ORDER BY sequence, model
+        """
+
+    private static let upsertRunLogSQL = """
+        INSERT INTO usage_run_logs (session_id, path, inode, offset, open_begin_ns, open_end_ns, cwd) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+        ON CONFLICT (session_id) DO UPDATE SET path = excluded.path, inode = excluded.inode, \
+        offset = excluded.offset, open_begin_ns = excluded.open_begin_ns, open_end_ns = excluded.open_end_ns, \
+        cwd = excluded.cwd
+        """
+
+    private static let deleteRunSQL = "DELETE FROM usage_runs WHERE session_id = ?1 AND sequence = ?2"
+
+    private static let deleteRunTotalsSQL = "DELETE FROM usage_run_totals WHERE session_id = ?1 AND sequence = ?2"
+
+    private static let insertRunSQL =
+        "INSERT INTO usage_runs (session_id, sequence, begin_ns, end_ns) VALUES (?1, ?2, ?3, ?4)"
+
+    private static let insertRunTotalSQL = """
+        INSERT INTO usage_run_totals (session_id, sequence, model, input_tokens, output_tokens, \
+        cache_read_tokens, cache_creation_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        """
+
+    private static let selectSessionsWithSeriesSQL =
+        "SELECT DISTINCT session_id FROM usage_series ORDER BY session_id"
 }

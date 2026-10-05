@@ -30,6 +30,18 @@ struct TranscriptReadResult: Sendable, Equatable {
 }
 
 enum TranscriptLineReader {
+    /// Longest line delivered by default: 16 MiB. Longer lines are
+    /// skipped and counted.
+    static let defaultMaxLineBytes = 16 * 1_024 * 1_024
+    /// Bytes after which a read stops by default, and so the usual size of
+    /// a batch: 4 MiB. The reader checks it only after a finished line, so
+    /// it does NOT bound one synchronous stretch of file I/O between
+    /// awaits: a read runs past the budget to the end of the line it is
+    /// in, and for an unterminated or over-long line that is up to the
+    /// rest of the file. (Memory stays bounded by `maxLineBytes` plus one
+    /// chunk regardless.)
+    static let defaultByteBudget = 4 * 1_024 * 1_024
+
     /// Bytes requested per `pread`. Independent of `maxLineBytes`: a line
     /// spanning chunks is reassembled through the carry buffer.
     private static let chunkSize = 64 * 1_024

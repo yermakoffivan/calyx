@@ -1,0 +1,16 @@
+{
+ "claude-haiku-4-5-20251001": {
+  "cacheCreation": 0,
+  "cacheRead": 0,
+  "input": 879,
+  "output": 12,
+  "thinking": 0
+ },
+ "claude-sonnet-5-5": {
+  "cacheCreation": 30100,
+  "cacheRead": 54680,
+  "input": 4,
+  "output": 7,
+  "thinking": 0
+ }
+}

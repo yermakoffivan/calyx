@@ -8,7 +8,10 @@
 //  whose realpath is "<realpath of root>/<project dir>/<sessionID>.jsonl"
 //  and whose final component is itself an existing regular file, and
 //  subagentTranscripts(in:) lists only the regular "agent-*.jsonl" files
-//  directly inside "<project dir>/<sessionID>/subagents", by name.
+//  directly inside "<project dir>/<sessionID>/subagents", by name, and
+//  locate(sessionID:root:) finds "<root>/<one dir>/<sessionID>.jsonl" with
+//  the same acceptance, the latest modification time winning and equal
+//  times decided by the directory name, byte-wise ascending.
 //
 //  "Resolved" means realpath(3) throughout (so "/var/..." is reported as
 //  "/private/var/..."), which is what the expected values are built from.
@@ -678,5 +681,256 @@ final class ClaudeTranscriptLocatorTests: XCTestCase {
 
     func test_locate_onlyPathThroughDataVolumePrefix_spellsTheLocationAsTheDescriptorDoes() throws {
         try assertLocatedWithDescriptorSpelling(rootPrefix: "", pathPrefix: dataVolumePrefix)
+    }
+
+    // MARK: - locate(sessionID:root:)
+
+    private let searchedID = "abcdef-session"
+
+    private func locateByID(_ id: String? = nil, root: String? = nil) -> ClaudeTranscriptLocation? {
+        ClaudeTranscriptLocator.locate(sessionID: id ?? searchedID, root: root ?? self.root)
+    }
+
+    /// "<root>/<directory>/<id>.jsonl" as the caller spells it.
+    private func candidate(_ directory: String, _ id: String? = nil) -> String {
+        root + "/" + directory + "/" + (id ?? searchedID) + ".jsonl"
+    }
+
+    private func expectedLocation(_ directory: String, _ id: String? = nil) -> ClaudeTranscriptLocation {
+        let name = id ?? searchedID
+        return ClaudeTranscriptLocation(
+            mainPath: realRoot + "/" + directory + "/" + name + ".jsonl",
+            sessionID: name,
+            subagentsDirectory: realRoot + "/" + directory + "/" + name + "/subagents")
+    }
+
+    /// Sets the item's modification time to `seconds` + `nanoseconds`
+    /// since the epoch, without following a link at the final component.
+    private func setModificationTime(_ path: String, seconds: Int, nanoseconds: Int = 0) throws {
+        var times = [
+            timespec(tv_sec: seconds, tv_nsec: nanoseconds),
+            timespec(tv_sec: seconds, tv_nsec: nanoseconds),
+        ]
+        guard utimensat(AT_FDCWD, path, &times, AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    func test_locateByID_findsTheFileInOneOfSeveralProjectDirectories() throws {
+        try makeDirectory(root + "/-a")
+        try makeFile(root + "/-a/other-session.jsonl")
+        try makeFile(candidate("-b"))
+        try makeFile(root + "/-c/other-session.jsonl")
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_noCandidateAnywhere_returnsNil() throws {
+        try makeFile(root + "/-a/other-session.jsonl")
+
+        XCTAssertNil(locateByID())
+    }
+
+    func test_locateByID_laterModificationTimeWins_newerInTheFirstNamedDirectory() throws {
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_800_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_700_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-a"))
+    }
+
+    func test_locateByID_laterModificationTimeWins_newerInTheSecondNamedDirectory() throws {
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_700_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_800_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_modificationTimesDifferingBelowASecond_theLaterWins() throws {
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-b"))
+        // The later file is in "-b", so the name tie-break cannot pick it
+        // by accident when only whole seconds are compared.
+        try setModificationTime(candidate("-a"), seconds: 1_800_000_000, nanoseconds: 250_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_800_000_000, nanoseconds: 750_000_000)
+        var status = stat()
+        XCTAssertEqual(lstat(candidate("-b"), &status), 0, "Fixture error")
+        XCTAssertEqual(status.st_mtimespec.tv_nsec, 750_000_000, "Fixture error: the volume keeps nanoseconds")
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_equalTimes_smallerDirectoryNameWins() throws {
+        try makeFile(candidate("-b"))
+        try makeFile(candidate("-a"))
+        try setModificationTime(candidate("-a"), seconds: 1_800_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_800_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-a"))
+    }
+
+    func test_locateByID_equalTimes_namesCompareByteWise_uppercaseBeforeLowercase() throws {
+        // "-B" (0x42) sorts before "-a" (0x61) byte-wise; a localized or
+        // case-insensitive comparison would pick "-a".
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-B"))
+        try setModificationTime(candidate("-a"), seconds: 1_800_000_000)
+        try setModificationTime(candidate("-B"), seconds: 1_800_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-B"))
+    }
+
+    func test_locateByID_symbolicLinkInTheNewerDirectory_isRejected_andTheSearchGoesOn() throws {
+        let target = tempPath + "/elsewhere/" + searchedID + ".jsonl"
+        try makeFile(target)
+        try makeDirectory(root + "/-a")
+        try makeSymlink(at: candidate("-a"), to: target)
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_900_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_700_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_directoryInPlaceOfTheFile_isRejected_andTheSearchGoesOn() throws {
+        try makeDirectory(candidate("-a"))
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_900_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_700_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_wrongCaseNameInTheNewerDirectory_isRejected_andTheSearchGoesOn() throws {
+        let upper = root + "/-a/" + searchedID.uppercased() + ".jsonl"
+        try makeFile(upper)
+        try makeFile(candidate("-b"))
+        try setModificationTime(upper, seconds: 1_900_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_700_000_000)
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_unreadableProjectDirectory_isSkipped() throws {
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_900_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_700_000_000)
+        let locked = root + "/-a"
+        XCTAssertEqual(chmod(locked, 0o000), 0, "Fixture error")
+        addTeardownBlock { _ = chmod(locked, 0o700) }
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_regularFileDirectlyUnderTheRoot_isSkipped() throws {
+        try makeFile(root + "/-a")
+        try makeFile(root + "/" + searchedID + ".jsonl")
+        try makeFile(candidate("-b"))
+
+        XCTAssertEqual(locateByID(), expectedLocation("-b"))
+    }
+
+    func test_locateByID_fileAtDepthThree_isNotACandidate() throws {
+        try makeFile(root + "/-a/nested/" + searchedID + ".jsonl")
+
+        XCTAssertNil(locateByID())
+    }
+
+    func test_locateByID_missingRoot_returnsNil() throws {
+        try makeFile(candidate("-b"))
+
+        XCTAssertNil(locateByID(root: tempPath + "/no-such-root"))
+    }
+
+    func test_locateByID_rootThatIsARegularFile_returnsNil() throws {
+        let fileRoot = tempPath + "/file-root"
+        try makeFile(fileRoot)
+
+        XCTAssertNil(locateByID(root: fileRoot))
+    }
+
+    func test_locateByID_unreadableRoot_returnsNil() throws {
+        try makeFile(candidate("-b"))
+        let locked = root
+        XCTAssertEqual(chmod(locked, 0o000), 0, "Fixture error")
+        addTeardownBlock { _ = chmod(locked, 0o700) }
+
+        XCTAssertNil(locateByID())
+    }
+
+    func test_locateByID_rootReachedThroughASymlink_returnsTheResolvedLocation() throws {
+        try makeFile(candidate("-b"))
+        let linkedRoot = tempPath + "/linked-projects"
+        try makeSymlink(at: linkedRoot, to: realRoot)
+
+        XCTAssertEqual(locateByID(root: linkedRoot), expectedLocation("-b"))
+    }
+
+    func test_locateByID_resultEqualsLocateTranscriptPathForThatPath() throws {
+        try makeFile(candidate("-a"))
+        try makeFile(candidate("-b"))
+        try setModificationTime(candidate("-a"), seconds: 1_700_000_000)
+        try setModificationTime(candidate("-b"), seconds: 1_800_000_000)
+
+        let found = try XCTUnwrap(locateByID())
+
+        XCTAssertEqual(found, locate(found.mainPath, sessionID: searchedID))
+        XCTAssertEqual(found, locate(candidate("-b"), sessionID: searchedID))
+    }
+
+    func test_locateByID_createsNothing() throws {
+        try makeFile(candidate("-b"))
+        let before = try FileManager.default.subpathsOfDirectory(atPath: root).sorted()
+
+        _ = locateByID()
+
+        XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: root).sorted(), before)
+    }
+
+    func test_locateByID_sessionIDDotDot_returnsNil() throws {
+        try makeFile(root + "/-a/...jsonl")
+
+        XCTAssertNil(locateByID(".."))
+    }
+
+    func test_locateByID_sessionIDWithSlash_returnsNil() throws {
+        try makeFile(root + "/-a/x/y.jsonl")
+        try makeFile(root + "/-a/y.jsonl")
+
+        XCTAssertNil(locateByID("x/y"))
+        XCTAssertNil(locateByID("-a/y"))
+    }
+
+    func test_locateByID_emptySessionID_returnsNil() throws {
+        try makeFile(root + "/-a/.jsonl")
+
+        XCTAssertNil(locateByID(""))
+    }
+
+    func test_locateByID_sessionIDOf129Scalars_returnsNil() throws {
+        let id = String(repeating: "a", count: 129)
+        try makeFile(candidate("-a", id))
+
+        XCTAssertNil(locateByID(id))
+    }
+
+    func test_locateByID_sessionIDOf128Scalars_isLocated() throws {
+        let id = String(repeating: "a", count: 128)
+        try makeFile(candidate("-a", id))
+
+        XCTAssertEqual(locateByID(id), expectedLocation("-a", id))
+    }
+
+    func test_locateByID_sessionIDWithAControlCharacter_returnsNil() throws {
+        let id = "abc\u{1}def"
+        try makeFile(candidate("-a", id))
+        var info = stat()
+        XCTAssertEqual(lstat(candidate("-a", id), &info), 0, "Fixture error: the file must exist under that name")
+
+        XCTAssertNil(locateByID(id))
     }
 }

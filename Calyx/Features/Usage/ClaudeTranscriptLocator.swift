@@ -35,7 +35,7 @@ enum ClaudeTranscriptLocator {
     ///   system call would stop reading the path there and examine some
     ///   other item than the string names.
     /// - `sessionID` must also be, verbatim, a valid identifier label
-    ///   (`ClaudeTranscriptParser.isIdentifierLabel`): it becomes the
+    ///   (`TranscriptLabel.isIdentifier`): it becomes the
     ///   stored session's id and the key its usage is published under,
     ///   and every other string in the store passed the parser's label
     ///   rule. A file that really exists under an id the rule rejects
@@ -77,9 +77,79 @@ enum ClaudeTranscriptLocator {
     /// not bind a later open: the ingestor re-checks the file it actually
     /// opened (see `UsageIngestor`).
     static func locate(transcriptPath: String, sessionID: String, root: String) -> ClaudeTranscriptLocation? {
-        guard !sessionID.isEmpty, sessionID != ".", sessionID != "..",
-              !sessionID.utf8.contains(where: { $0 == UInt8(ascii: "/") || $0 == 0 }),
-              ClaudeTranscriptParser.isIdentifierLabel(sessionID),
+        validated(transcriptPath: transcriptPath, sessionID: sessionID, root: root)?.location
+    }
+
+    /// The main transcript of `sessionID` under the projects `root`:
+    /// "<root>/<one directory>/<sessionID>.jsonl", accepted by exactly the
+    /// checks of `locate(transcriptPath:sessionID:root:)` (one definition:
+    /// each candidate goes through them).
+    ///
+    /// - Candidates are "<root>/<d>/<sessionID>.jsonl" for every entry `d`
+    ///   directly under `root`. An entry that is not a directory, a
+    ///   directory that cannot be opened, or a candidate the checks reject
+    ///   is skipped.
+    /// - Among the accepted candidates the one with the LATEST
+    ///   modification time wins (the file Claude Code is writing; compared
+    ///   to the nanosecond, from the `fstat` of the descriptor the checks
+    ///   opened). Equal times are decided by the directory name, the
+    ///   smaller byte-wise, so the answer does not depend on the order the
+    ///   directory lists its entries in.
+    /// - A missing or unreadable root, or a failure while listing it,
+    ///   yields nil. Nothing is created and no file content is read.
+    static func locate(sessionID: String, root: String) -> ClaudeTranscriptLocation? {
+        guard isValidSessionID(sessionID), !root.utf8.contains(0) else { return nil }
+        let rootDescriptor = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard rootDescriptor >= 0 else { return nil }
+        guard let directory = fdopendir(rootDescriptor) else {
+            close(rootDescriptor)
+            return nil
+        }
+        // closedir also closes `rootDescriptor`.
+        defer { closedir(directory) }
+
+        var best: (location: ClaudeTranscriptLocation, modified: timespec, name: String)?
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                // nil is both the end and a failure; a failure means the
+                // listing is incomplete, and a partial answer could name
+                // an older file than the one Claude Code is writing.
+                guard errno == 0 else { return nil }
+                break
+            }
+            let name = withUnsafeBytes(of: entry.pointee.d_name) { bytes in
+                String(decoding: bytes.prefix(Int(entry.pointee.d_namlen)), as: UTF8.self)
+            }
+            guard name != ".", name != ".." else { continue }
+            let path = root + "/" + name + "/" + sessionID + ".jsonl"
+            guard let found = validated(transcriptPath: path, sessionID: sessionID, root: root) else { continue }
+            let modified = found.status.st_mtimespec
+            if let current = best {
+                let newer = (modified.tv_sec, modified.tv_nsec) > (current.modified.tv_sec, current.modified.tv_nsec)
+                let tie = modified.tv_sec == current.modified.tv_sec && modified.tv_nsec == current.modified.tv_nsec
+                guard newer || (tie && name.utf8.lexicographicallyPrecedes(current.name.utf8)) else { continue }
+            }
+            best = (found.location, modified, name)
+        }
+        return best?.location
+    }
+
+    /// The session-id rule of both `locate` functions: one path component
+    /// (see `locate(transcriptPath:sessionID:root:)`) and an identifier
+    /// label verbatim.
+    private static func isValidSessionID(_ sessionID: String) -> Bool {
+        !sessionID.isEmpty && sessionID != "." && sessionID != ".."
+            && !sessionID.utf8.contains(where: { $0 == UInt8(ascii: "/") || $0 == 0 })
+            && TranscriptLabel.isIdentifier(sessionID)
+    }
+
+    /// The checks of `locate(transcriptPath:sessionID:root:)`, which also
+    /// return the `fstat` of the descriptor that proved the file regular.
+    private static func validated(
+        transcriptPath: String, sessionID: String, root: String
+    ) -> (location: ClaudeTranscriptLocation, status: stat)? {
+        guard isValidSessionID(sessionID),
               !transcriptPath.utf8.contains(0) else { return nil }
         guard transcriptPath.hasPrefix("/"),
               let lastSlash = transcriptPath.lastIndex(of: "/") else { return nil }
@@ -116,10 +186,11 @@ enum ClaudeTranscriptLocator {
               let mainPath = descriptorPath(fileDescriptor) else { return nil }
         let expectedPath = projectDirectory + "/" + expectedName
         guard mainPath.utf8.elementsEqual(expectedPath.utf8) else { return nil }
-        return ClaudeTranscriptLocation(
+        let location = ClaudeTranscriptLocation(
             mainPath: mainPath,
             sessionID: sessionID,
             subagentsDirectory: projectDirectory + "/" + sessionID + "/subagents")
+        return (location, status)
     }
 
     /// The session's subagent transcripts: the regular files named

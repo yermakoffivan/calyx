@@ -104,111 +104,32 @@ enum ClaudeTranscriptParser {
     private static let syntheticModel = "<synthetic>"
     private static let advisorIterationType = "advisor_message"
 
-    private static let identifierMaxLength = 128
+    private static let identifierMaxLength = TranscriptLabel.identifierMaxScalars
     private static let effortMaxLength = 64
     private static let gitBranchMaxLength = 255
-    private static let cwdMaxLength = 1_024
+    private static let cwdMaxLength = TranscriptLabel.cwdMaxScalars
 
     // MARK: - Labels
 
-    /// Transcript-derived strings are later handed to agents over MCP, so
-    /// each one is limited in length and character class before it is
-    /// stored: surrounding whitespace is trimmed, and the trimmed value
-    /// must be non-empty, at most `maxLength` Unicode SCALARS, and free of
-    /// every scalar `ControlCharacterDisplay.isEscapedCategory` flags.
-    /// Returns nil for anything else, including a non-string value; the
-    /// caller decides whether nil drops the line (required label) or just
-    /// the label (optional one).
-    ///
-    /// The length is counted in scalars, not `Character`s, for the reason
-    /// `ControlCharacterDisplay.render` documents for its `cap`: one
-    /// grapheme cluster can carry an unbounded number of combining marks,
-    /// so a grapheme-counted limit does not bound the stored size at all.
-    ///
-    /// The unsafe set is `ControlCharacterDisplay`'s own definition, not a
-    /// copy of it, so the approval banner and these labels cannot drift
-    /// apart: controls and line breaks (a tab INSIDE the value counts),
-    /// plus format scalars (bidi overrides, zero-width characters, the Tag
-    /// block used for invisible prompt injection), private-use and
-    /// surrogate scalars. The banner escapes such a scalar into a visible
-    /// token; a label has no reader to show a token to, so it is rejected
-    /// whole. Consequence: a label containing any format scalar is
-    /// invalid, including a ZWJ inside an otherwise ordinary emoji
-    /// sequence. Combining marks and non-ASCII letters stay valid.
-    ///
-    /// Trimming is an explicit scalar loop, NOT `trimmingCharacters(in:
-    /// .whitespaces)`: Foundation's trimming also strips U+FEFF and U+200B
-    /// at the edges although neither is in `.whitespaces`, which would
-    /// store "main" for "\u{200B}main" -- a value the transcript never
-    /// contained (for `cwd`, a different path) -- and hide a format scalar
-    /// from the check below. Only real whitespace is removed (see
-    /// `isEdgeWhitespace`); every scalar that remains is classified, so a
-    /// format scalar is rejected at any position, first and last included.
-    /// U+00A0 and U+3000 are Zs too, so they are trimmed at the edges and
-    /// valid inside a label.
-    ///
-    /// One exception sits below this function and cannot be seen from it:
-    /// `JSONSerialization.jsonObject` removes exactly ONE leading U+FEFF
-    /// from every string value before the parser sees it, for raw BOM
-    /// bytes and the `\ufeff` escape alike (verified; `JSONDecoder` does
-    /// not). So a single leading BOM is unobservable here ("\u{FEFF}main"
-    /// is stored as "main"), while two leading BOMs leave one behind and
-    /// are rejected. That is accepted: the removal cannot inject anything
-    /// and no slice needs the stored label to equal the transcript's
-    /// bytes. Pinned by
-    /// `test_records_singleLeadingBOM_isRemovedByJSONSerializationBeforeTheParserSeesIt`.
+    /// `TranscriptLabel.label`, the one label rule (see there).
     private static func label(_ value: Any?, maxLength: Int) -> String? {
-        guard let raw = value as? String else { return nil }
-        var scalars = raw.unicodeScalars[...]
-        while let first = scalars.first, isEdgeWhitespace(first) { scalars.removeFirst() }
-        while let last = scalars.last, isEdgeWhitespace(last) { scalars.removeLast() }
-        var scalarCount = 0
-        for scalar in scalars {
-            scalarCount += 1
-            guard scalarCount <= maxLength, !ControlCharacterDisplay.isEscapedCategory(scalar) else {
-                return nil
-            }
-        }
-        guard scalarCount > 0 else { return nil }
-        return String(scalars)
+        TranscriptLabel.label(value, maxScalars: maxLength)
     }
 
     /// The label rule for a working directory or project root: `label`
-    /// at `cwdMaxLength` scalars. The one definition of what a stored
-    /// path may be, for the transcript's `cwd` and for a root resolved
-    /// from it alike.
+    /// at `cwdMaxLength` scalars.
     private static func cwdLabel(_ value: Any?) -> String? {
         label(value, maxLength: cwdMaxLength)
     }
 
-    /// Whether `path` is a cwd label exactly as it stands: `cwdLabel`
-    /// accepts it and trims nothing from it.
+    /// Forwards to `TranscriptLabel.isCWD`.
     static func isCWDLabel(_ path: String) -> Bool {
-        isVerbatim(path, cwdLabel(path))
+        TranscriptLabel.isCWD(path)
     }
 
-    /// Whether `identifier` is an identifier label exactly as it stands:
-    /// the rule a transcript's `sessionId`, message id and agent id pass
-    /// (`label` at `identifierMaxLength` scalars), with nothing trimmed.
-    /// For an identifier that reaches the store from somewhere other
-    /// than a transcript line.
+    /// Forwards to `TranscriptLabel.isIdentifier`.
     static func isIdentifierLabel(_ identifier: String) -> Bool {
-        isVerbatim(identifier, label(identifier, maxLength: identifierMaxLength))
-    }
-
-    /// Whether `label` (what the label rule made of `raw`) is `raw`
-    /// itself. Compared scalar by scalar, because `String`'s `==` is
-    /// canonical equivalence and "verbatim" means the same scalars.
-    private static func isVerbatim(_ raw: String, _ label: String?) -> Bool {
-        guard let label else { return false }
-        return label.unicodeScalars.elementsEqual(raw.unicodeScalars)
-    }
-
-    /// Whitespace that is trimmed from a label's edges: a space separator
-    /// (general category Zs) or a tab. Defined from the Unicode property,
-    /// not from `CharacterSet`, so the set is exactly what it says.
-    private static func isEdgeWhitespace(_ scalar: Unicode.Scalar) -> Bool {
-        scalar.properties.generalCategory == .spaceSeparator || scalar == "\t"
+        TranscriptLabel.isIdentifier(identifier)
     }
 
     /// A model label, for the main record and for an advisor iteration
@@ -258,89 +179,8 @@ enum ClaudeTranscriptParser {
 
     // MARK: - Timestamp
 
-    /// Parses the one shape Claude Code writes (JavaScript's
-    /// `toISOString()`): `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, UTC only.
-    /// Done by hand in integer arithmetic for two reasons: the result is
-    /// millisecond-exact (no Double seconds to round), and it needs no
-    /// formatter, which would either be allocated per line or shared as
-    /// non-Sendable global state. Not private: the `usage_report` MCP
-    /// tool parses its `since` / `until` arguments with it, so they take
-    /// exactly the shape the transcripts use.
+    /// Forwards to `TranscriptTimestamp.epochMilliseconds(fromISO8601:)`.
     static func epochMilliseconds(fromISO8601 text: String) -> Int64? {
-        let bytes = Array(text.utf8)
-        // "YYYY-MM-DDTHH:MM:SSZ" is 20 bytes; a fraction adds "." + digits.
-        guard bytes.count >= 20, bytes.last == UInt8(ascii: "Z"),
-              bytes[4] == UInt8(ascii: "-"), bytes[7] == UInt8(ascii: "-"),
-              bytes[10] == UInt8(ascii: "T"),
-              bytes[13] == UInt8(ascii: ":"), bytes[16] == UInt8(ascii: ":"),
-              let year = decimal(bytes[0..<4]),
-              let month = decimal(bytes[5..<7]),
-              let day = decimal(bytes[8..<10]),
-              let hour = decimal(bytes[11..<13]),
-              let minute = decimal(bytes[14..<16]),
-              let second = decimal(bytes[17..<19]),
-              (1...12).contains(month),
-              (1...daysInMonth(month, year: year)).contains(day),
-              hour < 24, minute < 60, second < 60 else {
-            return nil
-        }
-
-        var milliseconds: Int64 = 0
-        if bytes.count > 20 {
-            let fraction = bytes[20..<(bytes.count - 1)]
-            guard bytes[19] == UInt8(ascii: "."), !fraction.isEmpty,
-                  fraction.allSatisfy(isDigit) else {
-                return nil
-            }
-            // Digits beyond the third are below a millisecond: truncated.
-            var scale: Int64 = 100
-            for byte in fraction.prefix(3) {
-                milliseconds += Int64(byte - UInt8(ascii: "0")) * scale
-                scale /= 10
-            }
-        }
-
-        let seconds = daysFromCivil(year: year, month: month, day: day) * 86_400
-            + hour * 3_600 + minute * 60 + second
-        return seconds * 1_000 + milliseconds
-    }
-
-    private static func isDigit(_ byte: UInt8) -> Bool {
-        byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9")
-    }
-
-    /// The value of an all-digit ASCII run; nil if any byte is not a digit.
-    private static func decimal(_ bytes: ArraySlice<UInt8>) -> Int64? {
-        var value: Int64 = 0
-        for byte in bytes {
-            guard isDigit(byte) else { return nil }
-            value = value * 10 + Int64(byte - UInt8(ascii: "0"))
-        }
-        return value
-    }
-
-    private static func daysInMonth(_ month: Int64, year: Int64) -> Int64 {
-        switch month {
-        case 2:
-            let isLeap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-            return isLeap ? 29 : 28
-        case 4, 6, 9, 11:
-            return 30
-        default:
-            return 31
-        }
-    }
-
-    /// Days from 1970-01-01 to the given proleptic Gregorian date (Howard
-    /// Hinnant's `days_from_civil`): the year is shifted to start in March
-    /// so the leap day falls at the end of the 400-year era's year.
-    private static func daysFromCivil(year: Int64, month: Int64, day: Int64) -> Int64 {
-        let shiftedYear = month <= 2 ? year - 1 : year
-        // The parsed year is 0...9999, so shiftedYear is -1 at the lowest.
-        let era = (shiftedYear >= 0 ? shiftedYear : shiftedYear - 399) / 400
-        let yearOfEra = shiftedYear - era * 400
-        let dayOfYear = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1
-        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
-        return era * 146_097 + dayOfEra - 719_468
+        TranscriptTimestamp.epochMilliseconds(fromISO8601: text)
     }
 }

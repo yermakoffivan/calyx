@@ -69,17 +69,11 @@ struct UsageIngestResult: Sendable, Equatable {
 // MARK: - UsageIngestor
 
 struct UsageIngestor: Sendable {
-    /// Longest line parsed: 16 MiB. Longer lines are skipped and counted.
-    static let defaultMaxLineBytes = 16 * 1_024 * 1_024
-    /// Bytes after which a read stops, and so the usual size of a batch:
-    /// 4 MiB. The reader checks it only after a finished line, so it does
-    /// NOT bound one synchronous stretch of file I/O between awaits: a
-    /// read runs past the budget to the end of the line it is in, and for
-    /// an unterminated or over-long line that is up to the rest of the
-    /// file. (Memory stays bounded by `maxLineBytes` plus one chunk
-    /// regardless.) The subagents directory listing is likewise one
-    /// synchronous pass over the directory.
-    static let defaultByteBudget = 4 * 1_024 * 1_024
+    /// `TranscriptLineReader.defaultMaxLineBytes`.
+    static let defaultMaxLineBytes = TranscriptLineReader.defaultMaxLineBytes
+    /// `TranscriptLineReader.defaultByteBudget`. The subagents directory
+    /// listing is one synchronous pass over the directory as well.
+    static let defaultByteBudget = TranscriptLineReader.defaultByteBudget
 
     private let store: any UsageBatchStoring
     private let resolver: any ProjectRootResolving
@@ -154,7 +148,7 @@ struct UsageIngestor: Sendable {
     /// reported through `UsageIngestResult.projectRootResolutionFailed`.
     ///
     /// A root the resolver returns is stored only when it is, verbatim,
-    /// a valid cwd label (`ClaudeTranscriptParser.isCWDLabel`). Every
+    /// a valid cwd label (`TranscriptLabel.isCWD`). Every
     /// other string in the store passed the parser's label rule, because
     /// these strings later reach other agents over MCP and the UI; git's
     /// answer is a path of its own (links resolved, whatever bytes the
@@ -189,7 +183,7 @@ struct UsageIngestor: Sendable {
             decision.root = cwd
             return
         }
-        if ClaudeTranscriptParser.isCWDLabel(resolved) {
+        if TranscriptLabel.isCWD(resolved) {
             decision.root = resolved
         } else {
             decision.root = cwd
@@ -222,10 +216,12 @@ struct UsageIngestor: Sendable {
             return result(.failed(errno: code))
         }
 
-        let file: OpenedTranscript
-        switch Self.openTranscript(atPath: path) {
+        let file: TranscriptFile.Opened
+        switch TranscriptFile.open(atPath: path) {
         case .opened(let opened): file = opened
-        case .unavailable(let status): return result(status)
+        case .missing: return result(.missing)
+        case .notARegularFile: return result(.notARegularFile)
+        case .redirected: return result(.redirected)
         case .failed(let code): return try fileFailure(code)
         }
         defer { close(file.descriptor) }
@@ -275,76 +271,5 @@ struct UsageIngestor: Sendable {
         }
 
         return result(.read)
-    }
-
-    // MARK: - Opening
-
-    private struct OpenedTranscript {
-        let descriptor: Int32
-        let inode: UInt64
-        let size: UInt64
-    }
-
-    private enum OpenOutcome {
-        case opened(OpenedTranscript)
-        case unavailable(UsageIngestFileResult.Status)
-        /// Any other errno of the open or of examining the descriptor.
-        case failed(Int32)
-    }
-
-    /// Opens a transcript for reading, or says why it is not one. `path`
-    /// is the path the locator produced, which it spelled with the same
-    /// `fcntl(F_GETPATH)` used below; a path spelled any other way
-    /// (`realpath(3)` included) can differ for the very same file.
-    ///
-    /// - O_NOFOLLOW rejects a symbolic link at the LAST component only
-    ///   (ELOOP). A directory above it that was replaced by a link since
-    ///   the path was validated is still followed by the open.
-    /// - O_NONBLOCK: a FIFO put at the path would otherwise block the
-    ///   open until a writer appears, i.e. possibly forever. It has no
-    ///   effect on reading a regular file.
-    /// - The type is taken from the DESCRIPTOR (`fstat`); a directory or
-    ///   FIFO opens fine and is rejected here.
-    /// - The descriptor's real path (`fcntl(F_GETPATH)`) must equal `path`
-    ///   byte for byte. This is the check that covers the directories
-    ///   above the file: an open redirected through a link anywhere in
-    ///   the path, or reaching the file under another spelling, reports a
-    ///   different real path and is `.redirected`. Together with
-    ///   `fstat` it makes the file that is read a regular file whose real
-    ///   path, at open time, was the validated one.
-    ///
-    /// The caller owns (and closes) the returned descriptor.
-    private static func openTranscript(atPath path: String) -> OpenOutcome {
-        let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard descriptor >= 0 else {
-            let openErrno = errno
-            switch openErrno {
-            case ENOENT: return .unavailable(.missing)
-            case ELOOP: return .unavailable(.notARegularFile)
-            default: return .failed(openErrno)
-            }
-        }
-        var status = stat()
-        guard fstat(descriptor, &status) == 0 else {
-            let statErrno = errno
-            close(descriptor)
-            return .failed(statErrno)
-        }
-        guard (status.st_mode & S_IFMT) == S_IFREG else {
-            close(descriptor)
-            return .unavailable(.notARegularFile)
-        }
-        var realPath = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        guard fcntl(descriptor, F_GETPATH, &realPath) == 0 else {
-            let pathErrno = errno
-            close(descriptor)
-            return .failed(pathErrno)
-        }
-        guard strcmp(realPath, path) == 0 else {
-            close(descriptor)
-            return .unavailable(.redirected)
-        }
-        return .opened(OpenedTranscript(
-            descriptor: descriptor, inode: UInt64(status.st_ino), size: UInt64(status.st_size)))
     }
 }
