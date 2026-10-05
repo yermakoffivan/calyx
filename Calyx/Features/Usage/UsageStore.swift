@@ -7,7 +7,8 @@
 // side: per-series baselines of Claude Code's cumulative token metric,
 // the per-minute token points their increments are added to, the process
 // starts, and the time tracking started from, and the run logs read from
-// Claude Code's own `cost-state` lines. SQLite rather than the JSON documents
+// Claude Code's own `cost-state` lines, and the unreported amounts the two
+// sources' comparison yields. SQLite rather than the JSON documents
 // used elsewhere because a batch -- records, session meta and the file
 // checkpoint -- must commit atomically on every agent turn, and the data
 // only grows. The store touches nothing outside its own directory; later
@@ -261,8 +262,8 @@ actor UsageStore {
         return try queries.map { try UsageGold.rows(for: $0, calendar: calendar, connection: connection) }
     }
 
-    /// Removes every record, session, checkpoint, point, series baseline
-    /// and run log (with its runs and totals) in one transaction and restarts tracking at the store's
+    /// Removes every record, session, checkpoint, point, series baseline,
+    /// run log (with its runs and totals) and unreported row in one transaction and restarts tracking at the store's
     /// clock (see `restartTracking`). The processes heard so far are
     /// retired, so their later exports only set baselines and deleted
     /// usage never comes back; only their digests remain. The store stays
@@ -274,7 +275,7 @@ actor UsageStore {
             try connection.execute("""
                 DELETE FROM usage_records; DELETE FROM usage_sessions; DELETE FROM usage_files; \
                 DELETE FROM usage_points; DELETE FROM usage_run_logs; DELETE FROM usage_runs; \
-                DELETE FROM usage_run_totals;
+                DELETE FROM usage_run_totals; DELETE FROM usage_unreported;
                 """)
             try Self.restartTracking(at: trackedFrom, connection: connection)
         }
@@ -367,6 +368,10 @@ actor UsageStore {
     ///   neither may move the other's position.
     /// - `usage_runs`: the closed runs of a session, by `sequence`.
     /// - `usage_run_totals`: each closed run's totals per model.
+    /// - `usage_unreported`: per session, run and model, the tokens Claude
+    ///   Code's totals hold beyond what was received (`reconcile(session:)`);
+    ///   `time_ns` is the run's end. The token columns are named as in
+    ///   `usage_points` so one aggregate can read both.
     private static let schemaV2Additions = """
         CREATE TABLE usage_series (
             session_id TEXT NOT NULL,
@@ -432,6 +437,17 @@ actor UsageStore {
             cache_creation_tokens INTEGER NOT NULL,
             PRIMARY KEY (session_id, sequence, model)
         ) WITHOUT ROWID;
+        CREATE TABLE usage_unreported (
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            time_ns INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cache_read_tokens INTEGER NOT NULL,
+            cache_creation_tokens INTEGER NOT NULL,
+            PRIMARY KEY (session_id, sequence, model)
+        ) WITHOUT ROWID;
         """
 
     /// Brings a database at `version` up to `schemaVersion`, one step per
@@ -466,6 +482,8 @@ actor UsageStore {
         selectPointRowsSQL, selectSeriesRowsSQL, selectProcessStartsSQL,
         selectRunLogSQL, selectRunsSQL, selectRunTotalsSQL, upsertRunLogSQL, deleteRunSQL, deleteRunTotalsSQL,
         insertRunSQL, insertRunTotalSQL, selectSessionsWithSeriesSQL,
+        selectSessionPointTotalsSQL, selectSessionProcessStartsSQL, selectSessionFirstHeardSQL,
+        selectSessionUnreportedSQL, deleteSessionUnreportedSQL, insertUnreportedSQL, selectUnreportedRowsSQL,
     ]
 
     /// Migrates, then proves the result is the schema this build uses by
@@ -1025,7 +1043,7 @@ extension UsageStore {
     }
 
     /// Restarts tracking at the store's clock (see `restartTracking`); the
-    /// points are kept. Called when tracking is switched on, so usage from
+    /// points and unreported rows are kept. Called when tracking is switched on, so usage from
     /// while it was off is never added.
     func resetTracking() throws {
         let connection = try openConnection()
@@ -1531,4 +1549,207 @@ extension UsageStore {
 
     private static let selectSessionsWithSeriesSQL =
         "SELECT DISTINCT session_id FROM usage_series ORDER BY session_id"
+}
+
+// MARK: - Unreported usage (schema version 2)
+
+/// One stored unreported amount: what Claude Code's totals for one run and
+/// model hold beyond what was received.
+struct UsageUnreportedStoredRow: Sendable, Equatable {
+    let sessionID: String
+    let sequence: Int
+    let timeNs: Int64
+    let model: String
+    let totals: UsageTokenTotals
+}
+
+extension UsageStore {
+    /// Recomputes the session's unreported rows from what is stored (run
+    /// log, points, process starts, series, tracked_from) and replaces them,
+    /// in ONE transaction: nothing can be applied between reading and
+    /// writing.
+    ///
+    /// - A session with no stored run log, or one whose outcome has no
+    ///   `firstSequence`, changes nothing.
+    /// - Otherwise the session's rows with `sequence >= firstSequence` are
+    ///   replaced by the outcome's rows. Rows of earlier runs are never
+    ///   touched: they were computed while those runs were inside the
+    ///   tracking period, and restarting tracking must not erase history.
+    /// - When the stored rows already equal the outcome's, nothing is
+    ///   written at all (the ledger reconciles after every export that
+    ///   changed a session, so an unchanged result must cost no disk write);
+    ///   a transaction that writes nothing leaves the database and its WAL
+    ///   untouched.
+    func reconcile(session sessionID: String) throws -> UsageReconcileOutcome {
+        let connection = try openConnection()
+        var outcome = UsageReconcileOutcome.empty
+        try connection.transaction {
+            guard let stored = try Self.runLog(forSession: sessionID, connection: connection) else { return }
+            let input = UsageReconcileInput(
+                runs: stored.log.runs,
+                trackedFromNs: try Self.trackedFrom(connection: connection),
+                processStarts: try Self.processStarts(ofSession: sessionID, connection: connection),
+                firstHeardNs: try Self.firstHeardNs(ofSession: sessionID, connection: connection),
+                heard: try Self.heardBuckets(ofSession: sessionID, connection: connection))
+            outcome = UsageReconciliation.reconcile(input)
+            guard let firstSequence = outcome.firstSequence else { return }
+
+            let replacement = outcome.rows.map {
+                UsageUnreportedStoredRow(
+                    sessionID: sessionID, sequence: $0.sequence, timeNs: $0.timeNs, model: $0.model, totals: $0.totals)
+            }
+            let current = try Self.unreportedRows(
+                ofSession: sessionID, fromSequence: firstSequence, connection: connection)
+            guard current != replacement else { return }
+
+            try connection.withStatement(Self.deleteSessionUnreportedSQL) { statement in
+                try statement.bind(sessionID, at: 1)
+                try statement.bind(Int64(firstSequence), at: 2)
+                _ = try statement.step()
+            }
+            for row in replacement {
+                try connection.withStatement(Self.insertUnreportedSQL) { statement in
+                    try statement.bind(row.sessionID, at: 1)
+                    try statement.bind(Int64(row.sequence), at: 2)
+                    try statement.bind(row.model, at: 3)
+                    try statement.bind(row.timeNs, at: 4)
+                    try statement.bind(row.totals.input, at: 5)
+                    try statement.bind(row.totals.output, at: 6)
+                    try statement.bind(row.totals.cacheRead, at: 7)
+                    try statement.bind(row.totals.cacheCreation, at: 8)
+                    _ = try statement.step()
+                }
+            }
+        }
+        return outcome
+    }
+
+    /// Every stored row, ordered by (sessionID, sequence, model).
+    func unreportedRows() throws -> [UsageUnreportedStoredRow] {
+        let connection = try openConnection()
+        return try connection.withStatement(Self.selectUnreportedRowsSQL) { statement in
+            var rows: [UsageUnreportedStoredRow] = []
+            while try statement.step() {
+                rows.append(try Self.decodeUnreported(statement))
+            }
+            return rows
+        }
+    }
+
+    // MARK: - Unreported helpers
+
+    /// The session's own active process starts, ordered by start.
+    private static func processStarts(
+        ofSession sessionID: String, connection: SQLiteConnection
+    ) throws -> [UsageProcessStart] {
+        try connection.withStatement(selectSessionProcessStartsSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            var starts: [UsageProcessStart] = []
+            while try statement.step() {
+                starts.append(UsageProcessStart(
+                    sessionID: sessionID, startNs: statement.int64(at: 0), startType: statement.text(at: 1)))
+            }
+            return starts
+        }
+    }
+
+    /// The smallest `first_heard_ns` among the session's series; nil when
+    /// it has none (`MIN` over no rows is NULL).
+    private static func firstHeardNs(ofSession sessionID: String, connection: SQLiteConnection) throws -> Int64? {
+        try connection.withStatement(selectSessionFirstHeardSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            guard try statement.step() else { throw UsageStoreError.malformedRow }
+            return optionalInt64(statement, at: 0)
+        }
+    }
+
+    /// The session's points summed per (minute, model). Summed here,
+    /// saturating, not in SQL: SQLite turns an overflowing integer sum into
+    /// a REAL.
+    private static func heardBuckets(
+        ofSession sessionID: String, connection: SQLiteConnection
+    ) throws -> [UsageHeardBucket] {
+        try connection.withStatement(selectSessionPointTotalsSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            var buckets: [UsageHeardBucket] = []
+            while try statement.step() {
+                guard let model = statement.text(at: 1) else { throw UsageStoreError.malformedRow }
+                let minute = statement.int64(at: 0)
+                let totals = UsageTokenTotals(
+                    input: statement.int64(at: 2), output: statement.int64(at: 3),
+                    cacheRead: statement.int64(at: 4), cacheCreation: statement.int64(at: 5))
+                // Rows arrive ordered by (minute, model), so a group's rows are adjacent.
+                if let last = buckets.last, last.minute == minute, last.model == model {
+                    buckets[buckets.count - 1] = UsageHeardBucket(
+                        minute: minute, model: model, totals: UsageTokenTotals(
+                            input: saturatingSum(last.totals.input, totals.input),
+                            output: saturatingSum(last.totals.output, totals.output),
+                            cacheRead: saturatingSum(last.totals.cacheRead, totals.cacheRead),
+                            cacheCreation: saturatingSum(last.totals.cacheCreation, totals.cacheCreation)))
+                } else {
+                    buckets.append(UsageHeardBucket(minute: minute, model: model, totals: totals))
+                }
+            }
+            return buckets
+        }
+    }
+
+    private static func unreportedRows(
+        ofSession sessionID: String, fromSequence firstSequence: Int, connection: SQLiteConnection
+    ) throws -> [UsageUnreportedStoredRow] {
+        try connection.withStatement(selectSessionUnreportedSQL) { statement in
+            try statement.bind(sessionID, at: 1)
+            try statement.bind(Int64(firstSequence), at: 2)
+            var rows: [UsageUnreportedStoredRow] = []
+            while try statement.step() {
+                rows.append(try decodeUnreported(statement))
+            }
+            return rows
+        }
+    }
+
+    /// Decodes a row selected with `unreportedColumns`.
+    private static func decodeUnreported(_ statement: SQLiteStatement) throws -> UsageUnreportedStoredRow {
+        guard let sessionID = statement.text(at: 0), let model = statement.text(at: 2),
+              let sequence = Int(exactly: statement.int64(at: 1)) else {
+            throw UsageStoreError.malformedRow
+        }
+        return UsageUnreportedStoredRow(
+            sessionID: sessionID, sequence: sequence, timeNs: statement.int64(at: 3), model: model,
+            totals: UsageTokenTotals(
+                input: statement.int64(at: 4), output: statement.int64(at: 5),
+                cacheRead: statement.int64(at: 6), cacheCreation: statement.int64(at: 7)))
+    }
+
+    // MARK: - Unreported statements
+
+    private static let unreportedColumns = """
+        session_id, sequence, model, time_ns, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+        """
+
+    private static let selectSessionPointTotalsSQL = """
+        SELECT minute, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens \
+        FROM usage_points WHERE session_id = ?1 ORDER BY minute, model
+        """
+
+    private static let selectSessionProcessStartsSQL =
+        "SELECT start_ns, start_type FROM usage_process_starts WHERE session_id = ?1 ORDER BY start_ns"
+
+    private static let selectSessionFirstHeardSQL =
+        "SELECT MIN(first_heard_ns) FROM usage_series WHERE session_id = ?1"
+
+    private static let selectSessionUnreportedSQL = """
+        SELECT \(unreportedColumns) FROM usage_unreported WHERE session_id = ?1 AND sequence >= ?2 \
+        ORDER BY sequence, model
+        """
+
+    private static let deleteSessionUnreportedSQL =
+        "DELETE FROM usage_unreported WHERE session_id = ?1 AND sequence >= ?2"
+
+    private static let insertUnreportedSQL = """
+        INSERT INTO usage_unreported (\(unreportedColumns)) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        """
+
+    private static let selectUnreportedRowsSQL =
+        "SELECT \(unreportedColumns) FROM usage_unreported ORDER BY session_id, sequence, model"
 }
