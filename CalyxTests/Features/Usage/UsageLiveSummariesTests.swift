@@ -3,12 +3,11 @@
 //  CalyxTests
 //
 //  Pins UsageLiveSummaries, the observable map from a session id to that
-//  session's total usage row (the row of `UsageQuery(sessionID:)` with an
-//  empty groupBy, so its key is []): set stores or replaces, nil removes,
-//  removeAll empties, and a change is visible to Observation -- while a
-//  `set` that changes nothing is NOT a change: the ledger publishes every
-//  session's row again after each re-read, and an observer must not be
-//  invalidated once per session for rows that stayed the same.
+//  session's total `UsageTokenTotals` (recorded plus unreported, as the
+//  ledger publishes it): set stores or replaces, nil removes, removeAll
+//  empties, and a change is visible to Observation -- while a `set` that
+//  changes nothing is NOT a change: an observer must not be invalidated
+//  for totals that stayed the same.
 //
 
 import Observation
@@ -19,12 +18,11 @@ import XCTest
 @MainActor
 final class UsageLiveSummariesTests: XCTestCase {
 
-    private func row(responses: Int64, output: Int64) -> UsageRow {
-        UsageRow(
-            key: [], responses: responses, finalResponses: responses, inputTokens: 3 * responses,
-            cacheReadTokens: 90_000 * responses, cacheCreationTokens: 1_200 * responses,
-            cacheCreation1hTokens: 1_000 * responses, outputTokensFinal: output,
-            thinkingTokensFinal: 150 * responses, lastTimestampMs: 1_790_936_849_765)
+    /// Session totals; `responses` scales the input side, `output` is
+    /// the output total, so two values differ by either.
+    private func row(responses: Int64, output: Int64) -> UsageTokenTotals {
+        UsageTokenTotals(
+            input: 3 * responses, output: output, cacheRead: 90_000 * responses, cacheCreation: 1_200 * responses)
     }
 
     func test_initialState_isEmpty() {

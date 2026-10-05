@@ -1,12 +1,11 @@
 // UsageLedger.swift
 // Calyx
 //
-// Sits between an accepted hook event and the usage store: decides when a
-// session's transcripts are read, keeps one read per transcript in flight,
-// owns the store's lifetime, and publishes each session's total after a
-// successful read. It is the only place that consults the tracking
-// setting: while tracking is off nothing is read from a transcript and
-// nothing is created on disk.
+// Sits between the usage route and the usage store: commits each export,
+// settles the sessions it changed, owns the store's lifetime, and
+// publishes each session's totals when they change. It is the only place
+// that consults the tracking setting: while tracking is off nothing is
+// stored and nothing is created on disk.
 
 import Foundation
 import os
@@ -34,13 +33,6 @@ enum UsageLedgerDiagnostic: Sendable, Equatable {
         }
     }
 
-    /// An ingest, or a store call around it, threw.
-    case ingestFailed(sessionID: String, error: Failure)
-    /// The main transcript was there but could not be used:
-    /// `.notARegularFile` or `.redirected`. Never reported for `.missing`.
-    case mainTranscriptUnusable(sessionID: String, status: UsageIngestFileResult.Status)
-    /// A subagent file whose status is not `.read`.
-    case subagentFileNotRead(path: String, status: UsageIngestFileResult.Status)
     case projectRootResolutionFailed(sessionID: String)
     /// The store could not be opened or read outside an ingest.
     case storeUnavailable(error: Failure)
@@ -59,21 +51,16 @@ enum UsageLedgerDiagnostic: Sendable, Equatable {
 // MARK: - UsageLedger
 
 actor UsageLedger {
-    /// The events after which a transcript that was already ingested is
-    /// read again: each ends a turn (of the session or of a subagent) or
-    /// the session, so the transcript has gained final numbers.
-    static let ingestTriggerEvents: Set<String> = ["Stop", "SubagentStop", "SessionEnd"]
-
-    /// The calendar handed to the store for a session's total row. That
+    /// The calendar handed to the store for a session's totals. That
     /// query has no `groupBy`, so no calendar can change its result; a
-    /// fixed one keeps the published row independent of the user's locale.
+    /// fixed one keeps the published totals independent of the user's
+    /// locale.
     private static let totalRowCalendar = Calendar(identifier: .gregorian)
 
     private let isEnabled: @Sendable () -> Bool
     private let projectsRoot: @Sendable () -> String
     private let storeDirectory: URL
-    private let ingest: @Sendable (ClaudeTranscriptLocation, UsageStore) async throws -> UsageIngestResult
-    private let publish: @Sendable (String, UsageRow?) async -> Void
+    private let publish: @Sendable (String, UsageTokenTotals?) async -> Void
     private let onDiagnostic: @Sendable (UsageLedgerDiagnostic) -> Void
     private let readRunLog: @Sendable (String, UsageStore, Bool) async throws -> UsageRunLogReadResult
     private let now: @Sendable () -> Date
@@ -110,15 +97,6 @@ actor UsageLedger {
     /// until the first successful sync.
     private var syncedTracking: Bool?
 
-    /// One transcript's ingest, from the trigger that started it until
-    /// its last re-run has ended.
-    private struct Flight {
-        /// Tells this flight from a later one for the same transcript.
-        let id: UInt64
-        /// A trigger arrived since the current run started.
-        var rerunRequested = false
-    }
-
     /// The open store; nil before the first need and after `close()`.
     private var store: UsageStore?
     /// A store `close()` took out of `store` and whose close may not have
@@ -126,22 +104,25 @@ actor UsageLedger {
     /// first is still checkpointing it (there is no busy timeout), so
     /// every open waits for this one first (`awaitPendingClose`).
     private var closingStore: UsageStore?
-    /// Calls into the store that are not part of a flight (`sessions`,
-    /// `report`, `deleteAll`) and are still running. `close()` waits for
+    /// Calls into the store that are not part of a settle (`apply`,
+    /// `tokenReports`, `deleteAll`, ...) and are still running. `close()` waits for
     /// them, so none of them finds its store closed underneath it.
     private var storeCallsInProgress = 0
 
-    /// Running flights, keyed by `ClaudeTranscriptLocation.mainPath`.
-    private var flights: [String: Flight] = [:]
-    private var lastFlightID: UInt64 = 0
-    /// Main paths ingested successfully in this process.
-    private var ingested: Set<String> = []
-    /// Session ids `publish` was called for with an ingest's row.
-    private var published: Set<String> = []
-    /// `deleteAll` calls that have not finished. While non-zero no ingest
-    /// starts.
+    /// What `publish` was last called with per session, only so an equal
+    /// value is not sent again; an absent entry is nil. Bounded: at most
+    /// one entry per session published in this run; cleared by a
+    /// successful `deleteAll()`.
+    private var lastPublished: [String: UsageTokenTotals] = [:]
+    /// Publishes requested and not yet handed to `publish`, in call order.
+    private var pendingPublishes: [(sessionID: String, totals: UsageTokenTotals?)] = []
+    /// True while the one task delivering `pendingPublishes` runs.
+    private var isPublishing = false
+    /// `deleteAll` calls that have not finished. While non-zero no export
+    /// is stored and no settle starts.
     private var deletionsInProgress = 0
-    /// Resumed whenever a flight or a store call ends; each waiter then
+    /// Resumed whenever a settle, a store call or the publishing task
+    /// ends; each waiter then
     /// re-checks its own condition.
     private var changeWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -150,18 +131,16 @@ actor UsageLedger {
     /// - `isEnabled`: the tracking setting, read every time it matters.
     /// - `projectsRoot`: Claude Code's projects directory, the root every
     ///   transcript path is validated against.
-    /// - `ingest`: reads one session's transcripts into the store
-    ///   (`UsageIngestor.ingest`).
-    /// - `publish`: receives a session's total row after each successful
-    ///   ingest, and nil once the data was deleted.
+    /// - `publish`: receives a session's totals whenever they changed
+    ///   (an export, a settle), and nil once the data was deleted; calls
+    ///   arrive one at a time, in the order they were requested.
     /// - `onDiagnostic`: receives everything that went wrong without
     ///   being thrown to a caller.
     init(
         isEnabled: @escaping @Sendable () -> Bool,
         projectsRoot: @escaping @Sendable () -> String,
         storeDirectory: URL,
-        ingest: @escaping @Sendable (ClaudeTranscriptLocation, UsageStore) async throws -> UsageIngestResult,
-        publish: @escaping @Sendable (String, UsageRow?) async -> Void,
+        publish: @escaping @Sendable (String, UsageTokenTotals?) async -> Void,
         onDiagnostic: @escaping @Sendable (UsageLedgerDiagnostic) -> Void,
         readRunLog: (@Sendable (String, UsageStore, Bool) async throws -> UsageRunLogReadResult)? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
@@ -171,7 +150,6 @@ actor UsageLedger {
         self.isEnabled = isEnabled
         self.projectsRoot = projectsRoot
         self.storeDirectory = storeDirectory
-        self.ingest = ingest
         self.publish = publish
         self.onDiagnostic = onDiagnostic
         self.readRunLog = readRunLog ?? { sessionID, store, resolveProjectRoot in
@@ -179,89 +157,6 @@ actor UsageLedger {
                 .read(sessionID: sessionID, resolveProjectRoot: resolveProjectRoot)
         }
         self.now = now
-    }
-
-    // MARK: - Events
-
-    /// Registers a hook event and returns; the ingest it may start runs
-    /// in a task of its own, so the caller never waits for file I/O.
-    ///
-    /// - Dropped while tracking is off or a `deleteAll` is in progress.
-    /// - The path is located on every call. A path the locator rejects
-    ///   (not this session's main transcript, not created yet, not
-    ///   readable) is dropped without a diagnostic and without being
-    ///   remembered: at `SessionStart` the file does not exist yet, and
-    ///   the same path must be accepted once it does.
-    /// - An ingest starts when the transcript was not ingested
-    ///   successfully in this process yet, whatever the event, or when
-    ///   the event is one of `ingestTriggerEvents`. "Ingested" is keyed
-    ///   by the located main path, never by the hook's own spelling.
-    /// - While that transcript's ingest is running, the trigger asks for
-    ///   one re-run instead: the running read may already be past the
-    ///   lines this event announces.
-    ///
-    /// The setting stops ingests from STARTING. An ingest that is already
-    /// reading when tracking is turned off finishes and publishes: what
-    /// it stores was produced while tracking was on. An ingest that was
-    /// asked for but has not opened the store yet (a flight not begun, a
-    /// requested re-run) is not run.
-    func note(_ activity: UsageActivity) {
-        guard isEnabled(), !isDeleting else { return }
-        guard let location = ClaudeTranscriptLocator.locate(
-            transcriptPath: activity.transcriptPath, sessionID: activity.sessionID, root: projectsRoot())
-        else { return }
-        guard !ingested.contains(location.mainPath) || Self.ingestTriggerEvents.contains(activity.hookEventName)
-        else { return }
-        _ = requestIngest(of: location)
-    }
-
-    /// Ingests every stored session that has a transcript path, one
-    /// after another, and returns when the last one has ended. This is
-    /// what picks up lines no hook event announced (events lost while
-    /// Calyx was not running, a transcript that lagged its `Stop`).
-    ///
-    /// Does nothing while tracking is off or a `deleteAll` is in
-    /// progress. Each stored path is located again, exactly like a hook's
-    /// path, and one the locator rejects is skipped without a diagnostic.
-    /// A transcript is ingested whether or not it already was in this
-    /// process, through the same single flight as `note`. The ingests
-    /// run in tasks of the ledger's own and this only waits for them, so
-    /// cancelling the caller never cancels an ingest: a cancelled ingest
-    /// would end the project root's git call, and the cwd it then falls
-    /// back to would be stored as the session's root for good. Never
-    /// throws: a session that fails is reported and the next one is
-    /// still read; a store that cannot be opened or listed is
-    /// `.storeUnavailable`.
-    func reconcileKnown() async {
-        guard isEnabled(), !isDeleting else { return }
-        await awaitPendingClose()
-        // The setting is read again in the same synchronous stretch as
-        // the open: it may have changed across the suspension above, and
-        // opening creates the database.
-        guard isEnabled(), !isDeleting else { return }
-        let sessions: [UsageSessionMeta]
-        do {
-            let store = try openedStore()
-            sessions = try await storeCall { try await store.sessions() }
-        } catch {
-            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
-            return
-        }
-        for session in sessions {
-            // Every pass follows a suspension, so the state is read anew.
-            guard isEnabled(), !isDeleting else { return }
-            guard let transcriptPath = session.transcriptPath,
-                  let location = ClaudeTranscriptLocator.locate(
-                      transcriptPath: transcriptPath, sessionID: session.sessionID, root: projectsRoot())
-            else { continue }
-            let flight = requestIngest(of: location)
-            // Ends when that flight does, re-run included. A `deleteAll`
-            // beginning meanwhile ends the flight without a re-run, and
-            // the guard above then ends this loop.
-            while flights[location.mainPath]?.id == flight {
-                await waitForChange()
-            }
-        }
     }
 
     // MARK: - Reading and deleting
@@ -275,65 +170,27 @@ actor UsageLedger {
         isEnabled()
     }
 
-    /// The Gold query over the store: `reports` with one query.
-    func report(_ query: UsageQuery, calendar: Calendar) async throws -> [UsageRow] {
-        let results = try await reports([query], calendar: calendar)
-        // `reports` returns exactly one result per query.
-        return results[0]
-    }
-
-    /// Several Gold queries over the store, one result per query in
-    /// order. While tracking is on, every known session is reconciled
-    /// first, once for the whole list, so the rows include what the
-    /// transcripts hold now; a failed reconcile is reported through
-    /// `onDiagnostic` and does not fail the report. While tracking is
-    /// off nothing is read from a transcript, and the store is opened
-    /// only if its database already exists (otherwise every query has no
-    /// rows and nothing is created). All queries are answered in one
-    /// store call, so the answers describe the same stored state. Errors
-    /// of the read itself are thrown; there is no partial result. Of
-    /// `calendar` only the time zone is used
-    /// (`UsagePeriod.localDayCalendar`).
-    func reports(_ queries: [UsageQuery], calendar: Calendar) async throws -> [[UsageRow]] {
-        await waitWhileDeleting()
-        if isEnabled() {
-            await reconcileKnown()
-        }
-        await awaitStoreReadyAfterDeletes()
-        guard let store = try storeIfWarranted() else { return queries.map { _ in [] } }
-        return try await storeCall { try await store.reports(queries, calendar: calendar) }
-    }
-
     /// Deletes everything stored, whatever the setting.
     ///
     /// From its first statement until it returns or throws
-    /// (`isDeleting`), no ingest starts: a `note` or `reconcileKnown`
-    /// arriving meanwhile is dropped, a flight that has not begun is
-    /// skipped and a requested re-run is not run. It waits for the flights
-    /// already running, so no ingest can write into the store after the
-    /// delete, and the block covers its own `publish(_, nil)` calls, so
-    /// no ingest can publish a fresh row that one of those calls would
-    /// then erase.
+    /// (`isDeleting`), no export is stored and no settle starts: an export
+    /// arriving meanwhile is dropped and a requested re-run of a settle is
+    /// not run. It waits for the settles and store calls already running,
+    /// so nothing can write into the store after the delete.
     ///
-    /// When it returns OR throws, no transcript counts as ingested, so
-    /// the next event of any kind reads its transcript again. After a
-    /// delete that is the point; after a failed one it is what makes up
-    /// for every trigger dropped while it ran, whichever way it was
-    /// dropped, and costs little because the checkpoints are still
-    /// there. Only a delete that succeeded publishes: every session that
-    /// was published is published again with nil. The store's
-    /// checkpoints are deleted with the records, so a session that is
-    /// still running is read again from the start of its transcript at
-    /// its next event.
+    /// Only a delete that succeeded publishes: it first waits until every
+    /// publish requested before it was delivered, then every session that
+    /// was published in this run is published again with nil, and the
+    /// memory of what was published is cleared. Its nils are delivered
+    /// before it returns. The store's checkpoints are deleted with the
+    /// records, so a session that is still running is read again from
+    /// the start of its transcript at its next settle.
     ///
     /// While tracking is off and no database exists, nothing is opened
     /// or created.
     func deleteAll() async throws {
         deletionsInProgress += 1
         defer {
-            // No flight can have marked a transcript since the wait
-            // below ended, so this leaves the set empty on every path.
-            ingested.removeAll()
             projectRootFailed.removeAll()
             transcriptMissingSince.removeAll()
             deletionsInProgress -= 1
@@ -341,23 +198,27 @@ actor UsageLedger {
             signalChange()
         }
         // Waits for everything in flight that started before it, as
-        // `close()` does: transcript flights, settles, and store calls (an
-        // export's `apply` suspended in the store included). Work that
-        // resumes meanwhile sees `isDeleting` and requests nothing new; a
-        // requested re-run of a settle is not run. Its own store call
-        // starts only after this wait, so it never waits on itself.
-        while !flights.isEmpty || !settles.isEmpty || storeCallsInProgress > 0 {
+        // `close()` does: settles, and store calls (an export's `apply`
+        // suspended in the store included). Work that resumes meanwhile
+        // sees `isDeleting` and requests nothing new; a requested re-run
+        // of a settle is not run. Its own store call starts only after
+        // this wait, so it never waits on itself.
+        while !settles.isEmpty || storeCallsInProgress > 0 {
             await waitForChange()
         }
         await awaitPendingClose()
         if let store = try storeIfWarranted() {
             try await storeCall { try await store.deleteAll() }
         }
-        let sessionIDs = published.sorted()
-        published.removeAll()
+        // What was queued before the delete is delivered first, so none
+        // of it can arrive after the nils below and show deleted totals.
+        await waitForPublishes()
+        let sessionIDs = lastPublished.keys.sorted()
+        lastPublished.removeAll()
         for sessionID in sessionIDs {
-            await publish(sessionID, nil)
+            enqueuePublish(sessionID, nil)
         }
+        await waitForPublishes()
     }
 
     /// Returns once no `deleteAll` is in progress (several in a row
@@ -388,9 +249,10 @@ actor UsageLedger {
 
     // MARK: - Lifetime
 
-    /// Returns when no ingest or settle is running or pending.
+    /// Returns when no settle is running or pending and every requested
+    /// publish was delivered.
     func waitUntilIdle() async {
-        while !flights.isEmpty || !settles.isEmpty {
+        while !settles.isEmpty || isPublishing {
             await waitForChange()
         }
     }
@@ -400,7 +262,7 @@ actor UsageLedger {
     /// the one closing it. The ledger stays usable: the next need opens
     /// the store again.
     func close() async {
-        while !flights.isEmpty || !settles.isEmpty || storeCallsInProgress > 0 {
+        while !settles.isEmpty || storeCallsInProgress > 0 || isPublishing {
             await waitForChange()
         }
         // Taken out of `store` before the suspension below, so whatever
@@ -450,7 +312,7 @@ actor UsageLedger {
         return try openedStore()
     }
 
-    /// Runs a store call outside a flight, counted so `close()` waits
+    /// Runs a store call outside a settle, counted so `close()` waits
     /// for it.
     private func storeCall<Value: Sendable>(
         _ body: @Sendable () async throws -> Value
@@ -461,111 +323,6 @@ actor UsageLedger {
             signalChange()
         }
         return try await body()
-    }
-
-    // MARK: - Single flight
-
-    /// Asks for one ingest of `location` and returns the id of the
-    /// flight that will run it: the transcript's running flight, now
-    /// asked for a re-run, or a new one.
-    ///
-    /// A new flight always runs in a task of the ledger's own, never in
-    /// the caller's: whoever asked only waits (or does not), so no
-    /// caller's cancellation reaches an ingest.
-    private func requestIngest(of location: ClaudeTranscriptLocation) -> UInt64 {
-        if let running = flights[location.mainPath] {
-            flights[location.mainPath]?.rerunRequested = true
-            return running.id
-        }
-        lastFlightID += 1
-        flights[location.mainPath] = Flight(id: lastFlightID)
-        Task { await self.runFlight(location) }
-        return lastFlightID
-    }
-
-    /// Runs the registered flight of `location`: one ingest, then one
-    /// more for as long as a trigger arrived during the last one.
-    ///
-    /// The flight is registered before this runs and removed in the same
-    /// synchronous stretch that finds no re-run requested. A trigger
-    /// therefore either finds the flight and sets the flag before that
-    /// check, or finds no flight and starts a new one; it cannot fall
-    /// between the two. Any number of triggers during one run set the
-    /// same flag, so they cost one more run.
-    private func runFlight(_ location: ClaudeTranscriptLocation) async {
-        let key = location.mainPath
-        repeat {
-            flights[key]?.rerunRequested = false
-            await ingestOnce(location)
-        } while !isDeleting && flights[key]?.rerunRequested == true
-        flights[key] = nil
-        signalChange()
-    }
-
-    /// One ingest and what follows from its result.
-    ///
-    /// It succeeded when the seam did not throw and the main transcript's
-    /// status is `.read`. Only then is the transcript marked ingested and
-    /// the session's stored total published; the partial failures inside
-    /// a successful ingest (subagent files, project root) are reported
-    /// and change neither. Everything else leaves the transcript
-    /// unmarked, so its next event of any kind tries again; nothing here
-    /// retries on its own.
-    private func ingestOnce(_ location: ClaudeTranscriptLocation) async {
-        await awaitPendingClose()
-        // Checked here, in the same synchronous stretch as the open, and
-        // not only when the trigger arrived: a `deleteAll` may have begun
-        // or tracking been turned off since, and the open creates the
-        // database.
-        guard isEnabled(), !isDeleting else { return }
-        let store: UsageStore
-        do {
-            store = try openedStore()
-        } catch {
-            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
-            return
-        }
-
-        let sessionID = location.sessionID
-        let row: UsageRow?
-        do {
-            let result = try await ingest(location, store)
-            // No entry at all is not a success either: there is no main
-            // status to rely on.
-            guard let main = result.files.first else { return }
-            switch main.status {
-            case .read:
-                break
-            case .missing:
-                // Normal right after SessionStart: the file is not
-                // written yet.
-                return
-            case .notARegularFile, .redirected:
-                onDiagnostic(.mainTranscriptUnusable(sessionID: sessionID, status: main.status))
-                return
-            case .failed(let code):
-                // An I/O failure of the main transcript, which the
-                // ingestor throws; the same failure handed back as a
-                // status is the same failure.
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
-            }
-            for file in result.files.dropFirst() where file.status != .read {
-                onDiagnostic(.subagentFileNotRead(path: file.path, status: file.status))
-            }
-            if result.projectRootResolutionFailed {
-                onDiagnostic(.projectRootResolutionFailed(sessionID: sessionID))
-            }
-            row = try await store.report(UsageQuery(sessionID: sessionID), calendar: Self.totalRowCalendar).first
-        } catch {
-            onDiagnostic(.ingestFailed(sessionID: sessionID, error: UsageLedgerDiagnostic.Failure(error)))
-            return
-        }
-        // The flight is still registered, so a `deleteAll` that began
-        // meanwhile is still waiting: these marks and this publish land
-        // before its delete, and its own nil publish comes after.
-        ingested.insert(location.mainPath)
-        published.insert(sessionID)
-        await publish(sessionID, row)
     }
 
     // MARK: - Exports (version 2)
@@ -605,8 +362,9 @@ actor UsageLedger {
         await awaitPendingClose()
         guard isEnabled(), !isDeleting else { return .dropped }
         let outcome: UsageSeriesApplyOutcome
+        let store: UsageStore
         do {
-            let store = try openedStore()
+            store = try openedStore()
             let afterApply = self.afterApply
             outcome = try await storeCall {
                 let applied = try await store.apply(
@@ -618,8 +376,12 @@ actor UsageLedger {
             onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
             return .unavailable
         }
+        let changed = outcome.changedSessions.sorted()
+        // Published before the settles, so the card never waits for a
+        // transcript read; the publishes are queued, not awaited.
+        await publishTotals(of: changed, from: store)
         if !isDeleting {
-            for sessionID in outcome.changedSessions.sorted() {
+            for sessionID in changed {
                 _ = requestSettle(of: sessionID)
             }
         }
@@ -781,6 +543,81 @@ actor UsageLedger {
         } catch {
             onDiagnostic(.reconcileFailed(sessionID: sessionID, error: UsageLedgerDiagnostic.Failure(error)))
         }
+        await publishTotals(of: [sessionID], from: store)
+    }
+
+    // MARK: - Publishing
+
+    /// Reads the totals of `sessionIDs` in one counted store call and
+    /// queues a publish for each whose totals differ from what was last
+    /// published for it. A failed read is `storeUnavailable` and
+    /// publishes nothing.
+    private func publishTotals(of sessionIDs: [String], from store: UsageStore) async {
+        guard !sessionIDs.isEmpty else { return }
+        let calendar = Self.totalRowCalendar
+        let totals: [UsageTokenTotals?]
+        do {
+            totals = try await storeCall {
+                var read: [UsageTokenTotals?] = []
+                for sessionID in sessionIDs {
+                    let rows = try await store.tokenReport(UsageTokenQuery(sessionID: sessionID), calendar: calendar)
+                    read.append(Self.totals(of: rows))
+                }
+                return read
+            }
+        } catch {
+            onDiagnostic(.storeUnavailable(error: UsageLedgerDiagnostic.Failure(error)))
+            return
+        }
+        for (sessionID, value) in zip(sessionIDs, totals) where lastPublished[sessionID] != value {
+            lastPublished[sessionID] = value
+            enqueuePublish(sessionID, value)
+        }
+    }
+
+    /// A session's totals: its rows (at most one recorded and one
+    /// unreported) summed field by field, saturating; nil for no row.
+    private static func totals(of rows: [UsageTokenRow]) -> UsageTokenTotals? {
+        guard !rows.isEmpty else { return nil }
+        return rows.reduce(into: UsageTokenTotals()) { sum, row in
+            sum.input = saturatingSum(sum.input, row.inputTokens)
+            sum.output = saturatingSum(sum.output, row.outputTokens)
+            sum.cacheRead = saturatingSum(sum.cacheRead, row.cacheReadTokens)
+            sum.cacheCreation = saturatingSum(sum.cacheCreation, row.cacheCreationTokens)
+        }
+    }
+
+    /// `a + b`, at `Int64.max` (or `.min`) instead of trapping.
+    private static func saturatingSum(_ a: Int64, _ b: Int64) -> Int64 {
+        let (result, overflow) = a.addingReportingOverflow(b)
+        guard overflow else { return result }
+        return b > 0 ? .max : .min
+    }
+
+    /// Queues one publish and starts the delivering task if none runs.
+    /// One task delivers the queue in order, so publishes arrive in call
+    /// order and none is awaited by whoever requested it.
+    private func enqueuePublish(_ sessionID: String, _ totals: UsageTokenTotals?) {
+        pendingPublishes.append((sessionID: sessionID, totals: totals))
+        guard !isPublishing else { return }
+        isPublishing = true
+        Task { await self.deliverPublishes() }
+    }
+
+    private func deliverPublishes() async {
+        while let next = pendingPublishes.first {
+            pendingPublishes.removeFirst()
+            await publish(next.sessionID, next.totals)
+        }
+        isPublishing = false
+        signalChange()
+    }
+
+    /// Returns once every queued publish was delivered.
+    private func waitForPublishes() async {
+        while isPublishing {
+            await waitForChange()
+        }
     }
 
     // MARK: - Waiting
@@ -813,8 +650,8 @@ extension UsageLedger {
         setting && launchMayTouchAgentPaths
     }
 
-    /// The ledger the app runs: the real ingestor and git resolver, the
-    /// given setting, roots and summaries. Each session's total is
+    /// The ledger the app runs: the real run-log reader and git resolver,
+    /// the given setting, roots and summaries. Each session's totals are
     /// published into `summaries` on the main actor, and diagnostics go
     /// to the unified log. Touches no file.
     static func makeProduction(
@@ -827,11 +664,8 @@ extension UsageLedger {
             isEnabled: isEnabled,
             projectsRoot: projectsRoot,
             storeDirectory: storeDirectory,
-            ingest: { location, store in
-                try await UsageIngestor(store: store, resolver: GitProjectRootResolver()).ingest(location)
-            },
-            publish: { sessionID, row in
-                await summaries.set(row, forSession: sessionID)
+            publish: { sessionID, totals in
+                await summaries.set(totals, forSession: sessionID)
             },
             onDiagnostic: { log($0) }
         )
@@ -892,23 +726,6 @@ extension UsageLedger {
     /// transcript's content.
     private static func log(_ diagnostic: UsageLedgerDiagnostic) {
         switch diagnostic {
-        case .ingestFailed(let sessionID, let error):
-            logger.error("""
-                Usage ingest failed for session \(sessionID): \
-                \(error.domain, privacy: .public) \(error.code, privacy: .public): \(error.description)
-                """)
-        case .mainTranscriptUnusable(let sessionID, let status):
-            logger.warning(
-                "Main transcript of session \(sessionID) was not read: \(statusName(status), privacy: .public)")
-        case .subagentFileNotRead(let path, let status):
-            if case .failed(let code) = status {
-                logger.warning("""
-                    Subagent transcript \(path) was not read: \
-                    \(statusName(status), privacy: .public), errno \(code, privacy: .public)
-                    """)
-            } else {
-                logger.warning("Subagent transcript \(path) was not read: \(statusName(status), privacy: .public)")
-            }
         case .projectRootResolutionFailed(let sessionID):
             logger.warning("Project root of session \(sessionID) could not be resolved; its working directory is used")
         case .storeUnavailable(let error):
@@ -940,16 +757,6 @@ extension UsageLedger {
         case .missing: return "missing"
         case .notARegularFile: return "notARegularFile"
         case .redirected: return "redirected"
-        }
-    }
-
-    private static func statusName(_ status: UsageIngestFileResult.Status) -> String {
-        switch status {
-        case .read: return "read"
-        case .missing: return "missing"
-        case .notARegularFile: return "notARegularFile"
-        case .redirected: return "redirected"
-        case .failed: return "failed"
         }
     }
 }

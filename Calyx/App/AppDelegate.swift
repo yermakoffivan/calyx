@@ -1148,8 +1148,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // Before `resyncAgentHooksIfInstalled()`, so the IPC start it may
         // trigger reaches the MCP host.
         startMCPHost()
-        // Before `resyncAgentHooksIfInstalled()`, so the sink is in place
-        // before the IPC start it may trigger accepts a hook event.
+        // Before `resyncAgentHooksIfInstalled()`, so the usage route's
+        // endpoint is in place before the IPC start it may trigger
+        // accepts an export.
         startUsageLedger(server: .shared, ledger: .shared)
         resyncAgentHooksIfInstalled()
 
@@ -1510,19 +1511,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
 
     // MARK: - Usage ledger
 
-    /// Connects `ledger` to `server`: every Claude Code hook event the
-    /// server accepts is handed to the ledger, and the sessions the
-    /// ledger already knows are read once for the lines no event
-    /// announced. Safe with tracking off: the ledger then drops both and
-    /// creates nothing.
+    /// Connects `ledger` to `server`. Safe with tracking off: the ledger
+    /// then drops every export and creates nothing. Nothing here reads a
+    /// file or waits; the startup work runs in a task of its own.
     ///
-    /// Nothing here reads a file or waits. The sink only starts a task,
-    /// so the hook's HTTP response never waits for an ingest, and the
-    /// reconcile runs in a task of its own on the ledger. The sink's
-    /// task keeps the default priority: it is tiny, and events reach the
-    /// ledger in the order they arrived.
-    ///
-    /// It also installs the server's usage bridge, which answers the
+    /// It installs the server's usage bridge, which answers the
     /// usage_* MCP tools from the same ledger. Whether tracking is on is
     /// the ledger's own `isTracking`, so the tool and the ledger never
     /// disagree; `current` is looked up in the registry the server holds
@@ -1537,7 +1530,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// R4b: that task awaits ONE `activation.reconcile()`, which loads the
     /// credential (its loader owns the directory), syncs the store's
     /// tracking flag and brings Claude Code's settings file in line with
-    /// the switches; then the catch-up runs next to `reconcileKnown`.
+    /// the switches; then the catch-up runs.
     /// Every `.calyxIPCStateDidChange` requests another reconcile; that
     /// observer lives as long as this delegate (or until the next call)
     /// and holds `activation` weakly.
@@ -1549,11 +1542,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         ingestMonitor: UsageIngestMonitor = .shared,
         activation: UsageTelemetryActivation = .shared
     ) -> Task<Void, Never> {
-        server.usageSink = { activity in
-            Task {
-                await ledger.note(activity)
-            }
-        }
         // Weak: the server owns the bridge, so a strong capture would be
         // a cycle. The bridge is only reached through the server, so the
         // server is alive whenever the closure runs.
@@ -1577,9 +1565,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         }
         return Task(priority: .utility) {
             await activation.reconcile()
-            async let known: Void = ledger.reconcileKnown()
-            async let caughtUp: Void = ledger.catchUp()
-            _ = await (known, caughtUp)
+            await ledger.catchUp()
         }
     }
 

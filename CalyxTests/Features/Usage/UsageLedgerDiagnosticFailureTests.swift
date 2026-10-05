@@ -96,8 +96,8 @@ final class UsageLedgerDiagnosticFailureTests: XCTestCase {
         let failure = UsageLedgerDiagnostic.Failure(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)))
 
         XCTAssertEqual(
-            UsageLedgerDiagnostic.ingestFailed(sessionID: "session-a", error: failure),
-            .ingestFailed(sessionID: "session-a", error: failure))
+            UsageLedgerDiagnostic.runLogReadFailed(sessionID: "session-a", error: failure),
+            .runLogReadFailed(sessionID: "session-a", error: failure))
         XCTAssertNotEqual(
             UsageLedgerDiagnostic.storeUnavailable(error: failure),
             .storeUnavailable(error: UsageLedgerDiagnostic.Failure(NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)))))

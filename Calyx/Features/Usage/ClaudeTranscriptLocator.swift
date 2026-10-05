@@ -1,8 +1,11 @@
 // ClaudeTranscriptLocator.swift
 // Calyx
 //
-// The gate between an UNTRUSTED transcript path (it arrives in an agent
-// hook payload) and the usage ingestor. A path is accepted only when it
+// The gate between a transcript path and the code that reads it. The
+// run-log reader finds a session's transcript by its session id under
+// the projects directory (`locate(sessionID:root:)`), or re-checks the
+// path it stored for the session, which is not trusted either
+// (`locate(transcriptPath:sessionID:root:)`). A path is accepted only when it
 // names "<projects root>/<project dir>/<sessionID>.jsonl" and that file is
 // itself a regular file; the session's subagent transcripts are then
 // listed by name, never through a symbolic link at the session or
@@ -41,8 +44,8 @@ enum ClaudeTranscriptLocator {
     ///   rule. A file that really exists under an id the rule rejects
     ///   (a bidi override, a zero-width or control character, more than
     ///   128 scalars, whitespace at an edge) is not located.
-    /// - The path must be absolute: a hook payload has no working
-    ///   directory worth trusting, and "~" is never expanded.
+    /// - The path must be absolute: no working directory is worth
+    ///   trusting, and "~" is never expanded.
     /// - The final component must be "<sessionID>.jsonl" and a regular
     ///   file by `lstat`, so a symbolic link there is rejected even when
     ///   it points at a valid transcript: following it would let the

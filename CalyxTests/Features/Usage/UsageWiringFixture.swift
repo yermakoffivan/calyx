@@ -4,13 +4,14 @@
 //
 //  What the tests of the usage ledger's wiring share: a per-test
 //  temporary directory holding a synthetic projects root and a store
-//  directory, synthetic transcript lines with the total row they add up
-//  to (written by hand), a recorder for the ledger's `publish` seam that
-//  can fulfil an expectation, and a test ledger running the REAL ingestor.
+//  directory, synthetic exports of the token metric with the totals they
+//  add up to (written by hand), a recorder for the ledger's `publish` seam
+//  that can fulfil an expectation, and a test ledger whose settles run the
+//  REAL run log reader.
 //  Nothing here knows ~/.claude, Application Support or UserDefaults.
 //
-//  The code under test starts tasks it does not wait for (a reconcile, a
-//  forwarded event). Two things keep such a task from outliving its test:
+//  The code under test starts tasks it does not wait for (a settle, a
+//  catch-up, a publish). Two things keep such a task from outliving its test:
 //  `closeBehindEverythingStarted` is the barrier a test uses before it
 //  asserts that something did NOT happen, and `shutDown` turns the
 //  fixture's tracking switch off before it closes the ledgers and removes
@@ -43,30 +44,49 @@ final class UsageFixtureSwitch: Sendable {
 final class UsagePublishRecorder: Sendable {
     struct Entry: Equatable, Sendable {
         let sessionID: String
-        let row: UsageRow?
+        let totals: UsageTokenTotals?
     }
 
     private struct State: Sendable {
         var entries: [Entry] = []
-        var ingestPriorities: [TaskPriority] = []
+        var settlePriorities: [TaskPriority] = []
         var waiters: [(count: Int, expectation: XCTestExpectation)] = []
+        var settleWaiters: [(count: Int, expectation: XCTestExpectation)] = []
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     var entries: [Entry] { state.withLock { $0.entries } }
 
-    /// `Task.currentPriority` inside each ingest of a fixture ledger, in
-    /// call order.
-    var ingestPriorities: [TaskPriority] { state.withLock { $0.ingestPriorities } }
+    /// `Task.currentPriority` inside each run log read (one per settle)
+    /// of a fixture ledger, in call order.
+    var settlePriorities: [TaskPriority] { state.withLock { $0.settlePriorities } }
 
-    func recordIngest(priority: TaskPriority) {
-        state.withLock { $0.ingestPriorities.append(priority) }
+    func recordSettle(priority: TaskPriority) {
+        let ready: [XCTestExpectation] = state.withLock { state in
+            state.settlePriorities.append(priority)
+            let count = state.settlePriorities.count
+            let ready = state.settleWaiters.filter { $0.count <= count }.map(\.expectation)
+            state.settleWaiters.removeAll { $0.count <= count }
+            return ready
+        }
+        for expectation in ready { expectation.fulfill() }
     }
 
-    func record(_ sessionID: String, _ row: UsageRow?) {
+    /// Fulfils `expectation` once at least `count` run log reads were
+    /// recorded.
+    func expectSettles(count: Int, fulfilling expectation: XCTestExpectation) {
+        let alreadyThere = state.withLock { state in
+            if state.settlePriorities.count >= count { return true }
+            state.settleWaiters.append((count, expectation))
+            return false
+        }
+        if alreadyThere { expectation.fulfill() }
+    }
+
+    func record(_ sessionID: String, _ totals: UsageTokenTotals?) {
         let ready: [XCTestExpectation] = state.withLock { state in
-            state.entries.append(Entry(sessionID: sessionID, row: row))
+            state.entries.append(Entry(sessionID: sessionID, totals: totals))
             let count = state.entries.count
             let ready = state.waiters.filter { $0.count <= count }.map(\.expectation)
             state.waiters.removeAll { $0.count <= count }
@@ -164,10 +184,6 @@ struct UsageWiringFixture {
         projectDirectory + "/" + sessionID + ".jsonl"
     }
 
-    func subagentPath(_ sessionID: String, _ agentID: String) -> String {
-        projectDirectory + "/" + sessionID + "/subagents/agent-" + agentID + ".jsonl"
-    }
-
     /// Every path below the base directory, sorted.
     func everyPath() -> [String] {
         (FileManager.default.subpaths(atPath: basePath) ?? []).sorted()
@@ -192,50 +208,51 @@ struct UsageWiringFixture {
 
     // MARK: Transcript lines
 
-    /// One final assistant line in the transcript's shape. `agentID`
-    /// non-nil makes it a subagent (sidechain) line.
-    static func assistantLine(
-        _ id: String, sessionID: String = sessionA, agentID: String? = nil, cwd: String = "/work/repo/sub"
-    ) -> String {
-        var text = #"{"type":"assistant","sessionId":""# + sessionID + #"","#
-        text += #""timestamp":"2026-10-02T10:27:29.765Z","#
-        text += #""cwd":""# + cwd + #"","#
-        text += #""gitBranch":"main","effort":"high","#
-        if let agentID {
-            text += #""isSidechain":true,"agentId":""# + agentID + #"","attributionAgent":"swift-specialist","#
-        } else {
-            text += #""isSidechain":false,"#
-        }
-        text += #""message":{"id":""# + id + #"","model":"claude-opus-5-5","stop_reason":"end_turn","#
-        text += #""usage":{"input_tokens":3,"output_tokens":420"#
-        text += #","cache_read_input_tokens":90000,"cache_creation_input_tokens":1200,"#
-        text += #""cache_creation":{"ephemeral_1h_input_tokens":1000,"ephemeral_5m_input_tokens":200},"#
-        text += #""output_tokens_details":{"thinking_tokens":150}"#
-        text += "}}}"
-        return text
+    /// A line of the session's own transcript with a timestamp and a cwd:
+    /// what the run log reader takes the session's cwd (and so its project
+    /// root) from.
+    static func transcriptLine(_ sessionID: String = sessionA, cwd: String = "/work/repo/sub") -> String {
+        #"{"type":"user","timestamp":"2026-10-05T07:30:00.000Z","sessionId":""# + sessionID
+            + #"","cwd":""# + cwd + #""}"#
     }
 
-    /// A line that is read but yields no record.
-    static let userLine =
-        #"{"type":"user","sessionId":"11111111-2222-3333-4444-555555555555","message":{"role":"user"}}"#
+    // MARK: Exports
 
-    /// The total row of a session holding `responses` of those assistant
-    /// lines, by hand: each is final with input 3, output 420, thinking
-    /// 150, cache read 90,000, cache creation 1,200 (1,000 of it 1h), at
-    /// 2026-10-02T10:27:29.765Z = 1_790_936_849_765 ms.
-    static func totalRow(_ responses: Int64, key: [String?] = []) -> UsageRow {
-        UsageRow(
-            key: key,
-            responses: responses,
-            finalResponses: responses,
-            inputTokens: 3 * responses,
-            cacheReadTokens: 90_000 * responses,
-            cacheCreationTokens: 1_200 * responses,
-            cacheCreation1hTokens: 1_000 * responses,
-            outputTokensFinal: 420 * responses,
-            thinkingTokensFinal: 150 * responses,
-            lastTimestampMs: 1_790_936_849_765
-        )
+    /// A process start far after any store clock (2096): its exports count
+    /// in full whenever the store's tracking started.
+    static let exportStartNs: Int64 = 4_000_000_000_000_000_000
+    static let secondNs: Int64 = 1_000_000_000
+
+    /// One export of a fresh process of `sessionID` (started at
+    /// `exportStartNs`): its process start and one cumulative input series
+    /// of `input` tokens, sampled `seconds` after the start. The session's
+    /// totals after it are `inputTotals(input)`.
+    static func exportBody(_ sessionID: String = sessionA, input: Double, seconds: Int64 = 10) throws -> Data {
+        let fixtures = UsageTelemetryFixtures.self
+        let timeNs = exportStartNs + seconds * secondNs
+        let tokens = fixtures.point(
+            attributes: fixtures.attributes([
+                "session.id": sessionID, "model": "claude-sonnet-5-5", "query_source": "main", "type": "input",
+            ]),
+            startNs: exportStartNs, timeNs: timeNs, asDouble: input)
+        let start: [String: Any] = [
+            "attributes": fixtures.attributes(["session.id": sessionID, "start_type": "fresh"]),
+            "startTimeUnixNano": String(exportStartNs), "timeUnixNano": String(timeNs), "asDouble": 1.0,
+        ]
+        return try fixtures.body(metrics: [
+            fixtures.metric(points: [tokens]),
+            fixtures.metric(name: "claude_code.session.count", points: [start]),
+        ])
+    }
+
+    /// When `exportBody(input:seconds:)` is received.
+    static func exportTimeNs(seconds: Int64 = 10) -> Int64 {
+        exportStartNs + seconds * secondNs
+    }
+
+    /// The totals of a session whose only tokens are `input` input tokens.
+    static func inputTotals(_ input: Int64) -> UsageTokenTotals {
+        UsageTokenTotals(input: input, output: 0, cacheRead: 0, cacheCreation: 0)
     }
 
     static var utc: Calendar {
@@ -246,14 +263,10 @@ struct UsageWiringFixture {
 
     // MARK: Ledger and store
 
-    func activity(_ event: String, _ sessionID: String = sessionA) -> UsageActivity {
-        UsageActivity(sessionID: sessionID, transcriptPath: mainPath(sessionID), hookEventName: event)
-    }
-
     /// A ledger over this fixture's roots, enabled while `tracking` is
-    /// on, that runs the real ingestor (sessions are attributed to their
-    /// cwd) and records what it publishes and at which priority each
-    /// ingest ran.
+    /// on, whose settles run the real run log reader (sessions are
+    /// attributed to their cwd) and which records what it publishes and at
+    /// which priority each settle read its run log.
     func makeLedger(recorder: UsagePublishRecorder) -> UsageLedger {
         let root = self.root
         let tracking = self.tracking
@@ -261,12 +274,14 @@ struct UsageWiringFixture {
             isEnabled: { tracking.isOn },
             projectsRoot: { root },
             storeDirectory: storeURL,
-            ingest: { location, store in
-                recorder.recordIngest(priority: Task.currentPriority)
-                return try await UsageIngestor(store: store, resolver: UsageFixtureNoRepositoryResolver()).ingest(location)
-            },
-            publish: { sessionID, row in recorder.record(sessionID, row) },
-            onDiagnostic: { _ in })
+            publish: { sessionID, totals in recorder.record(sessionID, totals) },
+            onDiagnostic: { _ in },
+            readRunLog: { sessionID, store, resolveProjectRoot in
+                recorder.recordSettle(priority: Task.currentPriority)
+                return try await UsageRunLogReader(
+                    store: store, resolver: UsageFixtureNoRepositoryResolver(), projectsRoot: { root }
+                ).read(sessionID: sessionID, resolveProjectRoot: resolveProjectRoot)
+            })
     }
 
     /// Reads the store directory with a connection of its own. Call it

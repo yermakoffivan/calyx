@@ -61,10 +61,6 @@ class SettingsWindowController: NSWindowController {
     /// production code.
     var _shellIntegrationRootForTesting: URL?
 
-    /// Test seam: the ledger `usageTrackingDidChange(_:)` reconciles,
-    /// instead of `UsageLedger.shared`. DO NOT use from production code.
-    var _usageLedgerForTesting: UsageLedger?
-
     /// Test seam: the activation the Usage Tracking row reconciles and
     /// shows, instead of `UsageTelemetryActivation.shared`. DO NOT use
     /// from production code.
@@ -722,18 +718,12 @@ class SettingsWindowController: NSWindowController {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
     }
 
-    /// Writes the setting first, so the ledger already finds tracking on
-    /// when the reconcile below asks. Flipping ON reads what the known
-    /// sessions' transcripts gained while tracking was off; that runs in
-    /// a task on the ledger, never on the main thread, and at utility
-    /// priority, since catch-up work must not compete with the UI.
-    /// Flipping OFF does nothing else here: stored data stays, and an
-    /// ingest that is already reading finishes.
-    ///
-    /// R4b: every flip also refreshes the status line and requests a
+    /// Writes the setting, refreshes the status line and requests a
     /// reconcile of the telemetry activation (after the setting is
-    /// written), which writes or removes Calyx's block in Claude Code's
-    /// settings file.
+    /// written), which syncs the ledger's tracking flag and writes or
+    /// removes Calyx's block in Claude Code's settings file. Nothing else:
+    /// turning tracking on restarts tracking, so there is nothing earlier
+    /// to catch up, and turning it off keeps the stored data.
     @objc private func usageTrackingDidChange(_ sender: NSSwitch) {
         let enabled = sender.state == .on
         UsageTrackingSettings.enabled = enabled
@@ -741,15 +731,6 @@ class SettingsWindowController: NSWindowController {
         let activation = usageTelemetryActivation
         Task {
             await activation.reconcile()
-        }
-        guard enabled else { return }
-        #if DEBUG
-        let ledger = _usageLedgerForTesting ?? UsageLedger.shared
-        #else
-        let ledger = UsageLedger.shared
-        #endif
-        Task(priority: .utility) {
-            await ledger.reconcileKnown()
         }
     }
 

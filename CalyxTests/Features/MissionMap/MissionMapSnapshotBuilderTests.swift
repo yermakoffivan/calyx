@@ -114,7 +114,7 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         appPeerID: UUID? = nil, editedFiles: [AgentEditedFile] = [],
         git: [String: MissionMapGitBadge] = [:], now: Date = Date(),
         conflictWindow: TimeInterval = 300, ipcEdgeLifetime: TimeInterval = 30,
-        usage: [String: UsageRow] = [:]
+        usage: [String: UsageTokenTotals] = [:]
     ) -> MissionMapInput {
         var input = MissionMapInput(
             panes: panes, entries: entries, children: children, pendingApprovals: pendingApprovals,
@@ -128,12 +128,8 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
 
     /// A session total; `output` makes rows for different sessions
     /// distinguishable.
-    private func usageRow(output: Int64 = 1_500) -> UsageRow {
-        UsageRow(
-            key: [], responses: 2, finalResponses: 1, inputTokens: 100, cacheReadTokens: 20,
-            cacheCreationTokens: 3, cacheCreation1hTokens: 0, outputTokensFinal: output,
-            thinkingTokensFinal: 0, lastTimestampMs: 1_700_000_000_000
-        )
+    private func usageRow(output: Int64 = 1_500) -> UsageTokenTotals {
+        UsageTokenTotals(input: 100, output: output, cacheRead: 20, cacheCreation: 3)
     }
 
     // MARK: - Git badge cwd

@@ -3,29 +3,22 @@
 //
 // The one-line token summary a Mission Map card shows for its Claude
 // Code session, and the same summary as a spoken label. Pure formatting
-// over a session's total `UsageRow`; integer arithmetic only, so the
+// over a session's `UsageTokenTotals`; integer arithmetic only, so the
 // digits and the decimal point are ASCII whatever the user's locale.
 
 import Foundation
 
 enum UsageCardLine {
-    /// "<out> out · <in> in", e.g. "≥45.2k out · 1.2M in". `out` is the
-    /// output summed over final responses; it carries "≥" while some
-    /// responses have no final line yet, because their real output is not
-    /// counted, so the true total is at least the number shown. `in` is
+    /// "<out> out · <in> in", e.g. "45.2k out · 1.2M in". `in` is
     /// everything sent to the model, cached or not.
-    static func text(for row: UsageRow) -> String {
-        let prefix = isLowerBound(row) ? "\u{2265}" : ""
-        return "\(prefix)\(compact(row.outputTokensFinal)) out \u{00B7} \(compact(sentTokens(row))) in"
+    static func text(for totals: UsageTokenTotals) -> String {
+        "\(compact(totals.output)) out \u{00B7} \(compact(sentTokens(totals))) in"
     }
 
-    /// The spoken form of `text(for:)`: "Usage: [at least ]<out> output
-    /// tokens, <in> input tokens", with "at least " exactly when `text`
-    /// shows "≥", and the same compact numbers.
-    static func accessibilityLabel(for row: UsageRow) -> String {
-        let prefix = isLowerBound(row) ? "at least " : ""
-        return "Usage: \(prefix)\(compact(row.outputTokensFinal)) output tokens, "
-            + "\(compact(sentTokens(row))) input tokens"
+    /// The spoken form of `text(for:)`: "Usage: <out> output tokens, <in>
+    /// input tokens", with the same compact numbers.
+    static func accessibilityLabel(for totals: UsageTokenTotals) -> String {
+        "Usage: \(compact(totals.output)) output tokens, \(compact(sentTokens(totals))) input tokens"
     }
 
     /// A short token count: the number itself below 1,000, then one
@@ -51,17 +44,10 @@ enum UsageCardLine {
         return "\(whole).\(tenth)\(suffix)"
     }
 
-    /// Fewer final responses than responses: the output sum is short of
-    /// the real output.
-    private static func isLowerBound(_ row: UsageRow) -> Bool {
-        row.finalResponses < row.responses
-    }
-
-    /// Input, cache read and cache creation tokens (the 1-hour cache
-    /// creation count is already part of `cacheCreationTokens`),
-    /// saturating at `Int64.max` (or `.min`) instead of trapping.
-    private static func sentTokens(_ row: UsageRow) -> Int64 {
-        [row.cacheReadTokens, row.cacheCreationTokens].reduce(row.inputTokens) { sum, part in
+    /// Input, cache read and cache creation tokens, saturating at
+    /// `Int64.max` (or `.min`) instead of trapping.
+    private static func sentTokens(_ totals: UsageTokenTotals) -> Int64 {
+        [totals.cacheRead, totals.cacheCreation].reduce(totals.input) { sum, part in
             let (result, overflow) = sum.addingReportingOverflow(part)
             return overflow ? (part > 0 ? .max : .min) : result
         }

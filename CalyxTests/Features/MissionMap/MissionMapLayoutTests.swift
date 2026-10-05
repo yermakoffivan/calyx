@@ -30,7 +30,7 @@ final class MissionMapLayoutTests: XCTestCase {
 
     private func card(
         id: UUID = UUID(), groupID: UUID, groupName: String = "Default", tabID: UUID = UUID(),
-        children: [MissionMapChildCard] = [], usage: UsageRow? = nil
+        children: [MissionMapChildCard] = [], usage: UsageTokenTotals? = nil
     ) -> MissionMapCard {
         MissionMapCard(
             id: id, groupID: groupID, groupName: groupName, tabID: tabID, kindLabel: "claude-code",
@@ -40,10 +40,7 @@ final class MissionMapLayoutTests: XCTestCase {
         )
     }
 
-    private let row = UsageRow(
-        key: [], responses: 1, finalResponses: 1, inputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0,
-        cacheCreation1hTokens: 0, outputTokensFinal: 1, thinkingTokensFinal: 0, lastTimestampMs: 0
-    )
+    private let row = UsageTokenTotals(input: 2, output: 1, cacheRead: 0, cacheCreation: 0)
 
     private func childCard(id: String = "sub-1") -> MissionMapChildCard {
         MissionMapChildCard(id: id, agentType: "explore", state: .working, toolLine: "ls -la")

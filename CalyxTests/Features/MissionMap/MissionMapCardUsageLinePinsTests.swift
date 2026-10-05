@@ -51,19 +51,15 @@ final class MissionMapCardUsageLinePinsTests: XCTestCase {
         XCTAssertEqual(a4.toolLine, "Bash: swift test")
     }
 
-    /// 10 responses, 9 final; input 1,000,000 + cache read 150,000 +
-    /// cache creation 50,000 = 1,200,000; output 45,200.
+    /// Input 1,000,000 + cache read 150,000 + cache creation 50,000 =
+    /// 1,200,000; output 45,200.
     func test_fixture_a4_hasTheSessionUsageRow() throws {
         let a4 = try XCTUnwrap(MissionMapFixture.make(now: fixtureNow).cards["a4"])
 
-        let expected = UsageRow(
-            key: [], responses: 10, finalResponses: 9, inputTokens: 1_000_000, cacheReadTokens: 150_000,
-            cacheCreationTokens: 50_000, cacheCreation1hTokens: 0, outputTokensFinal: 45_200,
-            thinkingTokensFinal: 0, lastTimestampMs: 0
-        )
+        let expected = UsageTokenTotals(input: 1_000_000, output: 45_200, cacheRead: 150_000, cacheCreation: 50_000)
         let usage = try XCTUnwrap(a4.usage)
         XCTAssertEqual(usage, expected)
-        XCTAssertEqual(UsageCardLine.text(for: usage), "\u{2265}45.2k out \u{00B7} 1.2M in")
+        XCTAssertEqual(UsageCardLine.text(for: usage), "45.2k out \u{00B7} 1.2M in")
     }
 
     /// The snapshot the map draws holds the same a4 as `cards`.

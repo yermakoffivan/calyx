@@ -7,9 +7,9 @@
 // `uiTestSuite` (separate --uitesting process isolation) then `.standard`
 // in production.
 //
-// Default OFF is load-bearing: ON by default would read every Claude Code
-// transcript and create a database of the user's usage without their
-// consent.
+// Default OFF is load-bearing: ON by default would point Claude Code's
+// telemetry at Calyx, read its transcripts and create a database of the
+// user's usage without their consent.
 
 import Foundation
 

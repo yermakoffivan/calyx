@@ -45,7 +45,7 @@ struct MissionMapFixture: Sendable {
         func card(
             groupID: UUID, groupName: String, title: String, state: AgentState = .working,
             toolLine: String? = nil, children: [MissionMapChildCard] = [],
-            git: MissionMapGitBadge? = nil, usage: UsageRow? = nil
+            git: MissionMapGitBadge? = nil, usage: UsageTokenTotals? = nil
         ) -> MissionMapCard {
             let id = UUID()
             return MissionMapCard(
@@ -67,11 +67,7 @@ struct MissionMapFixture: Sendable {
         let a4 = card(
             groupID: groupA, groupName: "Band A", title: "Test runner", toolLine: "Bash: swift test",
             git: MissionMapGitBadge(branch: "main", shortHash: "abc1234", changedFileCount: 0),
-            usage: UsageRow(
-                key: [], responses: 10, finalResponses: 9, inputTokens: 1_000_000, cacheReadTokens: 150_000,
-                cacheCreationTokens: 50_000, cacheCreation1hTokens: 0, outputTokensFinal: 45_200,
-                thinkingTokensFinal: 0, lastTimestampMs: 0
-            )
+            usage: UsageTokenTotals(input: 1_000_000, output: 45_200, cacheRead: 150_000, cacheCreation: 50_000)
         )
         let b1 = card(groupID: groupB, groupName: "Band B", title: "Release notes", state: .idle)
         let b2 = card(groupID: groupB, groupName: "Band B", title: "Shell", state: .idle)

@@ -3,18 +3,17 @@
 //  CalyxTests
 //
 //  Pins UsageCardLine, the one-line token summary a Mission Map card
-//  shows for its Claude Code session:
+//  shows for its Claude Code session, over the session's total
+//  `UsageTokenTotals` (what Calyx received plus what it knows was not):
 //  - compact(_:) at every tier boundary (plain, 1.0k-99.9k, 100k-999k,
 //    then the same with M and B, whole billions with no upper limit),
 //    truncating and never rounding up so a card never overstates usage,
 //    and a negative value shown as 0
-//  - text(for:): output is the final-response output, prefixed with
-//    U+2265 only when some responses have no final line yet; input is
-//    input + cache read + cache creation, saturating at Int64.max; the
-//    two halves joined by " \u{00B7} "
-//  - accessibilityLabel(for:) reads "Usage: [at least ]<out> output
-//    tokens, <in> input tokens", "at least " exactly when text has the
-//    U+2265 prefix, with the same compact numbers
+//  - text(for:): "<compact(output)> out \u{00B7} <compact(input +
+//    cacheRead + cacheCreation)> in"; the sum saturates at Int64.max;
+//    no U+2265 prefix for any input (the totals are not a lower bound)
+//  - accessibilityLabel(for:) reads "Usage: <out> output tokens, <in>
+//    input tokens", never "at least ", with the same compact numbers
 //  - the output uses ASCII digits and "." only
 //
 
@@ -26,17 +25,10 @@ final class UsageCardLineTests: XCTestCase {
     private let atLeast = "\u{2265}"
     private let separator = " \u{00B7} "
 
-    private func row(
-        responses: Int64 = 5, finalResponses: Int64 = 5,
-        input: Int64 = 0, cacheRead: Int64 = 0, cacheCreation: Int64 = 0,
-        cacheCreation1h: Int64 = 0, output: Int64 = 0, thinking: Int64 = 0
-    ) -> UsageRow {
-        UsageRow(
-            key: [], responses: responses, finalResponses: finalResponses,
-            inputTokens: input, cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation,
-            cacheCreation1hTokens: cacheCreation1h, outputTokensFinal: output,
-            thinkingTokensFinal: thinking, lastTimestampMs: 1_700_000_000_000
-        )
+    private func totals(
+        input: Int64 = 0, output: Int64 = 0, cacheRead: Int64 = 0, cacheCreation: Int64 = 0
+    ) -> UsageTokenTotals {
+        UsageTokenTotals(input: input, output: output, cacheRead: cacheRead, cacheCreation: cacheCreation)
     }
 
     private func assertCompact(_ value: Int64, _ expected: String, file: StaticString = #filePath, line: UInt = #line) {
@@ -136,115 +128,118 @@ final class UsageCardLineTests: XCTestCase {
     // MARK: - text(for:)
 
     func test_text_documentedExample() {
-        let line = UsageCardLine.text(for: row(
-            responses: 4, finalResponses: 3, input: 1_000_000, cacheRead: 200_000, cacheCreation: 0, output: 45_200
-        ))
-        XCTAssertEqual(line, "\u{2265}45.2k out \u{00B7} 1.2M in")
+        let line = UsageCardLine.text(for: totals(input: 1_000_000, output: 45_200, cacheRead: 200_000))
+        XCTAssertEqual(line, "45.2k out \u{00B7} 1.2M in")
     }
 
-    func test_text_allResponsesFinal_hasNoAtLeastPrefix() {
-        let line = UsageCardLine.text(for: row(responses: 3, finalResponses: 3, input: 5, output: 42))
+    func test_text_plainNumbers() {
+        let line = UsageCardLine.text(for: totals(input: 5, output: 42))
         XCTAssertEqual(line, "42 out" + separator + "5 in")
     }
 
-    func test_text_someResponsesNotFinal_prefixesOutputWithAtLeast() {
-        let line = UsageCardLine.text(for: row(responses: 3, finalResponses: 2, input: 5, output: 42))
-        XCTAssertEqual(line, atLeast + "42 out" + separator + "5 in")
+    func test_text_allZero() {
+        XCTAssertEqual(UsageCardLine.text(for: UsageTokenTotals()), "0 out" + separator + "0 in")
     }
 
-    func test_text_noFinalResponseYet_prefixesZeroOutput() {
-        let line = UsageCardLine.text(for: row(responses: 1, finalResponses: 0, input: 5, output: 0))
-        XCTAssertEqual(line, atLeast + "0 out" + separator + "5 in")
-    }
-
-    /// The prefix is for strictly fewer final responses than responses.
-    func test_text_moreFinalThanResponses_hasNoAtLeastPrefix() {
-        let line = UsageCardLine.text(for: row(responses: 2, finalResponses: 3, input: 5, output: 42))
-        XCTAssertEqual(line, "42 out" + separator + "5 in")
+    /// The totals are Claude Code's own count, not a lower bound: no
+    /// input gives the U+2265 prefix (the old row's "some responses have
+    /// no final line yet" has no counterpart here).
+    func test_text_neverHasTheAtLeastPrefix() {
+        let inputs: [UsageTokenTotals] = [
+            UsageTokenTotals(),
+            totals(input: 5, output: 42),
+            totals(output: 0, cacheRead: 1),
+            totals(input: 1_000_000, output: 45_200, cacheRead: 200_000),
+            totals(input: Int64.max, output: Int64.max, cacheRead: Int64.max, cacheCreation: Int64.max),
+            totals(input: -5, output: -1),
+        ]
+        for value in inputs {
+            let line = UsageCardLine.text(for: value)
+            XCTAssertFalse(line.contains(atLeast), "\(value): \(line)")
+            XCTAssertTrue(line.hasSuffix(" in"), "\(value): \(line)")
+            XCTAssertTrue(line.contains(" out" + separator), "\(value): \(line)")
+        }
     }
 
     /// `in` is exactly input + cache read + cache creation: each part is
-    /// distinct so dropping any one changes the number, and the 1-hour
-    /// cache creation subtotal and thinking tokens are set so adding
-    /// either one shows.
+    /// distinct so dropping any one changes the number, and output is
+    /// set so adding it shows.
     func test_text_input_sumsInputCacheReadAndCacheCreation() {
-        let line = UsageCardLine.text(for: row(
-            responses: 2, finalResponses: 2, input: 100, cacheRead: 20, cacheCreation: 3,
-            cacheCreation1h: 400, output: 9, thinking: 50
-        ))
+        let line = UsageCardLine.text(for: totals(input: 100, output: 9, cacheRead: 20, cacheCreation: 3))
         XCTAssertEqual(line, "9 out" + separator + "123 in")
     }
 
     func test_text_input_compactsTheSum() {
-        let line = UsageCardLine.text(for: row(input: 600, cacheRead: 500, cacheCreation: 99, output: 1_500))
+        let line = UsageCardLine.text(for: totals(input: 600, output: 1_500, cacheRead: 500, cacheCreation: 99))
         XCTAssertEqual(line, "1.5k out" + separator + "1.1k in")
     }
 
     func test_text_input_saturatesAtInt64Max() {
-        let line = UsageCardLine.text(for: row(input: Int64.max, cacheRead: 1, cacheCreation: 0, output: 1))
+        let line = UsageCardLine.text(for: totals(input: Int64.max, output: 1, cacheRead: 1, cacheCreation: 0))
         XCTAssertEqual(line, "1 out" + separator + "9223372036B in")
     }
 
     func test_text_input_saturatesWhenTheThirdTermOverflows() {
-        let line = UsageCardLine.text(for: row(input: Int64.max - 1, cacheRead: 1, cacheCreation: 1, output: 1))
+        let line = UsageCardLine.text(for: totals(input: Int64.max - 1, output: 1, cacheRead: 1, cacheCreation: 1))
         XCTAssertEqual(line, "1 out" + separator + "9223372036B in")
     }
 
     func test_text_input_saturatesWithEveryPartAtMax() {
-        let line = UsageCardLine.text(for: row(
-            input: Int64.max, cacheRead: Int64.max, cacheCreation: Int64.max, output: Int64.max
+        let line = UsageCardLine.text(for: totals(
+            input: Int64.max, output: Int64.max, cacheRead: Int64.max, cacheCreation: Int64.max
         ))
         XCTAssertEqual(line, "9223372036B out" + separator + "9223372036B in")
     }
 
-    func test_text_output_isFinalOutputNotThinking() {
-        let line = UsageCardLine.text(for: row(input: 1, output: 999, thinking: 1))
-        XCTAssertEqual(line, "999 out" + separator + "1 in")
+    /// `out` is the output total alone, none of the input parts.
+    func test_text_output_isTheOutputTotal() {
+        let line = UsageCardLine.text(for: totals(input: 1, output: 999, cacheRead: 2, cacheCreation: 3))
+        XCTAssertEqual(line, "999 out" + separator + "6 in")
     }
 
     // MARK: - accessibilityLabel(for:)
 
     func test_accessibilityLabel_documentedExample() {
-        let label = UsageCardLine.accessibilityLabel(for: row(
-            responses: 4, finalResponses: 3, input: 1_000_000, cacheRead: 200_000, cacheCreation: 0, output: 45_200
-        ))
-        XCTAssertEqual(label, "Usage: at least 45.2k output tokens, 1.2M input tokens")
+        let label = UsageCardLine.accessibilityLabel(for: totals(input: 1_000_000, output: 45_200, cacheRead: 200_000))
+        XCTAssertEqual(label, "Usage: 45.2k output tokens, 1.2M input tokens")
     }
 
-    func test_accessibilityLabel_allResponsesFinal_hasNoAtLeast() {
-        let label = UsageCardLine.accessibilityLabel(for: row(responses: 3, finalResponses: 3, input: 5, output: 42))
+    func test_accessibilityLabel_plainNumbers() {
+        let label = UsageCardLine.accessibilityLabel(for: totals(input: 5, output: 42))
         XCTAssertEqual(label, "Usage: 42 output tokens, 5 input tokens")
     }
 
-    func test_accessibilityLabel_someResponsesNotFinal_saysAtLeast() {
-        let label = UsageCardLine.accessibilityLabel(for: row(responses: 3, finalResponses: 2, input: 5, output: 42))
-        XCTAssertEqual(label, "Usage: at least 42 output tokens, 5 input tokens")
+    func test_accessibilityLabel_allZero() {
+        XCTAssertEqual(UsageCardLine.accessibilityLabel(for: UsageTokenTotals()), "Usage: 0 output tokens, 0 input tokens")
     }
 
-    func test_accessibilityLabel_noFinalResponseYet_saysAtLeastZero() {
-        let label = UsageCardLine.accessibilityLabel(for: row(responses: 1, finalResponses: 0, input: 5, output: 0))
-        XCTAssertEqual(label, "Usage: at least 0 output tokens, 5 input tokens")
+    func test_accessibilityLabel_neverSaysAtLeast() {
+        let inputs: [UsageTokenTotals] = [
+            UsageTokenTotals(),
+            totals(input: 5, output: 42),
+            totals(input: 1_000_000, output: 45_200, cacheRead: 200_000),
+            totals(input: Int64.max, output: Int64.max, cacheRead: Int64.max, cacheCreation: Int64.max),
+        ]
+        for value in inputs {
+            let label = UsageCardLine.accessibilityLabel(for: value)
+            XCTAssertFalse(label.contains("at least"), "\(value): \(label)")
+            XCTAssertFalse(label.contains(atLeast), "\(value): \(label)")
+            XCTAssertTrue(label.hasPrefix("Usage: "), "\(value): \(label)")
+        }
     }
 
-    func test_accessibilityLabel_moreFinalThanResponses_hasNoAtLeast() {
-        let label = UsageCardLine.accessibilityLabel(for: row(responses: 2, finalResponses: 3, input: 5, output: 42))
-        XCTAssertEqual(label, "Usage: 42 output tokens, 5 input tokens")
-    }
-
-    /// Same three-part input sum and output as the card text, with the
-    /// 1-hour cache subtotal and thinking tokens left out.
+    /// Same three-part input sum and output as the card text.
     func test_accessibilityLabel_usesTheSameNumbersAsText() {
-        let label = UsageCardLine.accessibilityLabel(for: row(
-            responses: 2, finalResponses: 2, input: 600, cacheRead: 500, cacheCreation: 99,
-            cacheCreation1h: 400, output: 1_500, thinking: 50
+        let label = UsageCardLine.accessibilityLabel(for: totals(
+            input: 600, output: 1_500, cacheRead: 500, cacheCreation: 99
         ))
         XCTAssertEqual(label, "Usage: 1.5k output tokens, 1.1k input tokens")
     }
 
     func test_accessibilityLabel_saturatedInput() {
-        let label = UsageCardLine.accessibilityLabel(for: row(
-            responses: 2, finalResponses: 1, input: Int64.max, cacheRead: 1, cacheCreation: 1, output: 999_999
+        let label = UsageCardLine.accessibilityLabel(for: totals(
+            input: Int64.max, output: 999_999, cacheRead: 1, cacheCreation: 1
         ))
-        XCTAssertEqual(label, "Usage: at least 999k output tokens, 9223372036B input tokens")
+        XCTAssertEqual(label, "Usage: 999k output tokens, 9223372036B input tokens")
     }
 }

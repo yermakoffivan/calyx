@@ -136,7 +136,7 @@ final class MissionMapPopoverUITests: CalyxUITestCase {
         XCTAssertTrue(waitFor(usage, timeout: 5), "The fixture card with usage should show its usage line")
         XCTAssertEqual(usageQuery.count, 1, "Only the fixture's a4 card carries usage")
 
-        XCTAssertEqual(usage.label, "Usage: at least 45.2k output tokens, 1.2M input tokens")
+        XCTAssertEqual(usage.label, "Usage: 45.2k output tokens, 1.2M input tokens")
 
         let uuid = String(usage.identifier.dropFirst(usagePrefix.count))
         let card = app.descendants(matching: .any).matching(identifier: "calyx.missionMap.card.\(uuid)").firstMatch

@@ -203,14 +203,6 @@ struct AgentEvent: Sendable, Equatable {
     /// already ran, so recording it would only duplicate the edit its
     /// own `PreToolUse` already recorded.
     var editedFilePaths: [String] = []
-    /// Claude Code's `transcript_path`, verbatim: the session's main
-    /// transcript, also on an event fired inside a subagent. It can be
-    /// the empty string (remote-served sessions) and the file need not
-    /// exist yet at `SessionStart`. Nothing here trims or validates it;
-    /// `ClaudeTranscriptLocator` is the only gate before the path is
-    /// read. Always `nil` for Grok's envelope, whose transcripts the
-    /// usage ledger does not read.
-    var transcriptPath: String? = nil
 
     /// Whether this event fired inside a subagent rather than the main
     /// thread. The ONLY subagent predicate in the codebase: `agentType`
@@ -255,8 +247,7 @@ struct AgentEvent: Sendable, Equatable {
                 hookEventName: hookEventName,
                 toolName: object["tool_name"] as? String,
                 toolInput: object["tool_input"]
-            ),
-            transcriptPath: object["transcript_path"] as? String
+            )
         )
     }
 

@@ -3,31 +3,24 @@
 //  CalyxTests
 //
 //  Pins AppDelegate.startUsageLedger(server:ledger:), the one place the
-//  usage ledger is connected to the app: it installs the usage sink on
-//  the server it was GIVEN, forwarding to the ledger it was GIVEN, and
-//  starts one reconcile of the sessions that ledger already knows, at a
-//  priority no higher than utility. It also installs the server's usage
+//  usage ledger is connected to the app. It installs the server's usage
 //  bridge, so a `usage_report` call through /mcp reads that ledger,
 //  answers "tracking is off" exactly while the ledger's own switch is
 //  off, and resolves `session_id: "current"` through the registry the
 //  server holds at call time.
 //
-//  The whole path is driven for real: an authenticated POST /agent-event
-//  is routed by a test server, and the transcript it names is read into
-//  a store in a per-test temporary directory by a test ledger running
-//  the real ingestor. The shared server, the shared ledger, ~/.claude
+//  An export posted to the usage route is the one source of a publish:
+//  the route hands it to the GIVEN ledger, whose publish carries the
+//  session's totals. An accepted hook event reads and publishes nothing.
+//  The startup catch-up settles the sessions the store already heard, at
+//  a priority no higher than utility.
+//
+//  The whole path is driven for real: authenticated requests are routed
+//  by a test server into a test ledger over a store in a per-test
+//  temporary directory. The shared server, the shared ledger, ~/.claude
 //  and Application Support are never involved, and the usage setting is
 //  pointed at a test suite so that a wiring mistake reaching the shared
 //  ledger would find tracking off.
-//
-//  SCHEDULES. Neither the forwarded event nor the reconcile is waited
-//  for by the code under test, and they run at different priorities, so
-//  with tracking on the reconcile may list the store before or after an
-//  event's read stored its session. In the second case it reads that
-//  session once more and publishes its row again. Every test therefore
-//  either has a single source of reads, or asserts only what holds in
-//  both orders: WHICH rows were published (as a set), never how often.
-//  Each test says which of the two it is.
 //
 //  R3b: it also installs the usage route's endpoint on that server
 //  (`server.usageIngest`), forwarding exports to `ledger.ingestExport`,
@@ -54,7 +47,8 @@
 //  WAITING. A test waits for a publish that must happen through an
 //  expectation (bound: UsageWiringFixture.waitSeconds, reached only on
 //  failure). Before asserting what was or was not published it calls
-//  `settle`, which closes the ledger behind every task started so far.
+//  `settle`, which closes the ledger behind every task started so far
+//  (`close()` waits for settles and pending publishes).
 //
 
 import XCTest
@@ -98,7 +92,6 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        server?.usageSink = nil
         server?.usageIngest = nil
         await awaitStartups()
         startups = []
@@ -216,193 +209,181 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
         await fixture.closeBehindEverythingStarted(ledger, in: self)
     }
 
-    private func entry(_ sessionID: String, _ responses: Int64) -> Entry {
-        Entry(sessionID: sessionID, row: Fixture.totalRow(responses))
+    /// run1's totals by Claude Code's own count (`expected-cost-state.json`,
+    /// one model): what its last export carries, cumulative from its start.
+    private let run1Totals = UsageTokenTotals(input: 24, output: 2_114, cacheRead: 176_467, cacheCreation: 51_986)
+
+    /// Creates the database with tracking from the epoch, so a captured
+    /// export (whose times are fixed) counts in full.
+    private func seedStoreFromTheEpoch() async throws {
+        let seeded = try UsageStore(directory: fixture.storeURL, now: UsageTestClock(Date(timeIntervalSince1970: 0)).now)
+        await seeded.close()
     }
 
-    /// The distinct rows that were published, however often each was.
-    private var publishedRows: Set<String> {
-        Set(recorder.entries.map { "\($0.sessionID): \(String(describing: $0.row))" })
+    /// Writes the credential, starts `ledger`, and loads the credential into
+    /// the holder itself (deterministic whichever load runs first).
+    private func startWithACredential(_ ledger: UsageLedger) async throws -> UsageIngestCredential {
+        let holder = try theHolder()
+        let credential = try writeCredential()
+        start(ledger)
+        _ = try await holder.load(create: false, directory: credentialDirectory)
+        XCTAssertEqual(holder.credential, credential, "Fixture error")
+        return credential
     }
 
-    private func rows(_ entries: Entry...) -> Set<String> {
-        Set(entries.map { "\($0.sessionID): \(String(describing: $0.row))" })
+    // MARK: - Publishing from an export (R5a)
+
+    // The posted export is the only source of a publish; the startup
+    // catch-up may settle the session too, but its totals are the same,
+    // so they are not published again.
+    func test_exportPostedToTheRoute_isPublishedByTheGivenLedger_withTheSessionsTotals() async throws {
+        try await seedStoreFromTheEpoch()
+        let body = try XCTUnwrap(try UsageTelemetryFixtures.exports(run: "run1").last)
+        let session = try XCTUnwrap(Set(try UsageTelemetryFixtures.rawTokenPoints(in: body).map(\.sessionID)).first)
+        XCTAssertEqual(
+            try UsageTelemetryFixtures.expectedTotals(run: "run1")["claude-sonnet-5-5"],
+            ["input": 24, "output": 2_114, "cacheRead": 176_467, "cacheCreation": 51_986], "Fixture error")
+        let ledger = makeLedger()
+        let credential = try await startWithACredential(ledger)
+
+        let response = await server.route(request: usageRequest(body, token: credential.token))
+
+        XCTAssertEqual(response.statusCode, 200)
+        await waitForPublishes(1)
+        await settle(ledger)
+        XCTAssertEqual(recorder.entries, [Entry(sessionID: session, totals: run1Totals)])
     }
 
-    private func storedTotal(_ sessionID: String) async throws -> [UsageRow] {
-        try await fixture.readStore { try await $0.report(UsageQuery(sessionID: sessionID), calendar: Fixture.utc) }
+    // Every export reaches the ledger, not only the first: two sessions,
+    // one publish each.
+    func test_everyExportReachesTheLedger_notOnlyTheFirst() async throws {
+        try await seedStoreFromTheEpoch()
+        let ledger = makeLedger()
+        let credential = try await startWithACredential(ledger)
+
+        let first = await server.route(request: usageRequest(
+            try Fixture.exportBody(sessionA, input: 10), token: credential.token))
+        let second = await server.route(request: usageRequest(
+            try Fixture.exportBody(sessionB, input: 7, seconds: 11), token: credential.token))
+
+        XCTAssertEqual(first.statusCode, 200)
+        XCTAssertEqual(second.statusCode, 200)
+        await waitForPublishes(2)
+        await settle(ledger)
+        XCTAssertEqual(
+            Set(recorder.entries.map { "\($0.sessionID): \(String(describing: $0.totals))" }),
+            Set([Entry(sessionID: sessionA, totals: Fixture.inputTotals(10)),
+                 Entry(sessionID: sessionB, totals: Fixture.inputTotals(7))]
+                .map { "\($0.sessionID): \(String(describing: $0.totals))" }))
+        XCTAssertEqual(recorder.entries.count, 2)
     }
 
-    // MARK: - The sink
-
-    // No read can happen: tracking is off, so the reconcile and any
-    // event are dropped by the ledger whenever they arrive.
-    func test_startUsageLedger_installsTheSinkOnTheGivenServer() {
-        XCTAssertNil(server.usageSink, "Fixture error: a new server has no sink")
-        fixture.tracking.set(false)
-
-        start(makeLedger())
-
-        XCTAssertNotNil(server.usageSink)
-    }
-
-    // Both files exist before anything starts and nothing changes them,
-    // so every read of the session, by the event or by the reconcile, in
-    // any order and any number of times, publishes the same row.
-    func test_claudeCodeEvent_isReadIntoTheGivenLedgersStore() async throws {
-        try fixture.write(
-            [Fixture.userLine, Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
-        try fixture.write(
-            [Fixture.assistantLine("msg_s1", agentID: "a1")], to: fixture.subagentPath(sessionA, "a1"))
+    // A hook event reads nothing: with a transcript on disk and
+    // tracking on, an accepted event publishes nothing and stores nothing.
+    func test_claudeCodeEvent_isAccepted_butReadsAndPublishesNothing() async throws {
+        try fixture.write([Fixture.transcriptLine()], to: fixture.mainPath(sessionA))
         let ledger = makeLedger()
         start(ledger)
 
         let response = await server.route(request: try eventRequest("Stop", sessionA))
 
         XCTAssertEqual(response.statusCode, 204)
-        await waitForPublishes(1)
         await settle(ledger)
-        XCTAssertEqual(publishedRows, rows(entry(sessionA, 2)))
-        let stored = try await storedTotal(sessionA)
-        XCTAssertEqual(stored, [Fixture.totalRow(2)])
+        XCTAssertEqual(recorder.entries, [])
+        XCTAssertEqual(recorder.settlePriorities, [])
     }
 
-    // The sink stays installed and forwards each event, not only the
-    // first. The second event names another session: the reconcile can
-    // only read a session that is stored, and a session is stored only by
-    // its own event, so that session's row proves the second event
-    // arrived. Each transcript is fixed, so repeated reads change nothing.
-    func test_everyEventReachesTheLedger_notOnlyTheFirst() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
-        try fixture.write(
-            [Fixture.assistantLine("msg_b1", sessionID: sessionB), Fixture.assistantLine("msg_b2", sessionID: sessionB)],
-            to: fixture.mainPath(sessionB))
-        let ledger = makeLedger()
-        start(ledger)
+    // MARK: - The catch-up at start
 
-        let first = await server.route(request: try eventRequest("SessionStart", sessionA))
-        let second = await server.route(request: try eventRequest("Stop", sessionB))
-
-        XCTAssertEqual(first.statusCode, 204)
-        XCTAssertEqual(second.statusCode, 204)
-        await waitForPublishes(2)
-        await settle(ledger)
-        XCTAssertEqual(publishedRows, rows(entry(sessionA, 1), entry(sessionB, 2)))
-    }
-
-    // Session A is named only by an event of another agent kind, so no
-    // correct schedule stores or reads it; session B's event and the
-    // reconcile may read B any number of times.
-    func test_eventOfAnotherAgentKind_isNotRead() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
-        try fixture.write(
-            [Fixture.assistantLine("msg_b1", sessionID: sessionB)], to: fixture.mainPath(sessionB))
-        let ledger = makeLedger()
-        start(ledger)
-
-        let other = await server.route(request: try eventRequest("Stop", sessionA, kind: "codex"))
-        let claude = await server.route(request: try eventRequest("Stop", sessionB))
-
-        XCTAssertEqual(other.statusCode, 204)
-        XCTAssertEqual(claude.statusCode, 204)
-        await waitForPublishes(1)
-        await settle(ledger)
-        XCTAssertEqual(publishedRows, rows(entry(sessionB, 1)))
-        let sessions = try await fixture.readStore { try await $0.sessions().map(\.sessionID) }
-        XCTAssertEqual(sessions, [sessionB])
-    }
-
-    // MARK: - The reconcile at start
-
-    /// An earlier run of the app has read `sessionA`'s first line and
-    /// closed its ledger; two lines were appended since.
-    private func storeSessionAThenAppendTwoLines() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
+    /// An earlier run of the app heard `sessionA` through an export and
+    /// closed its ledger.
+    private func storeSessionAFromAnEarlierRun() async throws {
         let earlier = makeLedger()
-        await earlier.note(fixture.activity("Stop"))
+        let outcome = await earlier.ingestExport(
+            try Fixture.exportBody(sessionA, input: 10), receivedAtNs: Fixture.exportTimeNs())
+        XCTAssertEqual(outcome, .stored, "Fixture error")
         await earlier.waitUntilIdle()
         await earlier.close()
-        XCTAssertEqual(recorder.entries, [entry(sessionA, 1)], "Fixture error")
-        try fixture.append(
-            [Fixture.assistantLine("msg_m2"), Fixture.assistantLine("msg_m3")], to: fixture.mainPath(sessionA))
+        XCTAssertEqual(recorder.entries, [Entry(sessionID: sessionA, totals: Fixture.inputTotals(10))], "Fixture error")
     }
 
-    // No event is sent, so the reconcile is the only source of reads: it
-    // reads the one stored session exactly once.
-    func test_startUsageLedger_readsAStoredSessionsAppendedLines_withoutAnyEvent() async throws {
-        try await storeSessionAThenAppendTwoLines()
-        let ledger = makeLedger()
-
-        start(ledger)
-
-        await waitForPublishes(2)
-        await settle(ledger)
-        XCTAssertEqual(recorder.entries, [entry(sessionA, 1), entry(sessionA, 3)])
-        let stored = try await storedTotal(sessionA)
-        XCTAssertEqual(stored, [Fixture.totalRow(3)])
-    }
-
-    // Catching up on stored sessions is background work: it must not run
-    // at the priority of the main thread that starts it. The reconcile is
-    // the only source of reads here, and nothing awaits its task (the
-    // test waits for the publish through an expectation), so nothing can
-    // raise the priority its ingest observes.
-    func test_startUsageLedger_reconcileReadsAtUtilityPriorityOrLower() async throws {
-        try await storeSessionAThenAppendTwoLines()
+    // No export is sent, so the catch-up is the only source of settles: it
+    // settles the one stored session once, at utility priority or lower,
+    // and publishes its totals into the new ledger's seam.
+    // Nothing awaits its task (the startup task is awaited only by
+    // `settle`, after the priorities were read), so nothing raises it.
+    func test_startUsageLedger_catchUpSettlesAStoredSession_atUtilityPriorityOrLower() async throws {
+        try await storeSessionAFromAnEarlierRun()
         XCTAssertGreaterThan(
             Task.currentPriority, .utility,
             "Fixture error: the caller must run above utility, or an inherited priority would pass")
-        let seedIngests = recorder.ingestPriorities.count
+        let seedSettles = recorder.settlePriorities.count
         let ledger = makeLedger()
 
         start(ledger)
 
-        await waitForPublishes(2)
-        let priorities = Array(recorder.ingestPriorities.dropFirst(seedIngests))
+        let settled = expectation(description: "the startup catch-up settled the stored session")
+        recorder.expectSettles(count: seedSettles + 1, fulfilling: settled)
+        await fulfillment(of: [settled], timeout: Fixture.waitSeconds)
+        let priorities = Array(recorder.settlePriorities.dropFirst(seedSettles))
+        await settle(ledger)
         XCTAssertEqual(priorities.count, 1)
         for priority in priorities {
             XCTAssertLessThanOrEqual(priority, .utility)
         }
+        XCTAssertEqual(recorder.settlePriorities.count, seedSettles + 1, "one settle of the one stored session")
+        // A new ledger has published nothing yet, so the catch-up's settle
+        // publishes the stored totals once: the card shows them after a
+        // relaunch without waiting for the next export.
+        XCTAssertEqual(recorder.entries, [
+            Entry(sessionID: sessionA, totals: Fixture.inputTotals(10)),
+            Entry(sessionID: sessionA, totals: Fixture.inputTotals(10)),
+        ])
     }
 
     // MARK: - Tracking off
 
-    // Tracking is off throughout: the ledger drops the reconcile and the
-    // event whenever they arrive.
-    func test_trackingOff_startAndAnEvent_readNothingAndCreateNothing() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
+    // Tracking is off throughout: the route's export is dropped, nothing
+    // is published or created.
+    func test_trackingOff_anExport_isDropped_publishesNothing_andCreatesNothing() async throws {
         fixture.tracking.set(false)
         let ledger = makeLedger()
+        let credential = try writeCredential()
         let before = fixture.everyPath()
         start(ledger)
+        _ = try await theHolder().load(create: false, directory: credentialDirectory)
 
-        let response = await server.route(request: try eventRequest("Stop", sessionA))
+        let response = await server.route(request: usageRequest(
+            try Fixture.exportBody(sessionA, input: 10), token: credential.token))
 
-        XCTAssertEqual(response.statusCode, 204)
-        XCTAssertNotNil(server.usageSink, "the sink is installed whatever the setting says")
+        // A dropped export is accepted like a stored one (200, "{}").
+        XCTAssertEqual(response.statusCode, 200)
+        XCTAssertEqual(response.body, Data("{}".utf8))
         await settle(ledger)
         XCTAssertEqual(recorder.entries, [])
         XCTAssertEqual(fixture.everyPath(), before)
     }
 
-    // Wiring happens once at launch, with tracking possibly off; the sink
-    // must already be there when the user turns it on. The reconcile may
-    // run before tracking is turned on (it does nothing) or after (it
-    // finds no session, or re-reads the one the event stored): the fixed
-    // transcript gives the same row either way.
-    func test_trackingTurnedOnAfterStart_theNextEventIsRead() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
+    // Wiring happens once at launch, with tracking possibly off; the
+    // route must already reach the ledger when the user turns it on. The
+    // switch's own sync (the activation's, done here directly) restarts
+    // tracking before the export is received.
+    func test_trackingTurnedOnAfterStart_theNextExportIsPublished() async throws {
+        try await seedStoreFromTheEpoch()
         fixture.tracking.set(false)
         let ledger = makeLedger()
-        start(ledger)
+        let credential = try await startWithACredential(ledger)
+        await awaitStartups()
 
         fixture.tracking.set(true)
-        let response = await server.route(request: try eventRequest("Stop", sessionA))
+        await ledger.syncTracking()
+        let response = await server.route(request: usageRequest(
+            try Fixture.exportBody(sessionA, input: 10), token: credential.token))
 
-        XCTAssertEqual(response.statusCode, 204)
+        XCTAssertEqual(response.statusCode, 200)
         await waitForPublishes(1)
         await settle(ledger)
-        XCTAssertEqual(publishedRows, rows(entry(sessionA, 1)))
+        XCTAssertEqual(recorder.entries, [Entry(sessionID: sessionA, totals: Fixture.inputTotals(10))])
     }
 
     // MARK: - The usage_report tool
@@ -549,7 +530,7 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
     // suite) is on: the bridge answers from the ledger, never from the
     // setting. Tracking is off throughout, so nothing is read or created.
     func test_usageReport_trackingOff_isTheTrackingOffToolError_whateverTheSettingSays() async throws {
-        try fixture.write([Fixture.assistantLine("msg_m1")], to: fixture.mainPath(sessionA))
+        try fixture.write([Fixture.transcriptLine()], to: fixture.mainPath(sessionA))
         fixture.tracking.set(false)
         UsageTrackingSettings.enabled = true
         let ledger = makeLedger()

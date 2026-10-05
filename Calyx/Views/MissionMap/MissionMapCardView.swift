@@ -155,7 +155,7 @@ struct MissionMapCardView: View {
 
     /// The session's token summary, read as one element with the spoken
     /// form of the same numbers.
-    private func usageLine(_ usage: UsageRow) -> some View {
+    private func usageLine(_ usage: UsageTokenTotals) -> some View {
         HStack(spacing: 4) {
             Image(systemName: "chart.bar")
             Text(UsageCardLine.text(for: usage))

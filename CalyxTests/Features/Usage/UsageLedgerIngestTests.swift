@@ -15,6 +15,29 @@
 //  new line was read; a missing transcript is not looked for by
 //  `catchUp` for 10 minutes (the ledger's injected clock).
 //
+//  Publishing (R5a): the `publish` seam receives a session's totals
+//  (every row of `tokenReport(UsageTokenQuery(sessionID:))` summed:
+//  recorded plus unreported) right after an export that changed the
+//  session is committed, before its settle; after a settle only when the
+//  totals differ from what was last published for the session; and nil
+//  from `deleteAll` for every session published in this run, after which
+//  the memory of what was published is gone. A publish never holds up
+//  `ingestExport`'s answer. The seam is a recorder (`PublishRecorder`)
+//  that can hold a call; tests wait for publishes through bounded
+//  expectations and treat `waitUntilIdle()` as covering pending publishes.
+//
+//  The `readRunLog` seam is a scripted actor (`RunLogScript`) that records
+//  every call, can hold a call until the test releases it, and either
+//  answers a fixed status, throws, or runs the REAL UsageRunLogReader
+//  (with a counting resolver) over a temporary projects root. The store is
+//  a real UsageStore in a per-test temporary directory. Its database is
+//  created by the test with a pinned clock BEFORE the ledger opens it
+//  (the ledger opens the store with the system clock, and the captures'
+//  times are fixed), so `tracked_from` is known. Nothing here reads
+//  ~/.claude, Application Support or UserDefaults, and nothing sleeps to
+//  synchronise: ordering comes from the gates, `waitUntilIdle()`, and
+//  bounded expectations.
+//
 //  The `readRunLog` seam is a scripted actor (`RunLogScript`) that records
 //  every call, can hold a call until the test releases it, and either
 //  answers a fixed status, throws, or runs the REAL UsageRunLogReader
@@ -212,6 +235,59 @@ private actor ApplyGate {
     }
 }
 
+/// The `publish` seam: records every call in order; call `index`
+/// (1-based) can be held until the test releases it.
+private actor PublishRecorder {
+    struct Entry: Equatable, Sendable {
+        let sessionID: String
+        let totals: UsageTokenTotals?
+    }
+
+    private(set) var entries: [Entry] = []
+    private var gated: Set<Int> = []
+    private var released: Set<Int> = []
+    private var gatesOpen = false
+    private var releaseWaiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var countWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func gate(_ index: Int) { gated.insert(index) }
+
+    func release(_ index: Int) {
+        released.insert(index)
+        releaseWaiters.removeValue(forKey: index)?.resume()
+    }
+
+    /// Opens every gate, present and future, and resumes every waiter
+    /// (tearDown).
+    func releaseEverything() {
+        gatesOpen = true
+        let waiters = releaseWaiters.values
+        releaseWaiters = [:]
+        for waiter in waiters { waiter.resume() }
+        let counts = countWaiters
+        countWaiters = []
+        for waiter in counts { waiter.continuation.resume() }
+    }
+
+    /// Returns once at least `count` publishes were recorded (or
+    /// `releaseEverything` ran).
+    func waitForCount(_ count: Int) async {
+        if entries.count >= count || gatesOpen { return }
+        await withCheckedContinuation { countWaiters.append((count, $0)) }
+    }
+
+    func record(_ sessionID: String, _ totals: UsageTokenTotals?) async {
+        entries.append(Entry(sessionID: sessionID, totals: totals))
+        let index = entries.count
+        let ready = countWaiters.filter { $0.count <= index }
+        countWaiters.removeAll { $0.count <= index }
+        for waiter in ready { waiter.continuation.resume() }
+        if gated.contains(index), !released.contains(index), !gatesOpen {
+            await withCheckedContinuation { releaseWaiters[index] = $0 }
+        }
+    }
+}
+
 /// The `onDiagnostic` seam (a synchronous closure).
 private final class DiagnosticLog: Sendable {
     private let state = OSAllocatedUnfairLock(initialState: [UsageLedgerDiagnostic]())
@@ -265,6 +341,7 @@ final class UsageLedgerIngestTests: XCTestCase {
     /// realpath(3) of the per-test temporary directory; "" until setUp.
     private var tempPath = ""
     private var script: RunLogScript?
+    private let publisher = PublishRecorder()
     private var ledgers: [UsageLedger] = []
     private var openedStores: [UsageStore] = []
 
@@ -286,6 +363,7 @@ final class UsageLedgerIngestTests: XCTestCase {
         // anything still on its way creates nothing.
         await script?.releaseEverything()
         await applyGate.open()
+        await publisher.releaseEverything()
         tracking.set(false)
         for ledger in ledgers {
             await ledger.close()
@@ -325,20 +403,20 @@ final class UsageLedgerIngestTests: XCTestCase {
         try XCTUnwrap(script, "Fixture error: no script")
     }
 
-    /// A ledger over this test's roots whose `readRunLog` is the script.
-    /// The v1 `ingest` seam is never expected to run.
+    /// A ledger over this test's roots whose `readRunLog` is the script
+    /// and whose `publish` is the recorder.
     private func makeLedger() throws -> UsageLedger {
         let script = try runLogScript()
         let diagnostics = self.diagnostics
         let tracking = self.tracking
         let root = self.root
         let applyGate = self.applyGate
+        let publisher = self.publisher
         let ledger = UsageLedger(
             isEnabled: { tracking.isOn },
             projectsRoot: { root },
             storeDirectory: storeURL,
-            ingest: { _, _ in throw InjectedRunLogFailure() },
-            publish: { _, _ in },
+            publish: { sessionID, totals in await publisher.record(sessionID, totals) },
             onDiagnostic: { diagnostics.append($0) },
             readRunLog: { sessionID, store, resolveProjectRoot in
                 try await script.run(sessionID, store: store, resolveProjectRoot: resolveProjectRoot)
@@ -1332,5 +1410,375 @@ final class UsageLedgerIngestTests: XCTestCase {
               await finishes("the ingest", { await ingesting.value }),
               await finishes("tokenReports", { await reporting.value }) else { return }
         XCTAssertEqual(answer.value, [[]], "the report answers the store as it is after the delete")
+    }
+
+    // MARK: - Publishing the session's totals (R5a)
+
+    private typealias Published = PublishRecorder.Entry
+
+    /// run1's totals by Claude Code's own count (`expected-cost-state.json`
+    /// of run1, one model): input 24, output 2,114, cache read 176,467,
+    /// cache creation 51,986.
+    private static let run1CostState = UsageTokenTotals(
+        input: 24, output: 2_114, cacheRead: 176_467, cacheCreation: 51_986)
+    /// What exports 1-6 of run1 deliver: the cost-state totals minus R2b's
+    /// pinned unreported row (6, 534, 49,589, 1,220), by hand.
+    private static let run1SixExportsRecorded = UsageTokenTotals(
+        input: 18, output: 1_580, cacheRead: 126_878, cacheCreation: 50_766)
+
+    private func inputTotals(_ input: Int64) -> UsageTokenTotals {
+        UsageTokenTotals(input: input, output: 0, cacheRead: 0, cacheCreation: 0)
+    }
+
+    /// The fixture's own totals summed over its models.
+    private func summed(_ byModel: UsageTotalsByModel) -> UsageTokenTotals {
+        var totals = UsageTokenTotals()
+        for kinds in byModel.values {
+            totals.input += kinds["input"] ?? 0
+            totals.output += kinds["output"] ?? 0
+            totals.cacheRead += kinds["cacheRead"] ?? 0
+            totals.cacheCreation += kinds["cacheCreation"] ?? 0
+        }
+        return totals
+    }
+
+    /// Waits until the recorder has seen `count` publishes; fails the test
+    /// after `waitSeconds`.
+    private func waitForPublishes(_ count: Int) async {
+        let publisher = self.publisher
+        let published = expectation(description: "\(count) publish(es)")
+        Task {
+            await publisher.waitForCount(count)
+            published.fulfill()
+        }
+        await fulfillment(of: [published], timeout: Self.waitSeconds)
+    }
+
+    func test_publish_fixturePins_areConsistent() throws {
+        XCTAssertEqual(summed(try Fixtures.expectedTotals(run: "run1")), Self.run1CostState, "Fixture error")
+        let row = run1SixOfSevenRow.totals
+        XCTAssertEqual(
+            UsageTokenTotals(
+                input: Self.run1SixExportsRecorded.input + row.input,
+                output: Self.run1SixExportsRecorded.output + row.output,
+                cacheRead: Self.run1SixExportsRecorded.cacheRead + row.cacheRead,
+                cacheCreation: Self.run1SixExportsRecorded.cacheCreation + row.cacheCreation),
+            Self.run1CostState, "Fixture error")
+    }
+
+    // The settle reads nothing (stub), so there is no unreported row: what
+    // is published is exactly what the exports delivered.
+    func test_publish_afterFixtureExports_theTotalsAreTheRecordedSum() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+
+        await ingestAll(Array(try captured(run: "run1").prefix(6)), into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(1)
+
+        let entries = await publisher.entries
+        XCTAssertFalse(entries.isEmpty)
+        XCTAssertEqual(Set(entries.map(\.sessionID)), [Self.run1Session])
+        XCTAssertFalse(entries.contains { $0.totals == nil }, "\(entries)")
+        XCTAssertEqual(entries.last, Published(sessionID: Self.run1Session, totals: Self.run1SixExportsRecorded))
+        let points = try await inspect(ledger) { try await $0.pointRows() }
+        XCTAssertEqual(summed(Fixtures.totals(of: points)), Self.run1SixExportsRecorded, "the recorded sum")
+    }
+
+    // The settle is held: the export's totals are published anyway, so the
+    // card never waits for a transcript read.
+    func test_publish_anExportIsPublishedBeforeItsSettleEnds() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        await script.gate(1)
+        let ledger = try makeLedger()
+
+        let export = try synthetic(Self.sessionA, value: 10, seconds: 10)
+        let answer = await ingestWithoutWaitingForTheSettle(ledger, export.body, receivedAtNs: export.receivedAtNs)
+        XCTAssertEqual(answer, .stored)
+        guard answer == .stored else { return }
+        try await waitForRunLogCalls(1)
+        await waitForPublishes(1)
+
+        let whileHeld = await publisher.entries
+        let finished = await script.finished
+        XCTAssertEqual(finished, 0, "Fixture error: the settle is still held")
+        XCTAssertEqual(whileHeld, [Published(sessionID: Self.sessionA, totals: inputTotals(10))])
+        await script.release(1)
+        await ledger.waitUntilIdle()
+    }
+
+    func test_publish_ingestExportAnswersWhileItsPublishIsBlocked() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        await publisher.gate(1)
+        let ledger = try makeLedger()
+
+        let export = try synthetic(Self.sessionA, value: 10, seconds: 10)
+        let answer = await ingestWithoutWaitingForTheSettle(ledger, export.body, receivedAtNs: export.receivedAtNs)
+
+        XCTAssertEqual(answer, .stored, "ingestExport must answer while its publish is held")
+        guard answer == .stored else { return }
+        await publisher.release(1)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(1)
+        let entries = await publisher.entries
+        XCTAssertEqual(entries, [Published(sessionID: Self.sessionA, totals: inputTotals(10))])
+    }
+
+    // run1 with its transcript complete and its last export withheld: after
+    // the settles the published totals are recorded + unreported, which is
+    // Claude Code's own count.
+    func test_publish_afterASettleWithAnUnreportedRow_theTotalsAreRecordedPlusUnreported() async throws {
+        try await seedStore()
+        try writeTranscript(try UsageRunLogFixtures.lines(UsageRunLogFixtures.run1), session: Self.run1Session)
+        let ledger = try makeLedger()
+
+        await ingestAll(Array(try captured(run: "run1").prefix(6)), into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(1)
+
+        let entries = await publisher.entries
+        XCTAssertEqual(entries.last, Published(sessionID: Self.run1Session, totals: Self.run1CostState))
+        let stored = try await inspect(ledger) { store in
+            (try await store.pointRows(), try await store.unreportedRows())
+        }
+        XCTAssertEqual(summed(Fixtures.totals(of: stored.0)), Self.run1SixExportsRecorded, "Fixture error")
+        XCTAssertEqual(stored.1, [run1SixOfSevenRow], "Fixture error")
+    }
+
+    // While run1 runs only the received tokens are known; the exit line is
+    // appended and `catchUp` settles: that settle publishes the grown
+    // totals.
+    func test_publish_aCatchUpSettleThatAddsAnUnreportedRow_publishesTheNewTotals() async throws {
+        try await seedStore()
+        let ledger = try makeLedger()
+        let exit = try await run1RunningWithSixExports(ledger)
+        await waitForPublishes(1)
+        let whileRunning = await publisher.entries
+        XCTAssertEqual(whileRunning.last, Published(sessionID: Self.run1Session, totals: Self.run1SixExportsRecorded))
+        try appendTranscript(exit, session: Self.run1Session)
+
+        await ledger.catchUp()
+        await ledger.waitUntilIdle()
+        await waitForPublishes(whileRunning.count + 1)
+
+        let entries = await publisher.entries
+        XCTAssertEqual(Array(entries.dropFirst(whileRunning.count)),
+                       [Published(sessionID: Self.run1Session, totals: Self.run1CostState)])
+    }
+
+    func test_publish_anExportThatChangesNothing_publishesNothing() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+
+        await ingestAll([try synthetic(Self.sessionA, value: 10, seconds: 10)], into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(1)
+        await ingestAll([try synthetic(Self.sessionA, value: 10, seconds: 15)], into: ledger)
+        await ledger.waitUntilIdle()
+
+        let entries = await publisher.entries
+        XCTAssertEqual(entries, [Published(sessionID: Self.sessionA, totals: inputTotals(10))])
+    }
+
+    // The export's own settle and two catch-ups change nothing: one
+    // publish, the export's.
+    func test_publish_aSettleThatChangesNothing_publishesNothing() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+
+        await ingestAll([try synthetic(Self.sessionA, value: 10, seconds: 10)], into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(1)
+        await ledger.catchUp()
+        await ledger.catchUp()
+        await ledger.waitUntilIdle()
+
+        let calls = await script.count(forSession: Self.sessionA)
+        XCTAssertEqual(calls, 3, "Fixture error: one settle per export and per catch-up")
+        let entries = await publisher.entries
+        XCTAssertEqual(entries, [Published(sessionID: Self.sessionA, totals: inputTotals(10))])
+    }
+
+    // A new series of value 0 changes the session (it is now heard) but
+    // leaves it without a row: its totals are nil, and nil for a session
+    // never published is not sent.
+    func test_publish_anExportWhoseOnlyNewSeriesIsZero_publishesNothing() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+
+        let outcome = await ingest(try synthetic(Self.sessionA, value: 0, seconds: 10), into: ledger)
+        await ledger.waitUntilIdle()
+
+        XCTAssertEqual(outcome, .stored)
+        let calls = await script.count(forSession: Self.sessionA)
+        XCTAssertEqual(calls, 1, "Fixture error: the session changed, so it was settled")
+        let entries = await publisher.entries
+        XCTAssertEqual(entries, [])
+    }
+
+    // The first publish is held; two later exports queue theirs behind it.
+    // Once released, all three arrive in call order.
+    func test_publish_publishesAreDeliveredInCallOrder() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        await publisher.gate(1)
+        let ledger = try makeLedger()
+
+        let first = try synthetic(Self.sessionA, value: 10, seconds: 10)
+        let answer = await ingestWithoutWaitingForTheSettle(ledger, first.body, receivedAtNs: first.receivedAtNs)
+        XCTAssertEqual(answer, .stored)
+        guard answer == .stored else { return }
+        await waitForPublishes(1)
+        await ingestAll([
+            try synthetic(Self.sessionA, value: 20, seconds: 15),
+            try synthetic(Self.sessionA, value: 30, seconds: 20),
+        ], into: ledger)
+        let whileHeld = await publisher.entries
+        XCTAssertEqual(whileHeld.count, 1, "the later publishes wait behind the held one")
+
+        await publisher.release(1)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(3)
+
+        let entries = await publisher.entries
+        XCTAssertEqual(entries, [
+            Published(sessionID: Self.sessionA, totals: inputTotals(10)),
+            Published(sessionID: Self.sessionA, totals: inputTotals(20)),
+            Published(sessionID: Self.sessionA, totals: inputTotals(30)),
+        ])
+    }
+
+    func test_publish_deleteAll_publishesNilForEachPublishedSession_andALaterExportPublishesAgain() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+        await ingestAll([
+            try synthetic(Self.sessionA, value: 10, seconds: 10),
+            try synthetic(Self.sessionB, value: 7, seconds: 11),
+        ], into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(2)
+        let before = await publisher.entries
+        XCTAssertEqual(Set(before.map(\.sessionID)), [Self.sessionA, Self.sessionB], "Fixture error")
+        XCTAssertEqual(before.count, 2, "Fixture error")
+
+        try await ledger.deleteAll()
+        await ledger.waitUntilIdle()
+        await waitForPublishes(4)
+        let afterDelete = await publisher.entries
+        let cleared = afterDelete.dropFirst(2).sorted { $0.sessionID < $1.sessionID }
+        XCTAssertEqual(cleared, [
+            Published(sessionID: Self.sessionA, totals: nil), Published(sessionID: Self.sessionB, totals: nil),
+        ])
+        XCTAssertEqual(afterDelete.count, 4)
+
+        // The delete restarted tracking at the store's clock: a process
+        // started later counts. The same totals as before the delete are
+        // published again (the memory of what was published is gone).
+        await ingestAll(
+            [try synthetic(Self.sessionA, value: 10, seconds: 10, startNs: Self.futureStartNs)], into: ledger)
+        await ledger.waitUntilIdle()
+        await waitForPublishes(5)
+        let afterExport = await publisher.entries
+        XCTAssertEqual(Array(afterExport.dropFirst(4)), [Published(sessionID: Self.sessionA, totals: inputTotals(10))])
+
+        // A second delete clears only what was published since.
+        try await ledger.deleteAll()
+        await ledger.waitUntilIdle()
+        await waitForPublishes(6)
+        let afterSecond = await publisher.entries
+        XCTAssertEqual(Array(afterSecond.dropFirst(5)), [Published(sessionID: Self.sessionA, totals: nil)])
+    }
+
+    // MARK: - Lifetime and isTracking (moved from UsageLedgerTests, R5a)
+
+    func test_init_touchesNoFile() throws {
+        _ = try makeLedger()
+
+        XCTAssertFalse(exists(storePath), "init must not create the store directory")
+    }
+
+    /// Compiles only while `isTracking` is readable without awaiting the
+    /// actor (it is nonisolated).
+    private func readTrackingSynchronously(_ ledger: UsageLedger) -> Bool {
+        ledger.isTracking
+    }
+
+    func test_isTracking_isReadFromTheClosureAtEveryAccess() async throws {
+        let answer = OSAllocatedUnfairLock(initialState: false)
+        let reads = OSAllocatedUnfairLock(initialState: 0)
+        let ledger = UsageLedger(
+            isEnabled: {
+                reads.withLock { $0 += 1 }
+                return answer.withLock { $0 }
+            },
+            projectsRoot: { "/nonexistent" },
+            storeDirectory: storeURL,
+            publish: { _, _ in },
+            onDiagnostic: { _ in })
+        ledgers.append(ledger)
+        XCTAssertEqual(reads.withLock { $0 }, 0, "Fixture error: init must not read the setting")
+
+        let first = readTrackingSynchronously(ledger)
+        answer.withLock { $0 = true }
+        let second = readTrackingSynchronously(ledger)
+        let third = ledger.isTracking
+        answer.withLock { $0 = false }
+        let fourth = ledger.isTracking
+
+        XCTAssertEqual([first, second, third, fourth], [false, true, true, false])
+        XCTAssertEqual(reads.withLock { $0 }, 4, "one read of the closure per access")
+    }
+
+    func test_close_twoConcurrentCalls_bothReturnOnlyAfterTheDatabaseIsClosed() async throws {
+        try await seedStore()
+        let script = try runLogScript()
+        await script.setDefault(.status(.read))
+        let ledger = try makeLedger()
+
+        for round in 0..<200 {
+            // Opens the store and writes, so the close has a WAL to fold.
+            let outcome = await ingest(
+                try synthetic(Self.sessionA, value: Double(round + 1), seconds: Int64(round + 1)), into: ledger)
+            XCTAssertEqual(outcome, .stored, "round \(round)")
+            await ledger.waitUntilIdle()
+
+            // Whichever call returns first, the database must be closed
+            // by then: while a connection is still closing, a second one
+            // cannot open the database.
+            let directory = storeURL
+            let failure: String? = await withTaskGroup(of: Void.self) { group in
+                group.addTask { await ledger.close() }
+                group.addTask { await ledger.close() }
+                await group.next()
+                var failure: String?
+                do {
+                    let fresh = try UsageStore(directory: directory)
+                    await fresh.close()
+                } catch {
+                    failure = "\(error)"
+                }
+                await group.waitForAll()
+                return failure
+            }
+            if let failure {
+                return XCTFail("round \(round): the database was not closed when a close() returned: \(failure)")
+            }
+        }
+        assertDiagnostics([])
     }
 }

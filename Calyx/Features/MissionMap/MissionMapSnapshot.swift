@@ -66,11 +66,11 @@ struct MissionMapCard: Identifiable, Sendable, Equatable {
     /// The surface a click focuses, or `nil` when nothing resolvable is
     /// behind the card (`AgentRowFocusTarget.resolve`'s own `nil`).
     let focusTarget: UUID?
-    /// The total usage row of the agent's Claude Code session, which the
-    /// card shows as one line; `nil` when the pane has no session or the
-    /// ledger has no row for it yet. Defaulted to nil so cards built
-    /// without a usage row need not pass it.
-    var usage: UsageRow? = nil
+    /// The totals of the agent's Claude Code session, which the card
+    /// shows as one line; `nil` when the pane has no session or the
+    /// ledger has published no totals for it. Defaulted to nil so cards
+    /// built without usage need not pass it.
+    var usage: UsageTokenTotals? = nil
 }
 
 /// One subagent row inside its parent's card.
@@ -178,9 +178,9 @@ struct MissionMapInput: Sendable {
     /// The home directory cwd labels abbreviate to `~`. Injectable so
     /// the builder never reads process state its caller did not pass in.
     var homeDirectory: String = NSHomeDirectory()
-    /// Each session's total usage row, keyed by agent session id
+    /// Each session's totals, keyed by agent session id
     /// (`UsageLiveSummaries.bySession`).
-    var usage: [String: UsageRow] = [:]
+    var usage: [String: UsageTokenTotals] = [:]
 }
 
 // MARK: - Stable IDs
