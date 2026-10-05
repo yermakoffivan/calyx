@@ -2369,4 +2369,37 @@ final class ConfigEditingContractTests: XCTestCase {
         let openCodeJSONAfter = try String(contentsOfFile: openCodeRoot + "/opencode.json", encoding: .utf8)
         XCTAssertFalse(openCodeJSONAfter.contains("calyx-mcp"), "OpenCodeConfigManager: disable must remove calyx-mcp")
     }
+
+    // MARK: - ClaudeUsageTelemetryConfigManager (env.OTEL_* members + otelHeadersHelper)
+    //
+    // Same JSON key-path contract as Group A: Calyx's ten telemetry
+    // members are its owned region; install -> remove must leave every
+    // other byte (and the user's 0644 mode) of settings.json untouched.
+
+    private func claudeUsageTelemetryConfigCheck(_ fixture: Fixture) -> ContractCheck {
+        roundTripCheck(
+            managerName: "ClaudeUsageTelemetryConfigManager",
+            fixture: fixture,
+            relativePath: "settings.json",
+            fixtureMode: 0o644,
+            enable: { root in
+                let outcome = try ClaudeUsageTelemetryConfigManager.install(
+                    port: 41830,
+                    headersFilePath: "/opt/calyx/usage-headers.json",
+                    settingsPath: root + "/settings.json"
+                )
+                XCTAssertEqual(outcome, .installed(port: 41830), "enable must actually install for [\(fixture.label)]")
+            },
+            disable: { root in
+                let outcome = try ClaudeUsageTelemetryConfigManager.remove(settingsPath: root + "/settings.json")
+                XCTAssertEqual(outcome, .removed, "[\(fixture.label)]")
+            }
+        )
+    }
+
+    func test_claudeUsageTelemetryConfigManager_installThenRemove_preservesBytesOutsideOwnedRegion() throws {
+        for fixture in jsonFixtures {
+            try runContractCheck(claudeUsageTelemetryConfigCheck(fixture))
+        }
+    }
 }
