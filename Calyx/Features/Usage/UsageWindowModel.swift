@@ -24,25 +24,25 @@ final class UsageWindowModel {
         case unattributed
     }
 
-    /// One table row: Claude Code's token counts of one model at one
-    /// effort level, or the tokens of one model that Calyx did not
-    /// receive (`isUnreported`, effort unknown).
+    /// One table row: Claude Code's token counts of one key of
+    /// `groupBy`, or the tokens Calyx did not receive for that key
+    /// (`isUnreported`; effort and thread unknown).
     struct Row: Identifiable, Equatable, Sendable {
-        /// Unique within one result and the same for the same
-        /// (model, effort, unreported) in every result, so the table keeps
-        /// its selection and scroll position across refreshes.
+        /// Unique within one result and the same for the same key and
+        /// unreported flag in every result, so the table keeps its
+        /// selection and scroll position across refreshes.
         let id: String
-        /// Optional because the ledger's grouping key is `[String?]`; no
-        /// stored row has a nil model (`usage_points.model` and
-        /// `usage_unreported.model` are NOT NULL), but the key type allows it, and the view shows `—`
-        /// rather than assuming it away.
-        let model: String?
-        /// nil: no effort was recorded (always nil for an unreported row).
-        let effort: String?
+        /// The ledger's grouping key verbatim, in `groupBy` order; nil:
+        /// the dimension has no value for this row.
+        let key: [String?]
         /// true: tokens Claude Code counted that Calyx did not receive.
         let isUnreported: Bool
         let tokens: UsageTokenTotals
     }
+
+    /// The dimensions the window can group by, in their fixed key order
+    /// (day first).
+    static let groupableDimensions: [UsageTokenQuery.Dimension] = [.day, .model, .effort, .thread, .project]
 
     /// Shown instead of reading anything when the selected period's
     /// start cannot be computed.
@@ -53,8 +53,16 @@ final class UsageWindowModel {
     /// nil: every thread; otherwise a thread label ("main", "subagent",
     /// "auxiliary").
     var thread: String? = nil
+    /// The rows query's grouping: members of `groupableDimensions`, in
+    /// that order, never empty.
+    private(set) var groupBy: [UsageTokenQuery.Dimension] = [.model, .effort, .thread, .project]
 
     private(set) var rows: [Row] = []
+    /// The grouping `rows` was read with: set together with `rows` when a
+    /// refresh applies its result, and only then, so the table's columns
+    /// always match its rows while `groupBy` has changed but not yet been
+    /// read.
+    private(set) var rowsGroupBy: [UsageTokenQuery.Dimension] = [.model, .effort, .thread, .project]
     /// The field-by-field saturating sum of the totals query's rows
     /// (recorded + unreported); nil: the totals query returned no row.
     private(set) var totals: UsageTokenTotals? = nil
@@ -131,6 +139,21 @@ final class UsageWindowModel {
         return UsageTokenQuery(groupBy: groupBy, sinceMs: sinceMs, project: projectFilter, thread: thread)
     }
 
+    /// Turns `dimension` on or off in `groupBy`, keeping the fixed order.
+    /// A dimension the window does not offer, and a toggle that would
+    /// leave `groupBy` empty, are ignored. Never refreshes by itself.
+    func toggleGrouping(_ dimension: UsageTokenQuery.Dimension) {
+        guard Self.groupableDimensions.contains(dimension) else { return }
+        var enabled = Set(groupBy)
+        if enabled.contains(dimension) {
+            enabled.remove(dimension)
+        } else {
+            enabled.insert(dimension)
+        }
+        guard !enabled.isEmpty else { return }
+        groupBy = Self.groupableDimensions.filter(enabled.contains)
+    }
+
     /// Reads the table, its totals and the project list in exactly one
     /// `reports` call (one reconcile, one consistent read), with the
     /// clock and calendar read now.
@@ -158,7 +181,7 @@ final class UsageWindowModel {
         guard
             let rowsQuery = Self.query(
                 period: period, project: project, thread: thread,
-                groupBy: [.model, .effort], now: now, calendar: calendar),
+                groupBy: groupBy, now: now, calendar: calendar),
             let totalsQuery = Self.query(
                 period: period, project: project, thread: thread,
                 groupBy: [], now: now, calendar: calendar)
@@ -166,6 +189,7 @@ final class UsageWindowModel {
             recordFailure(Self.periodUnavailableMessage)
             return
         }
+        let readGroupBy = groupBy
         let queries = [rowsQuery, totalsQuery, UsageTokenQuery(groupBy: [.project])]
 
         runningRefreshes += 1
@@ -191,6 +215,7 @@ final class UsageWindowModel {
             return
         }
         rows = results[0].map(Self.row)
+        rowsGroupBy = readGroupBy
         totals = Self.saturatingSum(results[1])
         projects = Self.projectChoices(results[2])
         if generation > failureRecordedAtRefresh {
@@ -231,11 +256,9 @@ final class UsageWindowModel {
     }
 
     private static func row(_ source: UsageTokenRow) -> Row {
-        let model = source.key.first.flatMap { $0 }
-        let effort = source.key.dropFirst().first.flatMap { $0 }
-        return Row(
-            id: rowID(model: model, effort: effort, isUnreported: source.isUnreported),
-            model: model, effort: effort, isUnreported: source.isUnreported, tokens: tokens(of: source))
+        Row(
+            id: rowID(key: source.key, isUnreported: source.isUnreported),
+            key: source.key, isUnreported: source.isUnreported, tokens: tokens(of: source))
     }
 
     private static func tokens(of row: UsageTokenRow) -> UsageTokenTotals {
@@ -246,9 +269,8 @@ final class UsageWindowModel {
 
     /// Length-prefixed, so nil, "" and any string content give distinct
     /// ids; the unreported flag is a final element of its own.
-    private static func rowID(model: String?, effort: String?, isUnreported: Bool) -> String {
-        let elements = [model, effort]
-            .map { element in element.map { "\($0.count):\($0)" } ?? "-" }
+    private static func rowID(key: [String?], isUnreported: Bool) -> String {
+        let elements = key.map { element in element.map { "\($0.count):\($0)" } ?? "-" }
         return (elements + [isUnreported ? "u" : "r"]).joined(separator: ",")
     }
 

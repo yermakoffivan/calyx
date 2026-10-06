@@ -335,5 +335,9 @@ enum AccessibilityID {
         static let trackingOffBanner = "calyx.usage.trackingOffBanner"
         static let footnote = "calyx.usage.footnote"
         static let statusLine = "calyx.usage.statusLine"
+        static let columnsMenu = "calyx.usage.columnsMenu"
+        /// One item of the Columns menu; `dimension` is the
+        /// `UsageTokenQuery.Dimension` raw value.
+        static func column(_ dimension: String) -> String { "calyx.usage.column.\(dimension)" }
     }
 }

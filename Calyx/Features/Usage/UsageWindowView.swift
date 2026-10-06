@@ -2,8 +2,8 @@
 // Calyx
 //
 // SwiftUI content view for `UsageWindowController`: three filters, the
-// reception status line, a model x effort table of Claude Code's own
-// token counts with a totals row, and the note on how to read it. Its
+// reception status line, a table of Claude Code's own token counts with
+// a column per grouped dimension (the Columns menu) and a totals row, and the note on how to read it. Its
 // texts and row mapping are the static members below (pinned by
 // `UsageWindowViewPinsTests`); the body is built from them. Every read goes
 // through `UsageWindowModel.refresh()`; the view calls it whenever a
@@ -39,7 +39,7 @@ struct UsageWindowView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                UsageTable(rows: model.rows, totals: model.totals)
+                UsageTable(rows: model.rows, totals: model.totals, groupBy: model.rowsGroupBy)
             }
             Text(Self.footnote)
                 .font(.footnote)
@@ -59,6 +59,7 @@ struct UsageWindowView: View {
         .onChange(of: model.period) { refresh() }
         .onChange(of: model.project) { refresh() }
         .onChange(of: model.thread) { refresh() }
+        .onChange(of: model.groupBy) { refresh() }
         .confirmationDialog(
             "Delete all usage data?", isPresented: $isConfirmingDelete, titleVisibility: .visible
         ) {
@@ -72,19 +73,40 @@ struct UsageWindowView: View {
 
     // MARK: - Texts and row mapping
 
-    /// The table's column titles, in order.
+    /// The table's column titles.
     enum Column {
         static let model = "Model"
         static let effort = "Effort"
+        static let thread = "Thread"
+        static let project = "Project"
+        static let day = "Day"
         static let input = "Input"
         static let cacheRead = "Cache Read"
         static let cacheWrite = "Cache Write"
         static let output = "Output"
     }
 
-    static let columnTitles = [
-        Column.model, Column.effort, Column.input, Column.cacheRead, Column.cacheWrite, Column.output,
-    ]
+    /// The token columns, after the key columns.
+    static let tokenColumnTitles = [Column.input, Column.cacheRead, Column.cacheWrite, Column.output]
+
+    /// The title of a key column (and of its Columns menu item).
+    static func columnTitle(for dimension: UsageTokenQuery.Dimension) -> String {
+        switch dimension {
+        case .model: Column.model
+        case .effort: Column.effort
+        case .thread: Column.thread
+        case .project: Column.project
+        case .day: Column.day
+        case .agentType: "Agent Type"
+        case .session: "Session"
+        }
+    }
+
+    /// One key column per `groupBy` member in key order, then the token
+    /// columns.
+    static func columnTitles(for groupBy: [UsageTokenQuery.Dimension]) -> [String] {
+        groupBy.map(columnTitle(for:)) + tokenColumnTitles
+    }
 
     static let footnote =
         "Token counts are Claude Code's own, received while Calyx is running. Rows marked unreported are "
@@ -102,10 +124,17 @@ struct UsageWindowView: View {
     /// What an unreported row shows in the Effort column.
     static let unreportedEffortText = "unreported"
 
-    /// Shown for a missing model or effort.
+    /// The project picker's entry for every project.
+    static let allProjectsText = "All Projects"
+
+    /// The project picker's and the Project column's text for usage
+    /// without a project.
+    static let unattributedText = "Unattributed"
+
+    /// Shown for any other missing value.
     private static let missingText = "\u{2014}"
 
-    /// The totals line's Model column.
+    /// The totals line's first key column.
     private static let totalText = "Total"
 
     /// One entry of the thread picker: its title and the thread label it
@@ -122,32 +151,60 @@ struct UsageWindowView: View {
         ThreadChoice(title: "Auxiliary", thread: "auxiliary"),
     ]
 
-    static func modelText(for row: UsageWindowModel.Row) -> String {
-        row.model ?? missingText
+    /// One item of the Columns menu.
+    struct ColumnMenuItem: Hashable {
+        let dimension: UsageTokenQuery.Dimension
+        let title: String
+        let accessibilityID: String
     }
 
-    static func effortText(for row: UsageWindowModel.Row) -> String {
-        row.isUnreported ? unreportedEffortText : (row.effort ?? missingText)
+    static let columnMenuItems: [ColumnMenuItem] = [.model, .effort, .thread, .project, .day].map { dimension in
+        ColumnMenuItem(
+            dimension: dimension, title: columnTitle(for: dimension),
+            accessibilityID: AccessibilityID.Usage.column(dimension.rawValue))
+    }
+
+    /// The text of one key cell: `value` of `dimension` in a row.
+    static func cellText(
+        _ value: String?, for dimension: UsageTokenQuery.Dimension, isUnreported: Bool,
+        home: String = NSHomeDirectory()
+    ) -> String {
+        switch dimension {
+        case .effort where isUnreported:
+            return unreportedEffortText
+        case .project:
+            return value.map { UsageWindowModel.projectLabel(root: $0, home: home) } ?? unattributedText
+        default:
+            return value ?? missingText
+        }
     }
 
     /// A table line: one row, or the totals.
     struct Line: Identifiable, Equatable {
         let id: String
-        let model: String
-        let effort: String
+        /// One text per key column, in `groupBy` order.
+        let cells: [String]
         let tokens: UsageTokenTotals
         let isTotal: Bool
     }
 
-    /// The rows in order, then the totals line when there are totals.
-    static func tableLines(rows: [UsageWindowModel.Row], totals: UsageTokenTotals?) -> [Line] {
+    /// The rows in order, then the totals line when there are totals. A
+    /// key shorter than `groupBy` shows "—" in the missing columns.
+    static func tableLines(
+        rows: [UsageWindowModel.Row], totals: UsageTokenTotals?,
+        groupBy: [UsageTokenQuery.Dimension], home: String = NSHomeDirectory()
+    ) -> [Line] {
         let rowLines = rows.map { row in
-            Line(
-                id: "row:" + row.id, model: modelText(for: row), effort: effortText(for: row),
-                tokens: row.tokens, isTotal: false)
+            let cells = groupBy.enumerated().map { index, dimension in
+                index < row.key.count
+                    ? cellText(row.key[index], for: dimension, isUnreported: row.isUnreported, home: home)
+                    : missingText
+            }
+            return Line(id: "row:" + row.id, cells: cells, tokens: row.tokens, isTotal: false)
         }
         guard let totals else { return rowLines }
-        return rowLines + [Line(id: "total", model: totalText, effort: "", tokens: totals, isTotal: true)]
+        let totalCells = groupBy.indices.map { $0 == 0 ? totalText : "" }
+        return rowLines + [Line(id: "total", cells: totalCells, tokens: totals, isTotal: true)]
     }
 
     /// The status line's text; nil (no line) for an empty status.
@@ -170,7 +227,7 @@ struct UsageWindowView: View {
             .accessibilityIdentifier(AccessibilityID.Usage.periodPicker)
 
             Picker("Project", selection: $model.project) {
-                Text("All Projects").tag(UsageWindowModel.ProjectChoice.all)
+                Text(Self.allProjectsText).tag(UsageWindowModel.ProjectChoice.all)
                 ForEach(projectChoices, id: \.self) { choice in
                     projectLabel(choice).tag(choice)
                 }
@@ -186,6 +243,8 @@ struct UsageWindowView: View {
             .fixedSize()
             .accessibilityIdentifier(AccessibilityID.Usage.threadPicker)
 
+            columnsMenu
+
             Spacer()
 
             if model.isLoading {
@@ -194,6 +253,22 @@ struct UsageWindowView: View {
             Button("Refresh") { refresh() }
                 .accessibilityIdentifier(AccessibilityID.Usage.refreshButton)
         }
+    }
+
+    /// Which dimensions get a column; a check mark on each one that is on.
+    private var columnsMenu: some View {
+        Menu("Columns") {
+            ForEach(Self.columnMenuItems, id: \.self) { item in
+                Toggle(
+                    item.title,
+                    isOn: Binding(
+                        get: { model.groupBy.contains(item.dimension) },
+                        set: { _ in model.toggleGrouping(item.dimension) }))
+                .accessibilityIdentifier(item.accessibilityID)
+            }
+        }
+        .fixedSize()
+        .accessibilityIdentifier(AccessibilityID.Usage.columnsMenu)
     }
 
     /// The offered projects, plus the selected one when the ledger no
@@ -208,11 +283,11 @@ struct UsageWindowView: View {
     private func projectLabel(_ choice: UsageWindowModel.ProjectChoice) -> some View {
         switch choice {
         case .all:
-            Text("All Projects")
+            Text(Self.allProjectsText)
         case .root(let path):
             Text(UsageWindowModel.projectLabel(root: path, home: NSHomeDirectory())).help(path)
         case .unattributed:
-            Text("Unattributed")
+            Text(Self.unattributedText)
         }
     }
 
@@ -244,23 +319,34 @@ extension UsageWindowModel.Period {
     }
 }
 
-/// The model x effort table, its last line the totals of the selection.
+/// The usage table: a column per grouped dimension, then the token
+/// columns; its last line the totals of the selection.
 private struct UsageTable: View {
     let rows: [UsageWindowModel.Row]
     let totals: UsageTokenTotals?
+    let groupBy: [UsageTokenQuery.Dimension]
 
     private typealias Column = UsageWindowView.Column
 
+    /// One key column: its position in the key and its dimension.
+    private struct KeyColumn: Hashable {
+        let index: Int
+        let dimension: UsageTokenQuery.Dimension
+    }
+
     var body: some View {
-        Table(UsageWindowView.tableLines(rows: rows, totals: totals)) {
-            TableColumn(Column.model) { line in cell(line.model, line) }
-            TableColumn(Column.effort) { line in cell(line.effort, line) }
-                .width(min: 50, ideal: 80)
+        Table(UsageWindowView.tableLines(rows: rows, totals: totals, groupBy: groupBy)) {
+            TableColumnForEach(groupBy.enumerated().map { KeyColumn(index: $0, dimension: $1) }, id: \.self) { column in
+                TableColumn(UsageWindowView.columnTitle(for: column.dimension)) { line in
+                    cell(column.index < line.cells.count ? line.cells[column.index] : "", line)
+                }
+            }
             TableColumn(Column.input) { line in number(line.tokens.input, line) }
             TableColumn(Column.cacheRead) { line in number(line.tokens.cacheRead, line) }
             TableColumn(Column.cacheWrite) { line in number(line.tokens.cacheCreation, line) }
             TableColumn(Column.output) { line in number(line.tokens.output, line) }
         }
+        .id(groupBy)
         .accessibilityIdentifier(AccessibilityID.Usage.table)
     }
 

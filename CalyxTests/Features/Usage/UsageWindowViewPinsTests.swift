@@ -20,64 +20,144 @@ import XCTest
 final class UsageWindowViewPinsTests: XCTestCase {
 
     private func row(
-        id: String, model: String?, effort: String?, unreported: Bool = false, input: Int64 = 1
+        id: String, key: [String?], unreported: Bool = false, input: Int64 = 1
     ) -> UsageWindowModel.Row {
         UsageWindowModel.Row(
-            id: id, model: model, effort: effort, isUnreported: unreported,
+            id: id, key: key, isUnreported: unreported,
             tokens: UsageTokenTotals(input: input, output: 0, cacheRead: 0, cacheCreation: 0))
     }
 
-    // MARK: - Table
+    private static let tokenTitles = ["Input", "Cache Read", "Cache Write", "Output"]
+    private static let home = "/Users/someone"
 
-    func test_columnTitles_areModelEffortInputCacheReadCacheWriteOutput_inOrder() {
+    // MARK: - Table: column titles (R5e)
+
+    func test_columnTitles_default_areModelEffortThreadProject_thenTheTokenColumns() {
         XCTAssertEqual(
-            UsageWindowView.columnTitles, ["Model", "Effort", "Input", "Cache Read", "Cache Write", "Output"])
+            UsageWindowView.columnTitles(for: [.model, .effort, .thread, .project]),
+            ["Model", "Effort", "Thread", "Project", "Input", "Cache Read", "Cache Write", "Output"])
+    }
+
+    func test_columnTitles_dayOn_threadOff_followTheKeyOrder() {
+        XCTAssertEqual(
+            UsageWindowView.columnTitles(for: [.day, .model, .effort, .project]),
+            ["Day", "Model", "Effort", "Project"] + Self.tokenTitles)
+    }
+
+    func test_columnTitles_aSingleKeyColumn() {
+        XCTAssertEqual(UsageWindowView.columnTitles(for: [.project]), ["Project"] + Self.tokenTitles)
     }
 
     func test_columnTitles_haveNoVersion1Columns() {
+        let titles = UsageWindowView.columnTitles(for: [.day, .model, .effort, .thread, .project])
         for removed in ["Responses", "Thinking", "Final"] {
-            XCTAssertFalse(UsageWindowView.columnTitles.contains(removed), removed)
+            XCTAssertFalse(titles.contains(removed), removed)
         }
     }
 
-    func test_effortText_ofAnUnreportedRow_isUnreported_andItsModelIsShownAsUsual() {
-        let unreported = row(id: "u", model: "claude-opus", effort: nil, unreported: true)
+    // MARK: - Table: cell texts
 
-        XCTAssertEqual(UsageWindowView.effortText(for: unreported), "unreported")
-        XCTAssertEqual(UsageWindowView.modelText(for: unreported), "claude-opus")
+    func test_cellText_model_isAsIs_orAnEmDash() {
+        XCTAssertEqual(UsageWindowView.cellText("claude-opus", for: .model, isUnreported: false, home: Self.home), "claude-opus")
+        XCTAssertEqual(UsageWindowView.cellText("claude-opus", for: .model, isUnreported: true, home: Self.home), "claude-opus")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .model, isUnreported: false, home: Self.home), "\u{2014}")
     }
 
-    func test_effortText_ofARecordedRow_isItsEffort_orAnEmDash() {
-        XCTAssertEqual(UsageWindowView.effortText(for: row(id: "a", model: "m", effort: "high")), "high")
-        XCTAssertEqual(UsageWindowView.effortText(for: row(id: "b", model: "m", effort: nil)), "\u{2014}")
+    func test_cellText_effort_isAsIs_unreported_orAnEmDash() {
+        XCTAssertEqual(UsageWindowView.cellText("high", for: .effort, isUnreported: false, home: Self.home), "high")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .effort, isUnreported: true, home: Self.home), "unreported")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .effort, isUnreported: false, home: Self.home), "\u{2014}")
     }
 
-    func test_modelText_ofARowWithoutAModel_isAnEmDash() {
-        XCTAssertEqual(UsageWindowView.modelText(for: row(id: "a", model: nil, effort: "high")), "\u{2014}")
+    func test_cellText_thread_isAsIs_andAnEmDashForAnUnreportedRow() {
+        for thread in ["main", "subagent", "auxiliary"] {
+            XCTAssertEqual(UsageWindowView.cellText(thread, for: .thread, isUnreported: false, home: Self.home), thread)
+        }
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .thread, isUnreported: true, home: Self.home), "\u{2014}")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .thread, isUnreported: false, home: Self.home), "\u{2014}")
     }
 
-    func test_tableLines_areTheRowsInOrder_thenTotalLast() {
+    func test_cellText_project_isTildeAbbreviated_orUnattributed() {
+        XCTAssertEqual(
+            UsageWindowView.cellText("/Users/someone/work/app", for: .project, isUnreported: false, home: Self.home),
+            "~/work/app")
+        XCTAssertEqual(
+            UsageWindowView.cellText("/opt/work/app", for: .project, isUnreported: false, home: Self.home),
+            "/opt/work/app")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .project, isUnreported: false, home: Self.home), "Unattributed")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .project, isUnreported: true, home: Self.home), "Unattributed")
+    }
+
+    func test_cellText_day_isAsTheQueryReturnsIt_orAnEmDash() {
+        XCTAssertEqual(UsageWindowView.cellText("2026-03-10", for: .day, isUnreported: false, home: Self.home), "2026-03-10")
+        XCTAssertEqual(UsageWindowView.cellText(nil, for: .day, isUnreported: false, home: Self.home), "\u{2014}")
+    }
+
+    // MARK: - Table: lines
+
+    func test_tableLines_default_cellsInKeyOrder_thenTotalFirstColumnOnly() {
         let rows = [
-            row(id: "r1", model: "claude-opus", effort: "high", input: 3),
-            row(id: "r2", model: "claude-opus", effort: nil, unreported: true, input: 4),
+            row(id: "r1", key: ["claude-opus", "high", "main", "/Users/someone/work/app"], input: 3),
+            row(id: "r2", key: ["claude-opus", nil, nil, nil], unreported: true, input: 4),
         ]
         let totals = UsageTokenTotals(input: 7, output: 1, cacheRead: 2, cacheCreation: 3)
 
-        let lines = UsageWindowView.tableLines(rows: rows, totals: totals)
+        let lines = UsageWindowView.tableLines(
+            rows: rows, totals: totals, groupBy: [.model, .effort, .thread, .project], home: Self.home)
 
-        XCTAssertEqual(lines.map(\.model), ["claude-opus", "claude-opus", "Total"])
-        XCTAssertEqual(lines.map(\.effort), ["high", "unreported", ""])
+        XCTAssertEqual(
+            lines.map(\.cells),
+            [
+                ["claude-opus", "high", "main", "~/work/app"],
+                ["claude-opus", "unreported", "\u{2014}", "Unattributed"],
+                ["Total", "", "", ""],
+            ])
         XCTAssertEqual(lines.map(\.isTotal), [false, false, true])
         XCTAssertEqual(lines.map(\.tokens.input), [3, 4, 7])
         XCTAssertEqual(lines.last?.tokens, totals)
         XCTAssertEqual(Set(lines.map(\.id)).count, 3, "line ids collide: \(lines.map(\.id))")
     }
 
-    func test_tableLines_withoutTotals_haveNoTotalLine() {
-        let lines = UsageWindowView.tableLines(rows: [row(id: "r1", model: "m", effort: "low")], totals: nil)
+    func test_tableLines_dayFirst_totalIsInTheDayColumn() {
+        let rows = [row(id: "r1", key: ["2026-03-10", "/opt/x"])]
+        let lines = UsageWindowView.tableLines(
+            rows: rows, totals: UsageTokenTotals(input: 1, output: 0, cacheRead: 0, cacheCreation: 0),
+            groupBy: [.day, .project], home: Self.home)
 
-        XCTAssertEqual(lines.map(\.model), ["m"])
+        XCTAssertEqual(lines.map(\.cells), [["2026-03-10", "/opt/x"], ["Total", ""]])
+    }
+
+    func test_tableLines_aKeyShorterThanGroupBy_showsEmDashes_withoutTrapping() {
+        let lines = UsageWindowView.tableLines(
+            rows: [row(id: "r1", key: ["m"])], totals: nil, groupBy: [.model, .effort, .thread], home: Self.home)
+
+        XCTAssertEqual(lines.map(\.cells), [["m", "\u{2014}", "\u{2014}"]])
+    }
+
+    func test_tableLines_withoutTotals_haveNoTotalLine() {
+        let lines = UsageWindowView.tableLines(
+            rows: [row(id: "r1", key: ["m", "low"])], totals: nil, groupBy: [.model, .effort], home: Self.home)
+
+        XCTAssertEqual(lines.map(\.cells), [["m", "low"]])
         XCTAssertEqual(lines.map(\.isTotal), [false])
+    }
+
+    // MARK: - Columns menu
+
+    func test_columnsMenu_accessibilityIdentifier_isTheExactLiteral() {
+        XCTAssertEqual(AccessibilityID.Usage.columnsMenu, "calyx.usage.columnsMenu")
+    }
+
+    func test_columnMenuItems_oneItemPerDimension_withTitlesAndIds() {
+        let items = UsageWindowView.columnMenuItems
+        XCTAssertEqual(items.map(\.dimension), [.model, .effort, .thread, .project, .day])
+        XCTAssertEqual(items.map(\.title), ["Model", "Effort", "Thread", "Project", "Day"])
+        XCTAssertEqual(
+            items.map(\.accessibilityID),
+            [
+                "calyx.usage.column.model", "calyx.usage.column.effort", "calyx.usage.column.thread",
+                "calyx.usage.column.project", "calyx.usage.column.day",
+            ])
     }
 
     // MARK: - Thread picker
@@ -122,7 +202,7 @@ final class UsageWindowViewPinsTests: XCTestCase {
             AccessibilityID.Usage.periodPicker, AccessibilityID.Usage.projectPicker,
             AccessibilityID.Usage.threadPicker, AccessibilityID.Usage.table, AccessibilityID.Usage.refreshButton,
             AccessibilityID.Usage.deleteButton, AccessibilityID.Usage.trackingOffBanner,
-            AccessibilityID.Usage.footnote,
+            AccessibilityID.Usage.footnote, AccessibilityID.Usage.columnsMenu,
         ]
         XCTAssertFalse(others.contains(AccessibilityID.Usage.statusLine))
     }

@@ -334,18 +334,23 @@ final class UsageWindowModelTests: XCTestCase {
         await fulfillment(of: [stub.expectCall(index)], timeout: 10)
     }
 
+    /// The window's default grouping (R5e): a column per filtered dimension.
+    private static let defaultGroupBy: [UsageTokenQuery.Dimension] = [.model, .effort, .thread, .project]
+
     private func expectedQueries(
-        sinceMs: Int64?, project: UsageTokenQuery.ProjectFilter? = nil, thread: String? = nil
+        sinceMs: Int64?, project: UsageTokenQuery.ProjectFilter? = nil, thread: String? = nil,
+        groupBy: [UsageTokenQuery.Dimension] = UsageWindowModelTests.defaultGroupBy
     ) -> [UsageTokenQuery] {
         [
-            UsageTokenQuery(groupBy: [.model, .effort], sinceMs: sinceMs, project: project, thread: thread),
+            UsageTokenQuery(groupBy: groupBy, sinceMs: sinceMs, project: project, thread: thread),
             UsageTokenQuery(groupBy: [], sinceMs: sinceMs, project: project, thread: thread),
             UsageTokenQuery(groupBy: [.project]),
         ]
     }
 
+    /// The rows' keys as the ledger returned them (verbatim, in `groupBy` order).
     private func modelEffortUsage(_ rows: [UsageWindowModel.Row]) -> [[String?]] {
-        rows.map { [$0.model, $0.effort] }
+        rows.map(\.key)
     }
 
     // MARK: - query: period bounds
@@ -470,6 +475,8 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertFalse(model.isLoading)
         XCTAssertNil(model.errorMessage)
         XCTAssertEqual(model.statusText, "")
+        XCTAssertEqual(model.groupBy, [.model, .effort, .thread, .project])
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .thread, .project])
         XCTAssertEqual(stub.callCount, 0, "creating the model reads nothing")
         XCTAssertEqual(env.statusTextReads, 0, "creating the model reads nothing")
     }
@@ -624,7 +631,7 @@ final class UsageWindowModelTests: XCTestCase {
         await model.refresh()
 
         // Checked, not subscripted: a wrong first result must fail, not trap.
-        let highID = first.first { $0.model == "m" && $0.effort == "high" }?.id
+        let highID = first.first { $0.key == ["m", "high"] }?.id
         XCTAssertNotNil(highID)
         XCTAssertEqual(model.rows.map(\.id), highID.map { [$0] })
     }
@@ -1274,5 +1281,255 @@ final class UsageWindowModelTests: XCTestCase {
         XCTAssertEqual(model.rows, rows)
         XCTAssertEqual(model.totals, Self.totals(input: 1))
         XCTAssertEqual(model.projects, [.root("/a")])
+    }
+
+    // MARK: - groupBy (R5e)
+
+    func test_toggleGrouping_eachDimensionOff_keepsTheOthersInTheFixedOrder() {
+        let cases: [(UsageTokenQuery.Dimension, [UsageTokenQuery.Dimension])] = [
+            (.model, [.effort, .thread, .project]),
+            (.effort, [.model, .thread, .project]),
+            (.thread, [.model, .effort, .project]),
+            (.project, [.model, .effort, .thread]),
+        ]
+        for (dimension, expected) in cases {
+            let model = makeModel()
+            model.toggleGrouping(dimension)
+            XCTAssertEqual(model.groupBy, expected, "\(dimension) off")
+        }
+    }
+
+    func test_toggleGrouping_dayOn_isFirst() {
+        let model = makeModel()
+        model.toggleGrouping(.day)
+        XCTAssertEqual(model.groupBy, [.day, .model, .effort, .thread, .project])
+    }
+
+    func test_toggleGrouping_dayOnAfterOthersOff_isStillFirst_andOffAgainRemovesIt() {
+        let model = makeModel()
+        model.toggleGrouping(.model)
+        model.toggleGrouping(.thread)
+        model.toggleGrouping(.day)
+        XCTAssertEqual(model.groupBy, [.day, .effort, .project])
+        model.toggleGrouping(.day)
+        XCTAssertEqual(model.groupBy, [.effort, .project])
+    }
+
+    func test_toggleGrouping_backOn_returnsToItsFixedPlace_notTheEnd() {
+        let model = makeModel()
+        model.toggleGrouping(.model)
+        model.toggleGrouping(.effort)
+        model.toggleGrouping(.model)
+        XCTAssertEqual(model.groupBy, [.model, .thread, .project])
+        model.toggleGrouping(.effort)
+        XCTAssertEqual(model.groupBy, [.model, .effort, .thread, .project])
+    }
+
+    func test_toggleGrouping_thatWouldEmptyTheList_isIgnored() {
+        let model = makeModel()
+        model.toggleGrouping(.model)
+        model.toggleGrouping(.effort)
+        model.toggleGrouping(.thread)
+        XCTAssertEqual(model.groupBy, [.project])
+
+        model.toggleGrouping(.project)
+
+        XCTAssertEqual(model.groupBy, [.project])
+    }
+
+    func test_toggleGrouping_ofADimensionTheWindowDoesNotOffer_isIgnored() {
+        let model = makeModel()
+        model.toggleGrouping(.session)
+        model.toggleGrouping(.agentType)
+        XCTAssertEqual(model.groupBy, [.model, .effort, .thread, .project])
+    }
+
+    func test_toggleGrouping_doesNotRefreshByItself() async {
+        let model = makeModel()
+        model.toggleGrouping(.day)
+        model.toggleGrouping(.model)
+        XCTAssertEqual(stub.callCount, 0)
+
+        await model.refresh()
+
+        XCTAssertEqual(stub.callCount, 1)
+    }
+
+    func test_refresh_rowsQueryCarriesGroupBy_totalsAndProjectsUnchanged() async {
+        let model = makeModel()
+        model.toggleGrouping(.day)
+        model.toggleGrouping(.effort)
+        model.thread = "main"
+
+        await model.refresh()
+
+        XCTAssertEqual(stub.callCount, 1)
+        XCTAssertEqual(
+            stub.calls.first?.queries,
+            [
+                UsageTokenQuery(groupBy: [.day, .model, .thread, .project], sinceMs: Self.tokyoLast7Ms, thread: "main"),
+                UsageTokenQuery(groupBy: [], sinceMs: Self.tokyoLast7Ms, thread: "main"),
+                UsageTokenQuery(groupBy: [.project]),
+            ])
+    }
+
+    func test_refresh_rowKey_isTheFullKeyInGroupByOrder() async {
+        stub.answer { _ in
+            Self.answer(
+                rows: [
+                    Self.row(["2026-03-10", "claude-opus", "high", "main", "/work/app"], input: 2),
+                    Self.row(["2026-03-10", "claude-opus", nil, nil, nil], input: 3, unreported: true),
+                ],
+                totals: [], projects: [])
+        }
+        let model = makeModel()
+        model.toggleGrouping(.day)
+
+        await model.refresh()
+
+        XCTAssertEqual(
+            model.rows.map(\.key),
+            [["2026-03-10", "claude-opus", "high", "main", "/work/app"], ["2026-03-10", "claude-opus", nil, nil, nil]])
+        XCTAssertEqual(model.rows.map(\.isUnreported), [false, true])
+        XCTAssertEqual(model.rows.map(\.tokens.input), [2, 3])
+    }
+
+    func test_rowIDs_rowsDifferingOnlyInThreadOrProject_differ() async {
+        let rows = [
+            Self.row(["m", "high", "main", "/a"]),
+            Self.row(["m", "high", "subagent", "/a"]),
+            Self.row(["m", "high", "main", "/b"]),
+            Self.row(["m", "high", "main", nil]),
+            Self.row(["m", "high", nil, "/a"]),
+            Self.row(["m", "high", nil, nil], unreported: true),
+            Self.row(["m", "high", nil, nil]),
+        ]
+        stub.answer { _ in Self.answer(rows: rows, totals: [], projects: []) }
+        let model = makeModel()
+
+        await model.refresh()
+
+        XCTAssertEqual(model.rows.count, 7)
+        XCTAssertEqual(Set(model.rows.map(\.id)).count, 7, "ids collide: \(model.rows.map(\.id))")
+    }
+
+    func test_rowIDs_rowsDifferingOnlyInDay_differ() async {
+        let rows = [
+            Self.row(["2026-03-09", "m", "high", "main", "/a"]),
+            Self.row(["2026-03-10", "m", "high", "main", "/a"]),
+        ]
+        stub.answer { _ in Self.answer(rows: rows, totals: [], projects: []) }
+        let model = makeModel()
+        model.toggleGrouping(.day)
+
+        await model.refresh()
+
+        XCTAssertEqual(Set(model.rows.map(\.id)).count, 2, "ids collide: \(model.rows.map(\.id))")
+    }
+
+    /// Length-prefixed over every element: a key of one element and a key
+    /// that adds a nil element (another grouping) never share an id, nor
+    /// do keys whose elements join to the same text.
+    func test_rowIDs_acrossGroupings_andAmbiguousJoins_differ() async {
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m", "high"]), Self.row(["m,high"])], totals: [], projects: [])
+        }
+        let model = makeModel()
+        model.toggleGrouping(.thread)
+        model.toggleGrouping(.project)
+        await model.refresh()
+        let twoElementIDs = model.rows.map(\.id)
+        XCTAssertEqual(Set(twoElementIDs).count, 2, "ids collide: \(twoElementIDs)")
+
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m"]), Self.row(["m", nil])], totals: [], projects: [])
+        }
+        model.toggleGrouping(.effort)
+        await model.refresh()
+        let ids = model.rows.map(\.id)
+        XCTAssertEqual(Set(ids).count, 2, "ids collide: \(ids)")
+        XCTAssertTrue(Set(ids).isDisjoint(with: twoElementIDs), "\(ids) vs \(twoElementIDs)")
+    }
+
+    // MARK: - rowsGroupBy (R5e, fixed after review round 1)
+
+    func test_rowsGroupBy_initiallyIsTheDefault() {
+        XCTAssertEqual(makeModel().rowsGroupBy, [.model, .effort, .thread, .project])
+    }
+
+    func test_rowsGroupBy_doesNotFollowAToggle_byItself() {
+        let model = makeModel()
+        model.toggleGrouping(.day)
+        XCTAssertEqual(model.groupBy, [.day, .model, .effort, .thread, .project])
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .thread, .project])
+    }
+
+    func test_rowsGroupBy_andRows_changeTogether_onlyWhenTheReadReturns() async {
+        stub.answer { _ in
+            Self.answer(rows: [Self.row(["m", "high", "main", "/a"])], totals: [], projects: [])
+        }
+        let model = makeModel()
+        await model.refresh()
+        let oldRows = model.rows
+        XCTAssertEqual(oldRows.map(\.key), [["m", "high", "main", "/a"]])
+
+        stub.hold(2)
+        model.toggleGrouping(.day)
+        let refresh = Task { await model.refresh() }
+        await waitForCall(1)
+
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .thread, .project], "the old grouping while reading")
+        XCTAssertEqual(model.rows, oldRows, "the old rows while reading")
+
+        stub.release(
+            1, with: Self.answer(rows: [Self.row(["2026-03-10", "m", "high", "main", "/a"])], totals: [], projects: []))
+        await refresh.value
+
+        XCTAssertEqual(model.rowsGroupBy, [.day, .model, .effort, .thread, .project])
+        XCTAssertEqual(model.rows.map(\.key), [["2026-03-10", "m", "high", "main", "/a"]])
+    }
+
+    func test_rowsGroupBy_andRows_stayAsTheyWere_whenTheReadFails() async {
+        stub.answer { _ in Self.answer(rows: [Self.row(["m", "high", "main", "/a"])], totals: [], projects: []) }
+        let model = makeModel()
+        await model.refresh()
+        let oldRows = model.rows
+
+        model.toggleGrouping(.day)
+        stub.answer { _ in .failure(StubError(message: "The database is locked.")) }
+        await model.refresh()
+
+        XCTAssertEqual(model.errorMessage, "The database is locked.")
+        XCTAssertEqual(model.groupBy, [.day, .model, .effort, .thread, .project])
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .thread, .project])
+        XCTAssertEqual(model.rows, oldRows)
+    }
+
+    func test_rowsGroupBy_staysAsItWas_whenTheResultCountIsWrong() async {
+        let model = makeModel()
+        model.toggleGrouping(.thread)
+        stub.answer { _ in .success([[]]) }
+        await model.refresh()
+
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .thread, .project])
+    }
+
+    func test_rowsGroupBy_ofASupersededRefresh_isDiscarded() async {
+        let model = makeModel()
+        stub.hold(1)
+        model.toggleGrouping(.day)
+        let older = Task { await model.refresh() }
+        await waitForCall(0)
+
+        model.toggleGrouping(.day)
+        model.toggleGrouping(.thread)
+        await model.refresh()
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .project])
+
+        stub.release(0, with: Self.answer(rows: [], totals: [], projects: []))
+        await older.value
+
+        XCTAssertEqual(model.rowsGroupBy, [.model, .effort, .project])
     }
 }
