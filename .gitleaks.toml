@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+# Synthetic test token (0123456789abcdef x4) in CalyxMCPServerUsageIngestRouteTests.
+# Matches the captured secret only, so real keys in the same file are still flagged.
+[[allowlists]]
+description = "Placeholder hex token used as a test fixture"
+regexTarget = "secret"
+regexes = ['''^(?:0123456789abcdef){4}$''']
