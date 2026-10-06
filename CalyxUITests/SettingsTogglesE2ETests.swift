@@ -282,33 +282,56 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
         )
     }
 
-    /// Pins the Agents pane's "Agent Hook Approval" toggle (its own
-    /// heading + wrapping subtitle pushed this pane to be the tallest of
-    /// all Settings panes) as actually reachable and operable, not merely
-    /// present in the AX tree: SettingsPaneContentViewController sizes
-    /// the Settings window to each pane's `view.fittingSize.height` with
-    /// no scroll view (see SettingsWindowController.swift), so a pane
-    /// taller than the screen clips its own trailing content below the
-    /// window's bottom edge with no way to reach it.
+    /// Scrolls the Settings window's pane scroll view down until
+    /// `element` is hittable and its frame lies inside the scroll view's
+    /// visible frame, giving up after a bounded number of steps. Returns
+    /// whether the element ended up fully inside the scroll view.
+    /// Panes taller than SettingsLayout.maxPaneContentHeight stop there and
+    /// scroll inside their scroll view, so trailing rows start below the fold.
+    @discardableResult
+    private func scrollSettingsPane(toReveal element: XCUIElement) -> Bool {
+        // The scroll view that contains `element`, so the terminal window
+        // these tests also open is never the one scrolled.
+        let scrollView = app.scrollViews.containing(.any, identifier: element.identifier).firstMatch
+        guard waitFor(scrollView, timeout: 5) else {
+            XCTFail("No scroll view contains \(element.identifier).")
+            return false
+        }
+        func revealed() -> Bool {
+            element.isHittable && scrollView.frame.contains(element.frame)
+        }
+        var attempts = 0
+        while !revealed() && attempts < 10 {
+            scrollView.scroll(byDeltaX: 0, deltaY: -200)
+            attempts += 1
+        }
+        return revealed()
+    }
+
+    /// Pins the Agents pane's "Agent Hook Approval" toggle as actually
+    /// reachable and operable, not merely present in the AX tree. The
+    /// Agents pane is the tallest Settings pane: its content is taller
+    /// than SettingsLayout.maxPaneContentHeight, so the window stops at
+    /// that height and the toggle is reached by scrolling the pane's
+    /// scroll view (see SettingsPaneContentViewController).
     func test_agentHookApprovalSwitch_isReachableAndTogglesOnAgentsPane() {
         waitForMenuBarAndWindow()
         openSettingsPane("Agents")
 
         let toggleElement = toggle(identifier: "calyx.settings.sessions.agentHookApprovalSwitch")
         XCTAssertTrue(waitFor(toggleElement, timeout: 5), "agentHookApproval switch not found on Agents pane.")
-        // The bug: the switch exists in the AX tree but is clipped below the
-        // window with no scroll view, so it is not hittable / cannot be clicked.
-        XCTAssertTrue(toggleElement.isHittable, "agentHookApproval switch is present but not hittable — it is clipped outside the Settings window (no scroll).")
+        XCTAssertTrue(scrollSettingsPane(toReveal: toggleElement), "agentHookApproval switch never scrolled fully inside the Agents pane's scroll view.")
+        XCTAssertTrue(toggleElement.isHittable, "agentHookApproval switch is present but not hittable even after scrolling the Agents pane.")
         let before = toggleElement.value as? Int
         toggleElement.click()
         XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
     }
 
     /// Pins the Agents pane's "Usage Tracking" toggle, the last row of
-    /// the tallest Settings pane, as reachable and operable in the same
-    /// way as the "Agent Hook Approval" toggle above it: a row below the
-    /// window's bottom edge would exist in the AX tree and still be
-    /// unusable.
+    /// the tallest Settings pane, as reachable by scrolling and operable
+    /// in the same way as the "Agent Hook Approval" toggle above it: a row
+    /// that could not be scrolled into view would exist in the AX tree and
+    /// still be unusable.
     ///
     /// The click turns the setting on only in this test's own defaults
     /// suite (`CALYX_UITEST_DEFAULTS_SUITE`), and the app was launched
@@ -321,7 +344,8 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
 
         let toggleElement = toggle(identifier: "calyx.settings.agents.usageTrackingSwitch")
         XCTAssertTrue(waitFor(toggleElement, timeout: 5), "usageTracking switch not found on Agents pane.")
-        XCTAssertTrue(toggleElement.isHittable, "usageTracking switch is present but not hittable — it is clipped outside the Settings window (no scroll).")
+        XCTAssertTrue(scrollSettingsPane(toReveal: toggleElement), "usageTracking switch never scrolled fully inside the Agents pane's scroll view.")
+        XCTAssertTrue(toggleElement.isHittable, "usageTracking switch is present but not hittable even after scrolling the Agents pane.")
         let before = toggleElement.value as? Int
         toggleElement.click()
         XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
