@@ -170,6 +170,98 @@ final class TabReorderUITests: CalyxUITestCase {
         )
     }
 
+    // MARK: - Sidebar Cross-Group Drag
+
+    /// Group header elements sorted top-to-bottom by frame.
+    private func groupHeadersByPosition() -> [XCUIElement] {
+        groupHeadersQuery().allElementsBoundByIndex.sorted { $0.frame.minY < $1.frame.minY }
+    }
+
+    func test_dragSidebarTab_intoAnotherGroup_movesRowUnderThatGroup() {
+        // Arrange: group 1 gets 2 tabs, then a second group (1 tab) is
+        // created. Group 1 keeps a tab after the move, so both headers stay.
+        createTabs(count: 1)
+        createGroupViaCommandPalette(expectingGroupCount: 2)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let headers = groupHeadersByPosition()
+        XCTAssertEqual(headers.count, 2, "Should have 2 group headers")
+        guard headers.count == 2 else { return }
+        let upperHeaderID = headers[0].identifier
+        let lowerHeaderID = headers[1].identifier
+        let upperMinY = headers[0].frame.minY
+        let lowerMinY = headers[1].frame.minY
+
+        let rowsBefore = sidebarTabsByPosition()
+        XCTAssertEqual(rowsBefore.count, 3, "Should have 3 sidebar rows before the drag")
+        guard let source = rowsBefore.first(where: {
+            $0.frame.minY > upperMinY && $0.frame.minY < lowerMinY
+        }) else {
+            return XCTFail("A row of the upper group should sit between the two headers")
+        }
+        let sourceID = source.identifier
+
+        // Act: drop the row onto the lower group's (expanded) header,
+        // pressing/dropping on the header's left part (away from the
+        // collapse chevron / close glyph). See
+        // test_dragTabBarTab_reordersCorrectly for why `click(forDuration:
+        // thenDragTo:)`.
+        let start = source.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+        let end = headers[1].coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+        start.click(forDuration: 0.2, thenDragTo: end)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        // Assert: same row count; the moved row now sits below the lower
+        // group's header, which is still below the upper group's header.
+        XCTAssertEqual(waitForCount({ self.sidebarTabsByPosition().count }, toEqual: 3), 3,
+                       "Moving a tab between groups must not add or remove rows")
+        let headersAfter = groupHeadersByPosition()
+        XCTAssertEqual(headersAfter.map(\.identifier), [upperHeaderID, lowerHeaderID],
+                       "Both groups should remain, in the same order")
+        guard headersAfter.count == 2 else { return }
+        guard let moved = sidebarTabsByPosition().first(where: { $0.identifier == sourceID }) else {
+            return XCTFail("The dragged row should still exist")
+        }
+        XCTAssertGreaterThan(
+            moved.frame.minY, headersAfter[1].frame.minY,
+            "The dragged row should now be listed under the other group's header"
+        )
+        let rowsUnderLower = sidebarTabsByPosition().filter { $0.frame.minY > headersAfter[1].frame.minY }
+        XCTAssertEqual(rowsUnderLower.count, 2, "The other group should now hold 2 rows")
+    }
+
+    func test_dragGroupHeader_pastAnotherGroup_swapsHeaderOrder() {
+        // Arrange: two groups, one tab each.
+        createGroupViaCommandPalette(expectingGroupCount: 2)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let headers = groupHeadersByPosition()
+        XCTAssertEqual(headers.count, 2, "Should have 2 group headers")
+        guard headers.count == 2 else { return }
+        let upperID = headers[0].identifier
+        let lowerID = headers[1].identifier
+
+        guard let lastRow = sidebarTabsByPosition().last else {
+            return XCTFail("The lower group's row should exist")
+        }
+
+        // Act: drag the upper header (from its left part) down to one row
+        // height BELOW the lower group's last row (still inside the
+        // sidebar). That point is below the lower group's whole section,
+        // so its section midpoint is above the dragged header's midpoint
+        // whatever the group's row count, which resolves to the last index.
+        let start = headers[0].coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+        let end = lastRow.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 2.0))
+        start.click(forDuration: 0.2, thenDragTo: end)
+        Thread.sleep(forTimeInterval: 1.0)
+
+        // Assert: the headers' top-to-bottom order is swapped.
+        XCTAssertEqual(
+            groupHeadersByPosition().map(\.identifier), [lowerID, upperID],
+            "After dragging the upper group past the lower one, their headers should swap order"
+        )
+    }
+
     // MARK: - Tap After Drag
 
     func test_tapStillWorksAfterDrag() {

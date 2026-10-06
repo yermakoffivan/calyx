@@ -156,6 +156,55 @@ class WindowSession: Identifiable {
         return .windowShouldClose
     }
 
+    // MARK: - Moving Groups and Tabs
+
+    /// Moves the group at `fromIndex` so it ends up at `toIndex` (its final
+    /// position, as in `TabGroup.moveTab(fromIndex:toIndex:)`). A no-op if
+    /// either index is out of range or they are equal. `activeGroupID` is
+    /// ID-based, so the selection follows the group without being touched.
+    func moveGroup(fromIndex: Int, toIndex: Int) {
+        guard fromIndex != toIndex,
+              groups.indices.contains(fromIndex),
+              groups.indices.contains(toIndex) else { return }
+
+        let group = groups.remove(at: fromIndex)
+        groups.insert(group, at: toIndex)
+    }
+
+    /// Moves the tab `tabID` into the group `destGroupID` at `index`
+    /// (clamped by `TabGroup.insertTab(_:at:)`). Returns `false`, changing
+    /// nothing, if the tab or the destination is unknown or the tab is
+    /// already in that group.
+    ///
+    /// The displayed tab (active tab of the active group) stays displayed:
+    /// the destination becomes the active group with it selected. Any other
+    /// tab moves without changing either group's selection. A source group
+    /// left empty is removed, as when its last tab is closed.
+    ///
+    /// The source is emptied with `TabGroup.removeTab(id:)`, not
+    /// `removeTab(id:fromGroup:)`, which would also remove the empty group
+    /// and move `activeGroupID` before the tab has arrived anywhere. The
+    /// selection is moved BEFORE `removeGroup(id:)`, so that call takes its
+    /// "removed a non-active group" branch and leaves `activeGroupID` alone.
+    @discardableResult
+    func moveTab(id tabID: UUID, toGroup destGroupID: UUID, at index: Int) -> Bool {
+        guard let (tab, source) = groups.tabAndGroup(tabID: tabID),
+              let dest = groups.first(where: { $0.id == destGroupID }),
+              source.id != dest.id else { return false }
+
+        let wasDisplayed = source.id == activeGroupID && source.activeTabID == tabID
+        source.removeTab(id: tabID)
+        dest.insertTab(tab, at: index)
+        if wasDisplayed {
+            dest.activeTabID = tabID
+            activeGroupID = dest.id
+        }
+        if source.tabs.isEmpty {
+            removeGroup(id: source.id)
+        }
+        return true
+    }
+
     // MARK: - Git Sections
 
     /// The Changes state of the section identified by `repoID`.

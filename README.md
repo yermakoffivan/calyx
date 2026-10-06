@@ -79,7 +79,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 ### Terminal workspace
 
 - **libghostty Engine** -- Metal GPU-accelerated rendering powered by Ghostty v1.3.1
-- **Tab Groups and Split Panes** -- color-coded collapsible groups, tab renaming and reordering, horizontal and vertical splits, directional focus, and split zoom
+- **Tab Groups and Split Panes** -- color-coded collapsible groups, tab renaming and reordering, group reordering and moving tabs between groups by dragging in the sidebar, horizontal and vertical splits, directional focus, and split zoom
 - **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, rename it, or open Mission Map with **Show All Tabs**, without switching to it
 - **Group Context Menu** -- right-click or Ctrl+click a group header in the sidebar to close it, close the other groups or the groups below it, rename it, or pick its color, without switching to it
 - **Command Palette** -- search and run operations with `Cmd+Shift+P`

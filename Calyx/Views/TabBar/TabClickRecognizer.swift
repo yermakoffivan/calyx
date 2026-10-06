@@ -75,6 +75,17 @@
 //   `mouseDown(with:)` is a no-op, and that layer can intercept
 //   clicks before they reach our `ClickContainerNSView`. Doing the
 //   reorder drag in AppKit eliminates that compositing layer entirely.
+// - Cancel path: AppKit delivers the drag's mouseDragged/mouseUp to the
+//   view instance that received the mouseDown. If that instance leaves
+//   its window mid-drag (e.g. the hosting SwiftUI row is torn down by a
+//   model change), the mouseUp never reaches it, `onDragEnded` never
+//   fires, and the caller's drag state (offset row, frozen layout) would
+//   stay live indefinitely. `viewWillMove(toWindow: nil)` therefore
+//   clears the press/drag state and calls `onDragCancelled` instead, so
+//   the caller can reset without performing a drop. It never calls
+//   `onDragEnded`: a drop resolved against a view that is going away
+//   would act on a stale layout. A press that never crossed the drag
+//   threshold has nothing to cancel and is left alone.
 //
 // Generics:
 // - Swift NSObject subclasses cannot be generic. The container NSView
@@ -111,6 +122,7 @@ struct TabClickContainer<Content: View>: NSViewRepresentable {
     let trailingActions: [TrailingAction]
     let onDragChanged: ((CGSize) -> Void)?
     let onDragEnded: (() -> Void)?
+    let onDragCancelled: (() -> Void)?
     let contextMenu: (() -> NSMenu?)?
     let content: Content
 
@@ -125,6 +137,7 @@ struct TabClickContainer<Content: View>: NSViewRepresentable {
         trailingActions: [TrailingAction] = [],
         onDragChanged: ((CGSize) -> Void)? = nil,
         onDragEnded: (() -> Void)? = nil,
+        onDragCancelled: (() -> Void)? = nil,
         contextMenu: (() -> NSMenu?)? = nil,
         @ViewBuilder content: () -> Content
     ) {
@@ -138,6 +151,7 @@ struct TabClickContainer<Content: View>: NSViewRepresentable {
         self.trailingActions = trailingActions
         self.onDragChanged = onDragChanged
         self.onDragEnded = onDragEnded
+        self.onDragCancelled = onDragCancelled
         self.contextMenu = contextMenu
         self.content = content()
     }
@@ -163,6 +177,7 @@ struct TabClickContainer<Content: View>: NSViewRepresentable {
         view.trailingActions = trailingActions
         view.onDragChanged = onDragChanged
         view.onDragEnded = onDragEnded
+        view.onDragCancelled = onDragCancelled
         view.contextMenuProvider = contextMenu
         view.isEnabled = isEnabled
         return view
@@ -183,6 +198,7 @@ struct TabClickContainer<Content: View>: NSViewRepresentable {
         nsView.trailingActions = trailingActions
         nsView.onDragChanged = onDragChanged
         nsView.onDragEnded = onDragEnded
+        nsView.onDragCancelled = onDragCancelled
         nsView.contextMenuProvider = contextMenu
         nsView.isEnabled = isEnabled
     }
@@ -204,6 +220,9 @@ final class ClickContainerNSView: NSView {
     var onClose: (() -> Void)?
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: (() -> Void)?
+    /// Called instead of `onDragEnded` when the view leaves its window
+    /// mid-drag. See "Cancel path" in the header comment.
+    var onDragCancelled: (() -> Void)?
     var contextMenuProvider: (() -> NSMenu?)?
     var isEnabled: Bool = true
 
@@ -455,5 +474,19 @@ final class ClickContainerNSView: NSView {
         }
 
         super.mouseUp(with: event)
+    }
+
+    /// Cancels an in-flight drag when the view is removed from its window:
+    /// the mouseUp that would end it can no longer arrive (see "Cancel
+    /// path" in the header comment). State is cleared before the callback,
+    /// as in `mouseUp`, so a re-entrant update or a stray later mouseUp
+    /// sees no drag and cannot end it a second time.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        guard newWindow == nil, isDragging, pressTargetsTabBody else { return }
+        mouseDownLocationInWindow = nil
+        isDragging = false
+        pressTargetsTabBody = false
+        onDragCancelled?()
     }
 }

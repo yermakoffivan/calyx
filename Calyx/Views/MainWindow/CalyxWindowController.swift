@@ -1450,6 +1450,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self.refreshHostingView()
                 self.requestSave()
             },
+            onMoveTabToGroup: { [weak self] tabID, groupID, index in
+                self?.moveTab(id: tabID, toGroup: groupID, at: index)
+            },
+            onMoveGroup: { [weak self] groupID, toIndex in
+                self?.moveGroup(id: groupID, toIndex: toIndex)
+            },
             paneTitle: { SurfacePropertyStore.shared.title(for: $0) },
             paneCwd: { SurfacePropertyStore.shared.cwd(for: $0) },
             onSidebarDragCommitted: { [weak self] in self?.requestSave() },
@@ -1495,6 +1501,29 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             totalReviewCommentCount: totalReviewCommentCount,
             reviewFileCount: reviewFileCount
         )
+    }
+
+    /// Moves `tabID` into the group `groupID` at `index` (the sidebar's
+    /// cross-group drag). A tab already being closed is not moved. Not
+    /// `private`: test access (`CalyxWindowControllerMoveTabToGroupTests`).
+    ///
+    /// Deliberately no `deactivateCurrentTab()` / `activateCurrentTab()`:
+    /// if the moved tab is the displayed one, the model keeps it displayed
+    /// as the same `Tab` object, so its surfaces stay mounted and focused.
+    func moveTab(id tabID: UUID, toGroup groupID: UUID, at index: Int) {
+        guard !closingTabIDs.contains(tabID) else { return }
+        guard windowSession.moveTab(id: tabID, toGroup: groupID, at: index) else { return }
+        refreshHostingView()
+        requestSave()
+    }
+
+    /// Moves the group `groupID` to `toIndex` (its final position). Not
+    /// `private`: test access (`CalyxWindowControllerMoveTabToGroupTests`).
+    func moveGroup(id groupID: UUID, toIndex: Int) {
+        guard let fromIndex = windowSession.groups.firstIndex(where: { $0.id == groupID }) else { return }
+        windowSession.moveGroup(fromIndex: fromIndex, toIndex: toIndex)
+        refreshHostingView()
+        requestSave()
     }
 
     private func refreshHostingView() {
