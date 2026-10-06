@@ -35,12 +35,34 @@ struct SidebarContentView: View {
     var onRetryGitRepoSection: ((String) -> Void)?
     var onSelectRefFilter: ((String, GitRefSelection) -> Void)?
     var onMoveTab: ((UUID, Int, Int) -> Void)?
+    var onMoveTabToGroup: ((UUID, UUID, Int) -> Void)?
+    var onMoveGroup: ((UUID, Int) -> Void)?
     var paneTitle: (UUID) -> String?
     var paneCwd: (UUID) -> String?
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.controlActiveState) private var controlActiveState
     @Namespace private var togglePillNS
+    @State private var dragState = SidebarDragState()
+
+    /// The order and membership a drag's frozen layout depends on.
+    private struct GroupStructure: Equatable {
+        let id: UUID
+        let tabIDs: [UUID]
+        let isCollapsed: Bool
+    }
+
+    private var groupStructure: [GroupStructure] {
+        groups.map { GroupStructure(id: $0.id, tabIDs: $0.tabs.map(\.id), isCollapsed: $0.isCollapsed) }
+    }
+
+    private func currentLayout() -> SidebarLayoutSnapshot? {
+        SidebarLayoutSnapshot(
+            groups: groups,
+            tabFrames: dragState.measuredTabFrames,
+            headerFrames: dragState.measuredHeaderFrames
+        )
+    }
 
     @ViewBuilder
     private var togglePill: some View {
@@ -178,14 +200,48 @@ struct SidebarContentView: View {
                                 onCloseOtherGroups: onCloseOtherGroups,
                                 onCloseGroupsBelow: onCloseGroupsBelow,
                                 onGroupColorChanged: onGroupColorChanged,
-                                onMoveTab: onMoveTab
+                                onMoveTab: onMoveTab,
+                                onMoveTabToGroup: onMoveTabToGroup,
+                                onMoveGroup: onMoveGroup,
+                                dragState: dragState,
+                                currentLayout: currentLayout
                             )
+                            // The per-tick drag reads live in this
+                            // modifier, not here, so a mouse-move
+                            // re-evaluates one group's lift, not the
+                            // whole sidebar body.
+                            .modifier(SidebarGroupDragLiftModifier(
+                                dragState: dragState,
+                                groupID: group.id,
+                                tabIDs: group.tabs.map(\.id)
+                            ))
                         }
+                    }
+                    // Every row and header frame is measured in this one
+                    // space, so frames from different groups compare
+                    // directly when a drag crosses group boundaries.
+                    .coordinateSpace(.named(SidebarDragState.coordinateSpaceName))
+                    .onPreferenceChange(SidebarTabFramePreferenceKey.self) { frames in
+                        dragState.measuredTabFrames = frames
+                    }
+                    .onPreferenceChange(SidebarGroupHeaderFramePreferenceKey.self) { frames in
+                        dragState.measuredHeaderFrames = frames
+                    }
+                    // Attached to the content (not the `ScrollView`) so the
+                    // overlay shares the measuring coordinate space and
+                    // scrolls with the rows; outside the `ScrollView` the
+                    // indicator would be off by the scroll offset.
+                    .overlay(alignment: .topLeading) {
+                        SidebarDropIndicatorView(dragState: dragState)
+                            .allowsHitTesting(false)
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                 }
                 .padding(.top, 10)
+                .onChange(of: groupStructure) { _, _ in
+                    dragState.reset()
+                }
 
                 Rectangle()
                     .fill(Color.white.opacity(reduceTransparency ? 0.14 : 0.10))
@@ -298,10 +354,65 @@ private struct GroupSectionView: View {
     var onCloseGroupsBelow: ((UUID) -> Void)?
     var onGroupColorChanged: (() -> Void)?
     var onMoveTab: ((UUID, Int, Int) -> Void)?
+    var onMoveTabToGroup: ((UUID, UUID, Int) -> Void)?
+    var onMoveGroup: ((UUID, Int) -> Void)?
+    let dragState: SidebarDragState
+    let currentLayout: () -> SidebarLayoutSnapshot?
 
     @State private var isEditing = false
     @State private var isHoveringHeader = false
-    @State private var reorderState = TabReorderState()
+
+    /// Whether a row can be dropped elsewhere in this group: there is
+    /// another slot and the move is wired.
+    private var canDropTabWithinGroup: Bool {
+        group.tabs.count > 1 && onMoveTab != nil
+    }
+
+    /// Whether a row can be dropped into another group: one exists and the
+    /// move is wired.
+    private var canDropTabAcrossGroups: Bool {
+        groupCount > 1 && onMoveTabToGroup != nil
+    }
+
+    /// A row can be dragged when either route is open. The drag state is
+    /// handed the same two flags, so it never resolves a target on a route
+    /// that would then do nothing on drop.
+    private var canDragTab: Bool {
+        canDropTabWithinGroup || canDropTabAcrossGroups
+    }
+
+    private var canDragGroup: Bool {
+        groupCount > 1 && onMoveGroup != nil
+    }
+
+    /// Ends the drag and performs its move. The model is mutated only here,
+    /// never mid-drag: a moved row's NSView would be re-created under
+    /// another `ForEach`, losing AppKit's mouse capture so the mouseUp
+    /// that ends the drag would never arrive.
+    private func endDrag() {
+        let outcome = withAnimation(.easeOut(duration: 0.15)) {
+            dragState.endDrag()
+        }
+        switch outcome {
+        case .moveTabWithinGroup(let groupID, let fromIndex, let toIndex):
+            onMoveTab?(groupID, fromIndex, toIndex)
+        case .moveTabToGroup(let tabID, let groupID, let index):
+            onMoveTabToGroup?(tabID, groupID, index)
+        case .moveGroup(let groupID, let toIndex):
+            onMoveGroup?(groupID, toIndex)
+        case nil:
+            break
+        }
+    }
+
+    /// Resets a drag whose row or header left the window before its mouseUp
+    /// (see "Cancel path" in `TabClickRecognizer.swift`). Nothing is moved;
+    /// the dragged view springs back as at the end of a drag.
+    private func cancelDrag() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            dragState.reset()
+        }
+    }
 
     private func toggleCollapse() {
         withAnimation(.easeInOut(duration: 0.15)) {
@@ -346,6 +457,16 @@ private struct GroupSectionView: View {
                         toggleCollapse()
                     },
                 ],
+                onDragChanged: { translation in
+                    guard canDragGroup else { return }
+                    dragState.updateGroupDrag(
+                        groupID: group.id,
+                        translation: translation.height,
+                        currentLayout: currentLayout
+                    )
+                },
+                onDragEnded: { endDrag() },
+                onDragCancelled: { cancelDrag() },
                 contextMenu: {
                     GroupContextMenu.make(
                         groupIndex: groupIndex,
@@ -447,6 +568,14 @@ private struct GroupSectionView: View {
                     reduceTransparency: reduceTransparency
                 ))
             }
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: SidebarGroupHeaderFramePreferenceKey.self,
+                        value: [group.id: geo.frame(in: .named(SidebarDragState.coordinateSpaceName))]
+                    )
+                }
+            )
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
             // The group-name `Text` lives inside the header's
@@ -474,45 +603,35 @@ private struct GroupSectionView: View {
                             onShowAllTabs: onShowAllTabs,
                             onTabRenamed: onTabRenamed,
                             onDragChanged: { translation in
-                                // Tab reorder: equivalent to the former
+                                // Tab drag: equivalent to the former
                                 // SwiftUI `DragGesture.onChanged`, but
                                 // driven by `ClickContainerNSView` so no
                                 // `PlatformGroupContainer` compositing
                                 // layer is created on top of the row.
-                                guard group.tabs.count > 1, onMoveTab != nil else { return }
-                                if reorderState.draggedTabID == nil {
-                                    reorderState.draggedTabID = tab.id
-                                    reorderState.draggedTabIndex = index
-                                }
-                                reorderState.dragOffset = translation.height
-                                if let frame = reorderState.tabFrames[tab.id] {
-                                    let midpoint = frame.midY + translation.height
-                                    reorderState.updateInsertionSlot(dragMidpoint: midpoint, axis: .vertical)
-                                }
+                                guard canDragTab else { return }
+                                dragState.updateTabDrag(
+                                    tabID: tab.id,
+                                    translation: translation.height,
+                                    allowsWithinGroup: canDropTabWithinGroup,
+                                    allowsCrossGroup: canDropTabAcrossGroups,
+                                    currentLayout: currentLayout
+                                )
                             },
-                            onDragEnded: {
-                                let moveFrom = reorderState.draggedTabIndex
-                                let moveTo = moveFrom.flatMap { reorderState.destinationIndex(fromIndex: $0, tabCount: group.tabs.count) }
-                                withAnimation(.easeOut(duration: 0.15)) {
-                                    reorderState.reset()
-                                }
-                                if let from = moveFrom, let to = moveTo {
-                                    onMoveTab?(group.id, from, to)
-                                }
-                            }
+                            onDragEnded: { endDrag() },
+                            onDragCancelled: { cancelDrag() }
                         )
                         .background(
                             GeometryReader { geo in
                                 Color.clear.preference(
-                                    key: TabFramePreferenceKey.self,
-                                    value: [tab.id: geo.frame(in: .named("sidebarGroup-\(group.id.uuidString)"))]
+                                    key: SidebarTabFramePreferenceKey.self,
+                                    value: [tab.id: geo.frame(in: .named(SidebarDragState.coordinateSpaceName))]
                                 )
                             }
                         )
-                        .offset(y: reorderState.draggedTabID == tab.id ? reorderState.dragOffset : 0)
-                        .zIndex(reorderState.draggedTabID == tab.id ? 1 : 0)
-                        .scaleEffect(reorderState.draggedTabID == tab.id ? 1.03 : 1.0)
-                        .shadow(color: .black.opacity(reorderState.draggedTabID == tab.id ? 0.15 : 0), radius: 8)
+                        .offset(y: dragState.item == .tab(tab.id) ? dragState.dragOffset : 0)
+                        .zIndex(dragState.item == .tab(tab.id) ? 1 : 0)
+                        .scaleEffect(dragState.item == .tab(tab.id) ? 1.03 : 1.0)
+                        .shadow(color: .black.opacity(dragState.item == .tab(tab.id) ? 0.15 : 0), radius: 8)
                         // NOTE: `.gesture(tabDragGesture(...))` was removed
                         // here. Drag tracking now happens inside
                         // `ClickContainerNSView` via `mouseDragged` /
@@ -521,22 +640,9 @@ private struct GroupSectionView: View {
                         .accessibilityValue(AccessibilityID.Sidebar.tabAtIndex(group.id, index))
                     }
                 }
-                .coordinateSpace(name: "sidebarGroup-\(group.id.uuidString)")
-                .onPreferenceChange(TabFramePreferenceKey.self) { frames in
-                    reorderState.tabFrames = frames
-                }
-                .overlay {
-                    if let slot = reorderState.insertionSlot,
-                       reorderState.draggedTabID != nil {
-                        insertionIndicator(slot: slot)
-                    }
-                }
             }
         }
         .padding(.bottom, 4)
-        .onChange(of: group.tabs.map(\.id)) { _, _ in
-            reorderState.reset()
-        }
     }
 
     private func subduedDotColor(_ nsColor: NSColor) -> Color {
@@ -545,29 +651,59 @@ private struct GroupSectionView: View {
         converted.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
         return Color(hue: Double(h), saturation: Double(s * 0.7), brightness: Double(b * 0.9), opacity: Double(a))
     }
+}
 
-    // MARK: - Insertion Indicator
+/// Applies a group section's drag offset and z-order. Reading the drag
+/// state here (not in `SidebarContentView.body`) scopes the per-tick
+/// invalidation to this modifier. The modifiers are always applied with
+/// conditional values, never conditionally, so the section (and the
+/// `TabClickContainer`s inside it) keeps its identity mid-drag.
+private struct SidebarGroupDragLiftModifier: ViewModifier {
+    let dragState: SidebarDragState
+    let groupID: UUID
+    let tabIDs: [UUID]
 
-    private func insertionIndicator(slot: Int) -> some View {
-        GeometryReader { geo in
-            let sortedFrames = reorderState.tabFrames.values.sorted { $0.minY < $1.minY }
-            let yPos: CGFloat = {
-                if slot == 0 {
-                    return sortedFrames.first?.minY ?? 0
-                } else if slot >= sortedFrames.count {
-                    return sortedFrames.last?.maxY ?? geo.size.height
-                } else {
-                    let prev = sortedFrames[slot - 1]
-                    let next = sortedFrames[slot]
-                    return (prev.maxY + next.minY) / 2
-                }
-            }()
+    /// Whether this group is, or contains, the item being dragged.
+    private var isDraggingInGroup: Bool {
+        switch dragState.item {
+        case .group(let id): id == groupID
+        case .tab(let id): tabIDs.contains(id)
+        case nil: false
+        }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .offset(y: dragState.item == .group(groupID) ? dragState.dragOffset : 0)
+            // Lifts the dragged group, or the group of the dragged row,
+            // above its siblings so the moving view is not drawn under a
+            // later group.
+            .zIndex(isDraggingInGroup ? 1 : 0)
+    }
+}
+
+/// Draws a `SidebarDropIndicator` at its content-space frame.
+/// Reads `dropIndicator` in its own body so a drag tick re-renders only
+/// the indicator, not the sidebar that hosts it.
+private struct SidebarDropIndicatorView: View {
+    let dragState: SidebarDragState
+
+    var body: some View {
+        switch dragState.dropIndicator {
+        case .line(let frame):
             RoundedRectangle(cornerRadius: 1)
                 .fill(Color.accentColor.opacity(0.8))
-                .frame(width: geo.size.width - 28, height: 2)
-                .position(x: geo.size.width / 2, y: yPos)
+                .frame(width: frame.width, height: frame.height)
+                .position(x: frame.midX, y: frame.midY)
+        case .header(let frame):
+            // Same shape as `GroupHeaderBackgroundModifier`'s background.
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 2)
+                .frame(width: frame.width, height: frame.height)
+                .position(x: frame.midX, y: frame.midY)
+        case nil:
+            EmptyView()
         }
-        .allowsHitTesting(false)
     }
 }
 
@@ -614,6 +750,7 @@ private struct TabRowItemView: View {
     var onTabRenamed: (() -> Void)?
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: (() -> Void)?
+    var onDragCancelled: (() -> Void)?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var isEditing = false
     @State private var isHovering = false
@@ -662,6 +799,9 @@ private struct TabRowItemView: View {
             },
             onDragEnded: {
                 onDragEnded?()
+            },
+            onDragCancelled: {
+                onDragCancelled?()
             },
             contextMenu: {
                 TabContextMenu.make(

@@ -41,6 +41,16 @@ class TabGroup: Identifiable {
         }
     }
 
+    /// Inserts `tab` at `index`, clamped to `0...tabs.count`. Like
+    /// `addTab(_:)`, it becomes the active tab only when the group has
+    /// none.
+    func insertTab(_ tab: Tab, at index: Int) {
+        tabs.insert(tab, at: min(max(index, 0), tabs.count))
+        if activeTabID == nil {
+            activeTabID = tab.id
+        }
+    }
+
     func removeTab(id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
 

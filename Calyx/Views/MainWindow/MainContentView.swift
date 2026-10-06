@@ -53,6 +53,8 @@ struct MainContentView: View {
     var onCloseGroupsBelow: ((UUID) -> Void)?
     var onGroupColorChanged: (() -> Void)?
     var onMoveTab: ((UUID, Int, Int) -> Void)?  // (groupID, fromIndex, toIndex)
+    var onMoveTabToGroup: ((UUID, UUID, Int) -> Void)?  // (tabID, destGroupID, index)
+    var onMoveGroup: ((UUID, Int) -> Void)?  // (groupID, toIndex)
     var paneTitle: (UUID) -> String?
     var paneCwd: (UUID) -> String?
     var onSidebarDragCommitted: (() -> Void)?
@@ -182,6 +184,8 @@ struct MainContentView: View {
                             onRetryGitRepoSection: onRetryGitRepoSection,
                             onSelectRefFilter: onSelectRefFilter,
                             onMoveTab: onMoveTab,
+                            onMoveTabToGroup: onMoveTabToGroup,
+                            onMoveGroup: onMoveGroup,
                             paneTitle: paneTitle,
                             paneCwd: paneCwd
                         )
