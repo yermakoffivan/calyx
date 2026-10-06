@@ -38,6 +38,15 @@ final class MissionMapPopoverUITests: CalyxUITestCase {
 
         // Let the glass settle before capturing.
         Thread.sleep(forTimeInterval: 1)
+
+        // The popover must keep MissionMapPopoverPlacement.defaultEdgeInset
+        // (8 pt) from the map's left edge, never flush against it.
+        let popoverFrame = popover.frame
+        let containerFrame = container.frame
+        XCTAssertGreaterThanOrEqual(
+            popoverFrame.minX - containerFrame.minX, 8 - 0.5,
+            "Popover should be at least 8 pt in from the Mission Map's left edge; popover \(popoverFrame), container \(containerFrame)"
+        )
         let pngData = XCUIScreen.main.screenshot().pngRepresentation
         let window = app.windows.firstMatch
         print("[fixture] window frame: \(window.frame)")

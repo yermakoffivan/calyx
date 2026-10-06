@@ -6,10 +6,11 @@
 // left and right (the bubble's near edge `gap` from the anchor, centered
 // on it along the other axis), then the diagonals top-left, top-right,
 // bottom-left and bottom-right (the bubble's near corner `gap` from the
-// anchor on both axes). Each candidate is first translated into `bounds`,
-// then scored by how much of the obstacles (cards, band headers) it
-// covers; the lowest score wins, a tie going to the earlier candidate.
-// Pure geometry.
+// anchor on both axes). Each candidate is first translated into
+// `bounds`, kept `edgeInset` from its edges where there is room (less,
+// split evenly, where there is not), then scored by how much of the
+// obstacles (cards, band headers) it covers; the lowest score wins, a
+// tie going to the earlier candidate. Pure geometry.
 
 import CoreGraphics
 import Foundation
@@ -18,10 +19,21 @@ enum MissionMapPopoverPlacement {
     /// The default distance between the anchor and the bubble.
     static let defaultGap: CGFloat = 8
 
+    /// The default distance kept between the bubble and the edges of
+    /// `bounds`.
+    static let defaultEdgeInset: CGFloat = 8
+
     /// The rect, `extent` in size and inside `bounds`, that covers the
-    /// least of `obstacles` among the candidates around `anchor`.
+    /// least of `obstacles` among the candidates around `anchor`, kept
+    /// `edgeInset` (0 if negative) from the edges of `bounds` where it
+    /// fits.
     static func place(
-        extent: CGSize, anchor: CGPoint, gap: CGFloat = defaultGap, obstacles: [CGRect], bounds: CGRect
+        extent: CGSize,
+        anchor: CGPoint,
+        gap: CGFloat = defaultGap,
+        edgeInset: CGFloat = defaultEdgeInset,
+        obstacles: [CGRect],
+        bounds: CGRect
     ) -> CGRect {
         let width = extent.width
         let height = extent.height
@@ -42,7 +54,9 @@ enum MissionMapPopoverPlacement {
             CGPoint(x: rightX, y: belowY),
         ]
 
-        let candidates = origins.map { clamp(CGRect(origin: $0, size: extent), into: bounds) }
+        let candidates = origins.map { origin in
+            clamp(CGRect(origin: origin, size: extent), into: bounds, edgeInset: edgeInset)
+        }
         var best = candidates[0]
         var bestScore = score(best, obstacles: obstacles)
         for candidate in candidates.dropFirst() {
@@ -65,11 +79,17 @@ enum MissionMapPopoverPlacement {
         }
     }
 
-    /// `rect` translated (not resized) so it lies inside `bounds`; a rect
-    /// larger than `bounds` keeps its top-left corner on `bounds`'.
-    private static func clamp(_ rect: CGRect, into bounds: CGRect) -> CGRect {
-        let x = max(bounds.minX, min(rect.minX, bounds.maxX - rect.width))
-        let y = max(bounds.minY, min(rect.minY, bounds.maxY - rect.height))
+    /// `rect` translated (not resized) so it lies inside `bounds`, at
+    /// least `edgeInset` from its edges. On an axis with less than
+    /// `2 * edgeInset` to spare the inset shrinks to half the spare room;
+    /// a rect larger than `bounds` on an axis keeps its min edge on
+    /// `bounds`' min edge. A negative `edgeInset` counts as 0.
+    private static func clamp(_ rect: CGRect, into bounds: CGRect, edgeInset: CGFloat) -> CGRect {
+        let inset = max(0, edgeInset)
+        let insetX = min(inset, max(0, (bounds.width - rect.width) / 2))
+        let insetY = min(inset, max(0, (bounds.height - rect.height) / 2))
+        let x = max(bounds.minX + insetX, min(rect.minX, bounds.maxX - insetX - rect.width))
+        let y = max(bounds.minY + insetY, min(rect.minY, bounds.maxY - insetY - rect.height))
         return CGRect(x: x, y: y, width: rect.width, height: rect.height)
     }
 }
