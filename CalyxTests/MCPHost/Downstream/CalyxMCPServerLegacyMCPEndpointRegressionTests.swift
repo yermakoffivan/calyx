@@ -6,7 +6,7 @@
 //  （/mcp、85 ツール）には手を付けません" -- introducing the new
 //  /calyx-mcp endpoint (and the routeStreaming(request:lifetime:) split)
 //  must leave POST /mcp's own behavior byte-for-byte identical: the
-//  85-tool tools/list surface, protocolVersion 2024-11-05, listChanged:
+//  86-tool tools/list surface, protocolVersion 2024-11-05, listChanged:
 //  false, and 204 for a notification. Lives under MCPHost/Downstream/
 //  rather than editing CalyxMCPServerTests.swift directly, per the
 //  test-writer split for this feature.
@@ -56,9 +56,9 @@ final class CalyxMCPServerLegacyMCPEndpointRegressionTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: dict)
     }
 
-    // MARK: - tools/list: still exactly 85, unaffected by the new catalog
+    // MARK: - tools/list: still exactly 86, unaffected by the new catalog
 
-    func test_postMCP_toolsList_stillReturnsExactly85Tools() async throws {
+    func test_postMCP_toolsList_stillReturnsExactly86Tools() async throws {
         let req = request(path: "/mcp", body: jsonRPC(method: "tools/list"), token: testToken)
         let resp = await server.route(request: req)
         XCTAssertEqual(resp.statusCode, 200)
@@ -66,7 +66,7 @@ final class CalyxMCPServerLegacyMCPEndpointRegressionTests: XCTestCase {
         let json = try JSONSerialization.jsonObject(with: try XCTUnwrap(resp.body)) as? [String: Any]
         let result = try XCTUnwrap(json?["result"] as? [String: Any])
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 85, "POST /mcp must remain unaffected by the new /calyx-mcp catalog")
+        XCTAssertEqual(tools.count, 86, "POST /mcp must remain unaffected by the new /calyx-mcp catalog")
     }
 
     // MARK: - initialize: protocolVersion and listChanged unchanged

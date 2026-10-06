@@ -1,0 +1,9 @@
+{
+ "claude-sonnet-5-5": {
+  "cacheCreation": 22697,
+  "cacheRead": 67460,
+  "input": 520,
+  "output": 9,
+  "thinking": 0
+ }
+}

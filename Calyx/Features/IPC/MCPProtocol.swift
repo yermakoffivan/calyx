@@ -181,10 +181,18 @@ struct MCPRouter: Sendable {
         MCPCockpitBridge.tools
     }
 
-    /// Combined IPC + LSP + terminal_* + Cockpit tool catalogue. Used by
-    /// `tools/list` to advertise every tool the server can dispatch.
+    /// usage_* tool catalogue. Delegates to `MCPUsageBridge.tools`, same
+    /// rationale as the other bridges' catalogues. Always listed: while
+    /// tracking is off the tool fails at call time instead.
+    static var usageTools: [MCPTool] {
+        MCPUsageBridge.tools
+    }
+
+    /// Combined IPC + LSP + terminal_* + Cockpit + usage_* tool
+    /// catalogue. Used by `tools/list` to advertise every tool the server
+    /// can dispatch.
     static var allTools: [MCPTool] {
-        tools + lspTools + terminalTools + cockpitTools
+        tools + lspTools + terminalTools + cockpitTools + usageTools
     }
 
     /// Classifier — does `name` belong to the LSP tool surface?
@@ -210,6 +218,13 @@ struct MCPRouter: Sendable {
     /// instead.
     static func isCockpitTool(name: String) -> Bool {
         MCPCockpitBridge.toolNames.contains(name)
+    }
+
+    /// Classifier — does `name` belong to the usage_* tool surface?
+    /// Identifies tools by the `usage_` prefix, same shape as
+    /// `isTerminalTool`.
+    static func isUsageTool(name: String) -> Bool {
+        name.hasPrefix("usage_")
     }
 
     /// Opening paragraph shared by both instructions variants below.
@@ -265,6 +280,7 @@ struct MCPRouter: Sendable {
         "Terminal command-history tools (terminal_*) are available when shell integration is installed (zsh and fish only, currently). Use terminal_list_commands to list the commands recorded for a surface, oldest-first, terminal_read_output to fetch a specific command's captured output, and terminal_await_command to block until a running command finishes or the timeout elapses. terminal_await_command returns {\"status\": \"timeout\"} on timeout — simply call it again to keep waiting. terminal_list_commands and terminal_await_command's surface_id argument also accepts a calyx-session ID in place of the raw surface UUID (terminal_read_output takes command_id instead and has no surface_id argument).",
         "Cockpit pane-discovery and layout tools are always available. Use pane_list to enumerate every terminal pane across all open Calyx windows (pane identity is split-tree leaf membership, so any pane it reports is guaranteed operable), pane_split to split an existing pane into two, and tab_create to open a new tab (optionally in a named group and/or at a specific working directory — this visibly changes focus in the live app window). pane_split's surface_id argument also accepts a calyx-session ID in place of the raw surface UUID.",
         "Cockpit also offers three execution tools: pane_run runs a command in a pane (paste text plus Return), pane_send_keys sends raw text verbatim with no Return appended, and palette_execute runs a command-palette entry by its id. All three also accept a calyx-session ID in surface_id, same as pane_split. Each requires in-app human approval unless auto-approve is enabled, so the call can suspend until a person acts on it; {\"status\": \"denied\"}, {\"status\": \"approval_timeout\"}, and {\"status\": \"dismissed\"} are normal, non-error results, not failures to retry — after a denied or dismissed result, do not retry the same action without new user intent.",
+        "Usage tools (usage_*) report Claude Code token usage as counted by Claude Code itself and received by Calyx over its telemetry, and work only while Settings > Agents > Usage Tracking is on. Use usage_report to aggregate input, cache and output tokens by model, effort, thread, agent_type, day, project or session, optionally limited to the last N days, a since/until range, one session (session_id \"current\" is the session in your own pane), a project or a thread. Rows with unreported true are tokens Calyx knows were used but did not receive in detail; the notes field explains them.",
     ]
 
     /// Static, trusted instructions text for a connection with no

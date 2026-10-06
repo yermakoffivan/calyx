@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import OSLog
 
 private let logger = Logger(
@@ -22,6 +23,23 @@ class SettingsWindowController: NSWindowController {
     private let agentIPCSwitch = NSSwitch()
     private let agentIPCRefreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let agentIPCStatusLabel = NSTextField(wrappingLabelWithString: "")
+    /// The Usage Tracking row's status line, kept current by
+    /// `updateUsageTrackingStatus()` (see `usageTrackingRow()`).
+    private let usageTrackingStatusLabel = SettingsLayout.statusLabel()
+    /// The row's reception status over this controller's inputs (and its
+    /// DEBUG seams); it calls `updateUsageTrackingStatus()` whenever the
+    /// text may have changed. `weak`, not `unowned`: nothing here may be
+    /// able to trap, also if this controller stops being a singleton. A
+    /// closure run after the controller is gone reads neutral values (no
+    /// server, the shared activation and monitor) and updates nothing.
+    private lazy var usageTelemetryStatusFeed = UsageTelemetryStatusFeed(
+        inputs: UsageTelemetryStatusFeed.Inputs(
+            trackingOn: { UsageTrackingSettings.enabled },
+            ipcEnabled: { IPCSettings.enabled },
+            serverRunning: { [weak self] in self?.usageServerRunning ?? false },
+            activation: { [weak self] in self?.usageTelemetryActivation ?? .shared },
+            monitor: { [weak self] in self?.usageIngestMonitor ?? .shared }),
+        onChange: { [weak self] in self?.updateUsageTrackingStatus() })
     /// State behind the MCP Apps pane (`SettingsPane.mcpServers`), shared by every instance and
     /// held by the type so the composition root configures it at launch
     /// without creating the Settings window. Empty until
@@ -42,6 +60,27 @@ class SettingsWindowController: NSWindowController {
     /// as `AppDelegate._shellIntegrationRootForTesting`. DO NOT use from
     /// production code.
     var _shellIntegrationRootForTesting: URL?
+
+    /// Test seam: the activation the Usage Tracking row reconciles and
+    /// shows, instead of `UsageTelemetryActivation.shared`. DO NOT use
+    /// from production code.
+    var _usageTelemetryActivationForTesting: UsageTelemetryActivation?
+
+    /// Test seam: the monitor the Usage Tracking row shows, instead of
+    /// `UsageIngestMonitor.shared`. Setting it moves the feed's
+    /// observation to it (the previous one stops). DO NOT use from
+    /// production code.
+    var _usageIngestMonitorForTesting: UsageIngestMonitor? {
+        didSet {
+            usageTelemetryStatusFeed.monitorDidChange()
+            updateUsageTrackingStatus()
+        }
+    }
+
+    /// Test seam: whether the Usage Tracking row takes the IPC server as
+    /// running, instead of `CalyxMCPServer.shared.isRunning`. DO NOT use
+    /// from production code.
+    var _usageServerRunningForTesting: Bool?
     #endif
 
     private init() {
@@ -69,6 +108,8 @@ class SettingsWindowController: NSWindowController {
             self, selector: #selector(agentIPCStateDidChange),
             name: .calyxIPCStateDidChange, object: nil
         )
+        // Arms the feed's observers (status, IPC state, monitor values).
+        _ = usageTelemetryStatusFeed
     }
 
     deinit {
@@ -158,6 +199,14 @@ class SettingsWindowController: NSWindowController {
                 title: "Agent Hook Approval",
                 subtitle: "Routes Claude Code and Codex permission prompts, all always-approve Grok tool calls, and every pi tool call to the Calyx approval banner. Off = agents decide alone, and pi, which has no prompt of its own, just runs the call."
             )
+        case .usageTracking:
+            return SectionHeading(
+                title: "Usage Tracking",
+                subtitle: "Records Claude Code token usage per model and effort, as counted by Claude Code itself. "
+                    + "While this is on, Calyx adds telemetry settings to ~/.claude/settings.json so that Claude "
+                    + "Code on this Mac sends its token counts to Calyx. Only numbers and labels are stored, never "
+                    + "conversation text. Needs AI Agent IPC."
+            )
         case .mcpServers:
             return SectionHeading(
                 title: "MCP Apps",
@@ -228,6 +277,8 @@ class SettingsWindowController: NSWindowController {
             return commandTrackingRow()
         case .agentHookApproval:
             return agentHookApprovalRow()
+        case .usageTracking:
+            return usageTrackingRow()
         case .mcpServers:
             return mcpServersRow()
         case .openSessionBrowserButton:
@@ -322,6 +373,7 @@ class SettingsWindowController: NSWindowController {
     /// across multiple panes, each backed by its own store: SessionSettings
     /// for the session rows, CockpitSettings for cockpitAutoApprove and
     /// agentHookApproval, CommandTrackingSettings for commandTracking,
+    /// UsageTrackingSettings for usageTracking,
     /// and UserDefaults.standard directly for
     /// glassOpacityCells (it has no dedicated settings type). Extracted as its own function (rather than
     /// reading each backing store directly inline in each row builder)
@@ -341,6 +393,7 @@ class SettingsWindowController: NSWindowController {
         case .cockpitAutoApprove: return CockpitSettings.autoApproveEnabled
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
         case .agentHookApproval: return CockpitSettings.agentHookApprovalEnabled
+        case .usageTracking: return UsageTrackingSettings.enabled
         case .glassOpacityCells: return UserDefaults.standard.bool(forKey: "terminalGlassOpacityCells")
         default: return false
         }
@@ -440,6 +493,61 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(agentHookApprovalDidChange(_:))
         return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
+    }
+
+    private func usageTrackingRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.usageTrackingSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .usageTracking) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(usageTrackingDidChange(_:))
+
+        usageTrackingStatusLabel.setAccessibilityIdentifier(AccessibilityID.Settings.usageTrackingStatusLabel)
+
+        let column = SettingsLayout.column([
+            controlRow(label: "Track Claude Code usage", control: toggleSwitch),
+            usageTrackingStatusLabel,
+        ])
+        updateUsageTrackingStatus()
+        return column
+    }
+
+    // MARK: Usage Tracking status
+
+    private var usageTelemetryActivation: UsageTelemetryActivation {
+        #if DEBUG
+        return _usageTelemetryActivationForTesting ?? .shared
+        #else
+        return .shared
+        #endif
+    }
+
+    private var usageIngestMonitor: UsageIngestMonitor {
+        #if DEBUG
+        return _usageIngestMonitorForTesting ?? .shared
+        #else
+        return .shared
+        #endif
+    }
+
+    private var usageServerRunning: Bool {
+        #if DEBUG
+        return _usageServerRunningForTesting ?? CalyxMCPServer.shared.isRunning
+        #else
+        return CalyxMCPServer.shared.isRunning
+        #endif
+    }
+
+    /// Applies the feed's text (`UsageTelemetryStatusResolver`) to the
+    /// row's status label; hidden while the text is empty. Called when the
+    /// pane is built, when the switch changes, and by the feed on
+    /// `.calyxIPCStateDidChange`, on `.calyxUsageTelemetryStatusDidChange`
+    /// (after every reconcile run of the shared activation), and when the
+    /// monitor's values change.
+    private func updateUsageTrackingStatus() {
+        let text = usageTelemetryStatusFeed.text
+        usageTrackingStatusLabel.isHidden = text.isEmpty
+        usageTrackingStatusLabel.attributedStringValue = SettingsLayout.statusText(text)
     }
 
     /// The whole MCP Apps pane below its heading, built from the same
@@ -608,6 +716,22 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
+    }
+
+    /// Writes the setting, refreshes the status line and requests a
+    /// reconcile of the telemetry activation (after the setting is
+    /// written), which syncs the ledger's tracking flag and writes or
+    /// removes Calyx's block in Claude Code's settings file. Nothing else:
+    /// turning tracking on restarts tracking, so there is nothing earlier
+    /// to catch up, and turning it off keeps the stored data.
+    @objc private func usageTrackingDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        UsageTrackingSettings.enabled = enabled
+        updateUsageTrackingStatus()
+        let activation = usageTelemetryActivation
+        Task {
+            await activation.reconcile()
+        }
     }
 
     /// Writes the setting and refreshes the row unconditionally -- the

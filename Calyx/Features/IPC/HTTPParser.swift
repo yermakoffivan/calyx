@@ -12,6 +12,12 @@ struct HTTPRequest: Sendable {
     let path: String
     let headers: [String: String]
     let body: Data?
+    /// Whether the header block carries more than one `Authorization`
+    /// header (names compared without case). `headers` keeps only one of
+    /// them, so a route that authenticates with a credential of its own
+    /// treats such a request as carrying none, as the transport's body cap
+    /// does (`HTTPParser.requestTarget`).
+    var repeatsAuthorization: Bool = false
 }
 
 // MARK: - HTTPResponse
@@ -68,6 +74,9 @@ enum HTTPParseError: Error, Equatable {
     case headerTooLarge
     case bodyTooLarge
     case invalidContentLength
+    /// Fewer body bytes are present than the declared `Content-Length`:
+    /// the connection ended (or was answered) before the body arrived.
+    case incompleteBody
     case malformedRequest
     case timeout
 }
@@ -82,6 +91,11 @@ struct HTTPParser {
     /// re-published tool arguments and results.
     static let maxCalyxMCPBodySize: Int = 32 * 1024 * 1024  // 32MB
     static let calyxMCPPath = "/calyx-mcp"
+    /// Body cap of a `/usage/v1/metrics` request carrying the usage token:
+    /// an OTLP export re-sends every series a process has ever had, so a
+    /// long-lived process sends several megabytes per export.
+    static let maxUsageMetricsBodySize: Int = 16 * 1024 * 1024  // 16MB
+    static let usageMetricsPath = "/usage/v1/metrics"
 
     private static let headerTerminator = Data("\r\n\r\n".utf8)
 
@@ -124,11 +138,15 @@ struct HTTPParser {
 
         // Parse headers
         var headers: [String: String] = [:]
+        var authorizationCount = 0
         for i in 1..<lines.count {
             let line = lines[i]
             if line.isEmpty { continue }
             guard let colonIndex = line.firstIndex(of: ":") else { continue }
             let key = String(line[line.startIndex..<colonIndex])
+            if key.caseInsensitiveCompare("Authorization") == .orderedSame {
+                authorizationCount += 1
+            }
             let valueStart = line.index(after: colonIndex)
             let value = String(line[valueStart...]).trimmingCharacters(in: .whitespaces)
             headers[key] = value
@@ -159,13 +177,14 @@ struct HTTPParser {
                 // Content-Length: 0 → nil body
                 body = nil
             } else {
-                // Extract body bytes starting after the separator
-                let bodyStart = separatorRange.upperBound
-                if bodyStart < data.endIndex {
-                    let available = data[bodyStart..<data.endIndex]
-                    let take = min(length, available.count)
-                    body = Data(available.prefix(take))
+                // Extract body bytes starting after the separator. A body
+                // shorter than declared is an error, never a partial body:
+                // a request that did not fully arrive must not reach a route.
+                let available = data[separatorRange.upperBound..<data.endIndex]
+                guard available.count >= length else {
+                    throw HTTPParseError.incompleteBody
                 }
+                body = Data(available.prefix(length))
             }
         }
 
@@ -173,7 +192,8 @@ struct HTTPParser {
             method: method,
             path: path,
             headers: headers,
-            body: body
+            body: body,
+            repeatsAuthorization: authorizationCount > 1
         )
     }
 
@@ -326,20 +346,69 @@ struct HTTPParser {
 
     /// The body cap for the request whose header block is `headerString`:
     /// `maxCalyxMCPBodySize` for `/calyx-mcp` when `isAuthorized` accepts
-    /// its `Authorization` value, `maxBodySize` for every other request.
-    static func bodyLimit(forHeaderString headerString: String, isAuthorized: (String?) -> Bool) -> Int {
+    /// its `Authorization` value, `maxUsageMetricsBodySize` for
+    /// `/usage/v1/metrics` when `isUsageAuthorized` accepts it,
+    /// `maxBodySize` for every other request. The path must match exactly
+    /// (a query string gets `maxBodySize`), the method is not looked at,
+    /// and each closure is asked only for its own path, with the trimmed
+    /// `Authorization` value `requestTarget` reads (nil when there is none
+    /// or more than one).
+    static func bodyLimit(
+        forHeaderString headerString: String,
+        isAuthorized: (String?) -> Bool,
+        isUsageAuthorized: (String?) -> Bool = { _ in false }
+    ) -> Int {
+        guard let target = requestTarget(inHeaderString: headerString) else { return maxBodySize }
+        switch target.path {
+        case calyxMCPPath:
+            return isAuthorized(target.authorization) ? maxCalyxMCPBodySize : maxBodySize
+        case usageMetricsPath:
+            return isUsageAuthorized(target.authorization) ? maxUsageMetricsBodySize : maxBodySize
+        default:
+            return maxBodySize
+        }
+    }
+
+    /// The request path and the trimmed value of the single `Authorization`
+    /// header of the header block `headerString` (request line included);
+    /// the value is nil when there is no such header or more than one
+    /// (names compared without case), so a repeated header carries no
+    /// credential here, as it carries none on the route
+    /// (`HTTPRequest.repeatsAuthorization`). Nil when the request line
+    /// names no path. The one reading of a header block behind `bodyLimit`.
+    static func requestTarget(inHeaderString headerString: String) -> (path: String, authorization: String?)? {
         let lines = headerString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return maxBodySize }
+        guard let requestLine = lines.first else { return nil }
         let parts = requestLine.split(separator: " ", maxSplits: 2)
-        guard parts.count >= 2, parts[1] == calyxMCPPath else { return maxBodySize }
+        guard parts.count >= 2 else { return nil }
         var authorization: String?
+        var authorizationCount = 0
         for line in lines.dropFirst() {
             guard let colonIndex = line.firstIndex(of: ":") else { continue }
             guard line[line.startIndex..<colonIndex].caseInsensitiveCompare("Authorization") == .orderedSame else { continue }
-            authorization = line[line.index(after: colonIndex)...].trimmingCharacters(in: .whitespaces)
-            break
+            authorizationCount += 1
+            if authorizationCount == 1 {
+                authorization = line[line.index(after: colonIndex)...].trimmingCharacters(in: .whitespaces)
+            }
         }
-        return isAuthorized(authorization) ? maxCalyxMCPBodySize : maxBodySize
+        return (String(parts[1]), authorizationCount == 1 ? authorization : nil)
+    }
+
+    // MARK: - Constant-Time Comparison
+
+    /// Whether `a` and `b` have the same UTF-8 bytes. Every byte pair is
+    /// examined whatever the first difference, so the time taken does not
+    /// reveal how long a matching prefix a guess has; strings of different
+    /// lengths are unequal (the length itself is not secret).
+    static func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let lhs = Array(a.utf8)
+        let rhs = Array(b.utf8)
+        guard lhs.count == rhs.count else { return false }
+        var difference: UInt8 = 0
+        for (x, y) in zip(lhs, rhs) {
+            difference |= x ^ y
+        }
+        return difference == 0
     }
 
     // MARK: - Chunked Transfer Encoding

@@ -56,6 +56,10 @@ final class AgentToolPathsTests: XCTestCase {
         XCTAssertEqual(AgentToolPaths.hermesConfigPath(testRoot: nil), NSHomeDirectory() + "/.hermes/config.yaml")
     }
 
+    func test_claudeProjectsDirectory_productionRoot() {
+        XCTAssertEqual(AgentToolPaths.claudeProjectsDirectory(testRoot: nil), NSHomeDirectory() + "/.claude/projects")
+    }
+
     // MARK: - testRoot override
 
     func test_claudeConfigDirectory_withTestRoot() {
@@ -94,6 +98,10 @@ final class AgentToolPathsTests: XCTestCase {
         XCTAssertEqual(AgentToolPaths.hermesConfigPath(testRoot: "/tmp/root"), "/tmp/root/.hermes/config.yaml")
     }
 
+    func test_claudeProjectsDirectory_withTestRoot() {
+        XCTAssertEqual(AgentToolPaths.claudeProjectsDirectory(testRoot: "/tmp/root"), "/tmp/root/.claude/projects")
+    }
+
     // MARK: - Zero-argument properties delegate to CalyxPathRoot.testRoot
 
     func test_zeroArgumentProperties_matchExplicitCurrentTestRoot() {
@@ -106,5 +114,10 @@ final class AgentToolPathsTests: XCTestCase {
                        AgentToolPaths.claudeConfigDirectory(testRoot: CalyxPathRoot.testRoot))
         XCTAssertEqual(AgentToolPaths.hermesConfigPath,
                        AgentToolPaths.hermesConfigPath(testRoot: CalyxPathRoot.testRoot))
+    }
+
+    func test_claudeProjectsDirectory_zeroArgumentProperty_matchesExplicitCurrentTestRoot() {
+        XCTAssertEqual(AgentToolPaths.claudeProjectsDirectory,
+                       AgentToolPaths.claudeProjectsDirectory(testRoot: CalyxPathRoot.testRoot))
     }
 }

@@ -11,7 +11,7 @@
 //  Coverage:
 //  - tools/list includes pane_list/pane_split/tab_create (ungated)
 //    and pane_run/pane_send_keys/palette_execute (human-approval
-//    gated), totaling 85 (6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit)
+//    gated), totaling 86 (6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit + 1 usage_*)
 //  - tools/call pane_list dispatches through the injected FakeCockpitAccess
 //    and returns the panes JSON MCPCockpitBridge builds
 //  - a Cockpit tool call does not trigger syncBoundPeerInboxCounts (it's
@@ -141,11 +141,11 @@ final class CalyxMCPServerCockpitToolsTests: XCTestCase {
         XCTAssertTrue(names.contains("pane_list"), "tools/list must surface pane_list")
         XCTAssertTrue(names.contains("pane_split"), "tools/list must surface pane_split")
         XCTAssertTrue(names.contains("tab_create"), "tools/list must surface tab_create")
-        XCTAssertEqual(tools.count, 85,
-                       "tools/list must return 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit = 85 tools")
+        XCTAssertEqual(tools.count, 86,
+                       "tools/list must return 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit + 1 usage_* = 86 tools")
     }
 
-    func test_toolsList_advertises85_includesGatedTools() async throws {
+    func test_toolsList_advertises86_includesGatedTools() async throws {
         let data = makeRequest(method: "tools/list")
 
         let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
@@ -157,8 +157,8 @@ final class CalyxMCPServerCockpitToolsTests: XCTestCase {
         XCTAssertTrue(names.contains("pane_run"), "tools/list must surface pane_run")
         XCTAssertTrue(names.contains("pane_send_keys"), "tools/list must surface pane_send_keys")
         XCTAssertTrue(names.contains("palette_execute"), "tools/list must surface palette_execute")
-        XCTAssertEqual(tools.count, 85,
-                       "tools/list must return 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit = 85 tools")
+        XCTAssertEqual(tools.count, 86,
+                       "tools/list must return 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit + 1 usage_* = 86 tools")
     }
 
     // MARK: - tools/call round trip

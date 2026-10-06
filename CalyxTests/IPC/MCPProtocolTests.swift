@@ -199,9 +199,9 @@ final class MCPProtocolTests: XCTestCase {
 
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP +
-        // terminal_* + Cockpit surface (6 IPC + 70 LSP + 3 terminal_* +
-        // 6 Cockpit = 85 tools; no ack_messages, and the 6 Cockpit
-        // tools are 3 ungated + 3 gated). Each IPC name must be present
+        // terminal_* + Cockpit + usage_* surface (6 IPC + 70 LSP + 3
+        // terminal_* + 6 Cockpit + 1 usage_* = 86 tools; no ack_messages,
+        // and the 6 Cockpit tools are 3 ungated + 3 gated). Each IPC name must be present
         // and the LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
@@ -227,8 +227,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 85,
-                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit = 85 tools")
+        XCTAssertEqual(toolsResult.tools.count, 86,
+                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit + 1 usage_* = 86 tools")
     }
 
     // ==================== ack_messages removed; receive is ====================
@@ -250,6 +250,23 @@ final class MCPProtocolTests: XCTestCase {
                        "deletes on read, so there is no longer a separate ack step for a client to call")
     }
 
+    /// Where `text` mentions the retired ack step: "ack" or
+    /// "ack_messages" as a word of its own, in any case. Ordinary words
+    /// that merely contain the letters ("tracking", "back", "stack") are
+    /// not a mention.
+    private static func ackMention(in text: String) -> Range<String.Index>? {
+        text.range(of: #"\back(_messages)?\b"#, options: [.regularExpression, .caseInsensitive])
+    }
+
+    func test_ackMention_matchesTheWordOnly() {
+        for text in ["ack", "Ack", "ACK", "call ack_messages", "call ack after receiving", "(ack)"] {
+            XCTAssertNotNil(Self.ackMention(in: text), text)
+        }
+        for text in ["tracking", "Usage Tracking", "back", "stack", "package", "acknowledge", "hack_messages"] {
+            XCTAssertNil(Self.ackMention(in: text), text)
+        }
+    }
+
     func test_instructions_withoutPeerID_doesNotMentionAck() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
         let resultData = try jsonEncoder.encode(response.result!)
@@ -257,7 +274,7 @@ final class MCPProtocolTests: XCTestCase {
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertNil(
-            instructions.range(of: "ack", options: .caseInsensitive),
+            Self.ackMention(in: instructions),
             "instructions for a connection with no auto-registered peerID must not mention " +
             "ack/ack_messages anywhere — the tool no longer exists"
         )
@@ -270,7 +287,7 @@ final class MCPProtocolTests: XCTestCase {
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertNil(
-            instructions.range(of: "ack", options: .caseInsensitive),
+            Self.ackMention(in: instructions),
             "instructions for a connection with an auto-registered peerID must not mention " +
             "ack/ack_messages anywhere — the tool no longer exists"
         )

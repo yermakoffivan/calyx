@@ -213,30 +213,31 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
         }
     }
 
-    // The 6 switches that live on the Agents pane. agentIPC, commandTracking
-    // and agentHookApproval are intentionally NOT included in the wiring
-    // zip below -- they're already independently covered by
+    // The 7 switches that live on the Agents pane. agentIPC, commandTracking,
+    // agentHookApproval and usageTracking are intentionally NOT included
+    // in the wiring zip below -- they're already independently covered by
     // test_agentIPCToggleSwitch_hasTargetAndActionWired below,
     // CommandTrackingSettingsToggleWiringTests
-    // .test_commandTrackingSwitch_existsWithTargetAndActionWired and
+    // .test_commandTrackingSwitch_existsWithTargetAndActionWired,
     // AgentHookApprovalSettingsToggleWiringTests
-    // .test_agentHookApprovalSwitch_existsWithTargetAndActionWired
+    // .test_agentHookApprovalSwitch_existsWithTargetAndActionWired and
+    // UsageTrackingSettingsToggleWiringTests
+    // .test_usageTrackingSwitch_existsOnceWithTargetAndActionWired
     // (all identifier-based lookups, position-independent), same
-    // division of labor this file used for the Sessions pane before the
-    // split. Renamed from ...exactlyFive... (agentIPC added a 6th).
-    func test_agentsToggleSwitches_exactlySix_inRowOrder() throws {
+    // division of labor this file uses for the Sessions pane.
+    func test_agentsToggleSwitches_exactlySeven_inRowOrder() throws {
         let switches = collectSwitches(in: try agentsPaneView())
 
         XCTAssertEqual(
-            switches.count, 6,
-            "The Agents pane must show exactly 6 switches (agentIPC/agentResume/agentResumeAutoExecute/" +
-            "cockpitAutoApprove/commandTracking/agentHookApproval). Found \(switches.count)."
+            switches.count, 7,
+            "The Agents pane must show exactly 7 switches (agentIPC/agentResume/agentResumeAutoExecute/" +
+            "cockpitAutoApprove/commandTracking/agentHookApproval/usageTracking). Found \(switches.count)."
         )
     }
 
     func test_agentIPCToggleSwitch_hasTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 6, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 7, "covered, and already failing, by the count pin above")
 
         let agentIPCSwitch = switches[0]
         XCTAssertTrue(
@@ -252,7 +253,7 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
 
     func test_agentsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 6, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 7, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Agents pane, filtered
         // to the switch-backed rows (SettingsPaneTests.expectedRows pins

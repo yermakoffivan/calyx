@@ -8,6 +8,9 @@
 // Edges, in this order: an adjacent round trip a1<->a2 (a1->a2 carrying
 // three messages sent 0.4 s apart, so its one line shows three pulse
 // dots), a cross-row a2->a4, a cross-band a4->b1, and a conflict a1-a3.
+// a4 alone also carries a git badge (branch main) and a session usage
+// row with one response not yet final, so its card shows the git line
+// and the usage line "45.2k out · 1.2M in" above its tool line.
 
 import Foundation
 
@@ -41,13 +44,15 @@ struct MissionMapFixture: Sendable {
         ]
         func card(
             groupID: UUID, groupName: String, title: String, state: AgentState = .working,
-            toolLine: String? = nil, children: [MissionMapChildCard] = []
+            toolLine: String? = nil, children: [MissionMapChildCard] = [],
+            git: MissionMapGitBadge? = nil, usage: UsageTokenTotals? = nil
         ) -> MissionMapCard {
             let id = UUID()
             return MissionMapCard(
                 id: id, groupID: groupID, groupName: groupName, tabID: UUID(), kindLabel: "Claude Code",
                 paneTitle: title, cwdLabel: "~/projects/app", state: state, toolLine: toolLine,
-                children: children, unreadCount: 0, approval: nil, git: nil, focusTarget: id
+                children: children, unreadCount: 0, approval: nil, git: git, focusTarget: id,
+                usage: usage
             )
         }
         let a1 = card(groupID: groupA, groupName: "Band A", title: "API server", toolLine: "Edit: main.swift")
@@ -59,7 +64,11 @@ struct MissionMapFixture: Sendable {
             ]
         )
         let a3 = card(groupID: groupA, groupName: "Band A", title: "Docs", state: .idle, toolLine: "Edit: main.swift")
-        let a4 = card(groupID: groupA, groupName: "Band A", title: "Test runner", toolLine: "Bash: swift test")
+        let a4 = card(
+            groupID: groupA, groupName: "Band A", title: "Test runner", toolLine: "Bash: swift test",
+            git: MissionMapGitBadge(branch: "main", shortHash: "abc1234", changedFileCount: 0),
+            usage: UsageTokenTotals(input: 1_000_000, output: 45_200, cacheRead: 150_000, cacheCreation: 50_000)
+        )
         let b1 = card(groupID: groupB, groupName: "Band B", title: "Release notes", state: .idle)
         let b2 = card(groupID: groupB, groupName: "Band B", title: "Shell", state: .idle)
         let cards = [a1, a2, a3, a4, b1, b2]

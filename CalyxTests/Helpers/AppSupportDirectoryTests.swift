@@ -40,4 +40,17 @@ final class AppSupportDirectoryTests: XCTestCase {
     func test_locksPath_isAlwaysPathPlusLocks() {
         XCTAssertEqual(AppSupportDirectory.locksPath, AppSupportDirectory.path + "/locks")
     }
+
+    func test_usagePath_isAlwaysPathPlusUsage() {
+        XCTAssertEqual(AppSupportDirectory.usagePath, AppSupportDirectory.path + "/usage")
+    }
+
+    func test_usagePath_followsTheTestRootRedirectOfPath() throws {
+        // The unit-test host always runs with a test root, and `path`
+        // resolves beneath it; usagePath must inherit that, never the
+        // real Application Support directory.
+        let testRoot = try XCTUnwrap(CalyxPathRoot.testRoot, "Fixture error: the test host has no path root")
+        XCTAssertEqual(AppSupportDirectory.usagePath, testRoot + "/Calyx/usage")
+        XCTAssertNotEqual(AppSupportDirectory.usagePath, AppSupportDirectory.path(testRoot: nil) + "/usage")
+    }
 }

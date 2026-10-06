@@ -1,0 +1,9 @@
+{
+ "claude-opus-5-5[1m]": {
+  "cacheCreation": 16899,
+  "cacheRead": 10738,
+  "input": 2,
+  "output": 4,
+  "thinking": 0
+ }
+}

@@ -1,0 +1,38 @@
+{
+ "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1": {
+  "claude-haiku-4-5-20251001": {
+   "cacheCreation": 0,
+   "cacheRead": 0,
+   "input": 879,
+   "output": 8
+  },
+  "claude-sonnet-5-5": {
+   "cacheCreation": 12781,
+   "cacheRead": 27340,
+   "input": 2,
+   "output": 3
+  }
+ },
+ "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2": {
+  "claude-haiku-4-5-20251001": {
+   "cacheCreation": 0,
+   "cacheRead": 0,
+   "input": 879,
+   "output": 13
+  },
+  "claude-sonnet-5-5": {
+   "cacheCreation": 34317,
+   "cacheRead": 99139,
+   "input": 522,
+   "output": 17
+  }
+ },
+ "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3": {
+  "claude-sonnet-5-5": {
+   "cacheCreation": 1004,
+   "cacheRead": 178921,
+   "input": 1040,
+   "output": 20
+  }
+ }
+}

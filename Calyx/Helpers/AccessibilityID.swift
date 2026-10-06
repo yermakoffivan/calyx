@@ -61,6 +61,9 @@ enum AccessibilityID {
         static func allowButton(_ id: UUID) -> String { "calyx.missionMap.allowButton.\(id.uuidString)" }
         static func openButton(_ id: UUID) -> String { "calyx.missionMap.openButton.\(id.uuidString)" }
         static func cardOpenButton(_ id: UUID) -> String { "calyx.missionMap.cardOpenButton.\(id.uuidString)" }
+        /// A card's usage line, one element whose label is
+        /// `UsageCardLine.accessibilityLabel(for:)`.
+        static func cardUsage(_ id: UUID) -> String { "calyx.missionMap.cardUsage.\(id.uuidString)" }
     }
     enum Compose {
         static let container = "calyx.compose"
@@ -120,6 +123,8 @@ enum AccessibilityID {
         static let agentIPCSwitch = "calyx.settings.agents.agentIPCSwitch"
         static let agentIPCRefreshButton = "calyx.settings.agents.agentIPCRefreshButton"
         static let agentIPCStatusLabel = "calyx.settings.agents.agentIPCStatusLabel"
+        static let usageTrackingSwitch = "calyx.settings.agents.usageTrackingSwitch"
+        static let usageTrackingStatusLabel = "calyx.settings.agents.usageTrackingStatusLabel"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
@@ -316,5 +321,23 @@ enum AccessibilityID {
         static let importPreview = "calyx.settings.mcpServers.import.preview"
         static let importParseError = "calyx.settings.mcpServers.import.parseError"
         static let importConfirmButton = "calyx.settings.mcpServers.import.confirmButton"
+    }
+    /// Usage window (UsageWindowView, Calyx/Features/Usage/): its
+    /// filter pickers, the model x effort table, its two buttons, the
+    /// tracking-off banner and the footnote under the table.
+    enum Usage {
+        static let periodPicker = "calyx.usage.periodPicker"
+        static let projectPicker = "calyx.usage.projectPicker"
+        static let threadPicker = "calyx.usage.threadPicker"
+        static let table = "calyx.usage.table"
+        static let refreshButton = "calyx.usage.refreshButton"
+        static let deleteButton = "calyx.usage.deleteButton"
+        static let trackingOffBanner = "calyx.usage.trackingOffBanner"
+        static let footnote = "calyx.usage.footnote"
+        static let statusLine = "calyx.usage.statusLine"
+        static let columnsMenu = "calyx.usage.columnsMenu"
+        /// One item of the Columns menu; `dimension` is the
+        /// `UsageTokenQuery.Dimension` raw value.
+        static func column(_ dimension: String) -> String { "calyx.usage.column.\(dimension)" }
     }
 }

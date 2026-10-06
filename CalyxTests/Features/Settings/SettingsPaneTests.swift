@@ -39,6 +39,9 @@
 //  cockpitAutoApprove/commandTracking each were before it (see this
 //  repo's own history on this file).
 //
+//  USAGE TRACKING: a `usageTracking` row follows `agentHookApproval` on
+//  the Agents pane; it toggles UsageTrackingSettings.enabled.
+//
 //  MCP APPS HOST: a new MCP Servers pane follows Agents (plan section 11,
 //  contract v2 section 13), holding a single `mcpServers` row that hosts
 //  the whole pane.
@@ -99,6 +102,7 @@ final class SettingsPaneTests: XCTestCase {
         ("cockpitAutoApprove", .agents),
         ("commandTracking", .agents),
         ("agentHookApproval", .agents),
+        ("usageTracking", .agents),
         ("mcpServers", .mcpServers),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),

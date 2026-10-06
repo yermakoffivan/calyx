@@ -238,7 +238,8 @@ final class HTTPParserTests: XCTestCase {
     // MARK: - Edge Case: Content-Length Mismatch (Body Too Short)
 
     func test_contentLengthMismatch_bodyTooShort() {
-        // Content-Length says 100 but actual body is only 5 bytes
+        // Content-Length says 100 but actual body is only 5 bytes: the
+        // request did not fully arrive, which is an error (R3a-0).
         let rawString =
             "POST /data HTTP/1.1\r\n"
             + "Content-Length: 100\r\n"
@@ -246,20 +247,31 @@ final class HTTPParserTests: XCTestCase {
             + "hello"
         let raw = makeRawData(rawString)
 
-        // Parser should either return partial body or throw malformedRequest.
-        // We accept either behavior — the key is it must not crash.
-        do {
-            let request = try HTTPParser.parse(raw)
-            // If it succeeds, body should be what was actually available
-            if let body = request.body {
-                XCTAssertLessThanOrEqual(body.count, 100,
-                    "Body must not exceed claimed Content-Length")
-            }
-        } catch {
-            XCTAssertEqual(error as? HTTPParseError, .malformedRequest,
-                "Content-Length mismatch should throw malformedRequest if treated as error")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
         }
     }
+
+    func test_parse_bodyOneByteShort_throwsIncompleteBody() {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 6\r\n\r\nhello")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
+        }
+    }
+
+    func test_parse_noBodyBytesWithContentLength5_throwsIncompleteBody() {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+        XCTAssertThrowsError(try HTTPParser.parse(raw)) { error in
+            XCTAssertEqual(error as? HTTPParseError, .incompleteBody)
+        }
+    }
+
+    func test_parse_bodyOfExactLength_parses() throws {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+        let request = try HTTPParser.parse(raw)
+        XCTAssertEqual(request.body, Data("hello".utf8))
+    }
+
 
     // MARK: - Edge Case: Case-Insensitive Headers
 
@@ -517,5 +529,345 @@ final class HTTPParserTests: XCTestCase {
 
         let request = try HTTPParser.parse(raw)
         XCTAssertNil(request.body, "With no real Content-Length header, parse(_:) must not extract a body — even though the request line looks like a Content-Length header")
+    }
+}
+
+// MARK: - Per-path body cap with the usage route (R3a)
+
+/// `bodyLimit(forHeaderString:isAuthorized:isUsageAuthorized:)`: 32 MiB for
+/// `/calyx-mcp` when `isAuthorized` accepts, 16 MiB for `/usage/v1/metrics`
+/// when `isUsageAuthorized` accepts, 1 MiB for everything else. Each closure
+/// is asked only for its own path and receives the trimmed `Authorization`
+/// value (nil without the header).
+extension HTTPParserTests {
+
+    private static let oneMiB = 1024 * 1024
+    private static let sixteenMiB = 16 * 1024 * 1024
+    private static let thirtyTwoMiB = 32 * 1024 * 1024
+
+    private func headerBlock(_ requestLine: String, authorization: String? = nil) -> String {
+        var lines = [requestLine, "Host: 127.0.0.1"]
+        if let authorization {
+            lines.append("Authorization: \(authorization)")
+        }
+        lines.append("Content-Type: application/json")
+        return lines.joined(separator: "\r\n")
+    }
+
+    func test_usageMetricsPath_constant() {
+        XCTAssertEqual(HTTPParser.usageMetricsPath, "/usage/v1/metrics")
+    }
+
+    func test_maxUsageMetricsBodySize_is16MiB() {
+        XCTAssertEqual(HTTPParser.maxUsageMetricsBodySize, 16_777_216)
+    }
+
+    func test_bodyLimit_usagePath_usageAuthorized_is16MiB() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { _ in true }
+        )
+        XCTAssertEqual(limit, Self.sixteenMiB)
+    }
+
+    func test_bodyLimit_usagePath_usageAuthorized_isAuthorizedAlsoTrue_is16MiB() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in true },
+            isUsageAuthorized: { _ in true }
+        )
+        XCTAssertEqual(limit, Self.sixteenMiB)
+    }
+
+    func test_bodyLimit_usagePath_notUsageAuthorized_is1MiB_evenWhenIsAuthorizedAccepts() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer s"),
+            isAuthorized: { _ in true },
+            isUsageAuthorized: { _ in false }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+    }
+
+    func test_bodyLimit_usagePath_neitherAuthorized_is1MiB() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer x"),
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { _ in false }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+    }
+
+    func test_bodyLimit_calyxMCP_authorized_is32MiB_whateverIsUsageAuthorizedSays() {
+        for usage in [true, false] {
+            let limit = HTTPParser.bodyLimit(
+                forHeaderString: headerBlock("POST /calyx-mcp HTTP/1.1", authorization: "Bearer s"),
+                isAuthorized: { _ in true },
+                isUsageAuthorized: { _ in usage }
+            )
+            XCTAssertEqual(limit, Self.thirtyTwoMiB, "isUsageAuthorized=\(usage)")
+        }
+    }
+
+    func test_bodyLimit_calyxMCP_notAuthorized_is1MiB_evenWhenUsageAuthorizedAccepts() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /calyx-mcp HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { _ in true }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+    }
+
+    func test_bodyLimit_usagePath_asksOnlyIsUsageAuthorized() {
+        var authorizedCalls = 0
+        var usageCalls = 0
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in authorizedCalls += 1; return true },
+            isUsageAuthorized: { _ in usageCalls += 1; return true }
+        )
+        XCTAssertEqual(authorizedCalls, 0)
+        XCTAssertEqual(usageCalls, 1)
+    }
+
+    func test_bodyLimit_calyxMCP_asksOnlyIsAuthorized() {
+        var authorizedCalls = 0
+        var usageCalls = 0
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /calyx-mcp HTTP/1.1", authorization: "Bearer s"),
+            isAuthorized: { _ in authorizedCalls += 1; return true },
+            isUsageAuthorized: { _ in usageCalls += 1; return true }
+        )
+        XCTAssertEqual(authorizedCalls, 1)
+        XCTAssertEqual(usageCalls, 0)
+    }
+
+    func test_bodyLimit_otherPath_asksNeitherClosure_and_is1MiB() {
+        var calls = 0
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /mcp HTTP/1.1", authorization: "Bearer s"),
+            isAuthorized: { _ in calls += 1; return true },
+            isUsageAuthorized: { _ in calls += 1; return true }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+        XCTAssertEqual(calls, 0)
+    }
+
+    func test_bodyLimit_usagePathWithQueryString_is1MiB_andAsksNeitherClosure() {
+        var calls = 0
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics?x=1 HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in calls += 1; return true },
+            isUsageAuthorized: { _ in calls += 1; return true }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+        XCTAssertEqual(calls, 0)
+    }
+
+    func test_bodyLimit_usagePath_isUsageAuthorizedReceivesTrimmedValue() {
+        var received: [String?] = []
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nHost: h\r\nAuthorization:   Bearer synthetic-usage   \r\nX: y",
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { received.append($0); return true }
+        )
+        XCTAssertEqual(received, ["Bearer synthetic-usage"])
+    }
+
+    func test_bodyLimit_usagePath_lowercaseHeaderName_isFound() {
+        var received: [String?] = []
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nhost: h\r\nauthorization: Bearer synthetic-usage",
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { received.append($0); return true }
+        )
+        XCTAssertEqual(received, ["Bearer synthetic-usage"])
+    }
+
+    func test_bodyLimit_usagePath_noAuthorizationHeader_closureReceivesNil() {
+        var received: [String?] = []
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1"),
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { received.append($0); return false }
+        )
+        XCTAssertEqual(received, [nil])
+    }
+
+    func test_bodyLimit_calyxMCP_isAuthorizedReceivesTrimmedValue() {
+        var received: [String?] = []
+        _ = HTTPParser.bodyLimit(
+            forHeaderString: "POST /calyx-mcp HTTP/1.1\r\nAuthorization:  Bearer synthetic-server \r\nHost: h",
+            isAuthorized: { received.append($0); return true },
+            isUsageAuthorized: { _ in false }
+        )
+        XCTAssertEqual(received, ["Bearer synthetic-server"])
+    }
+
+    func test_bodyLimit_methodIsNotLookedAt_forUsagePath() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("PUT /usage/v1/metrics HTTP/1.1", authorization: "Bearer u"),
+            isAuthorized: { _ in false },
+            isUsageAuthorized: { _ in true }
+        )
+        XCTAssertEqual(limit, Self.sixteenMiB)
+    }
+
+    // Without the third argument the function behaves as before.
+
+    func test_bodyLimit_twoArguments_usagePath_is1MiB_evenWhenIsAuthorizedAccepts() {
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerBlock("POST /usage/v1/metrics HTTP/1.1", authorization: "Bearer s"),
+            isAuthorized: { _ in true }
+        )
+        XCTAssertEqual(limit, Self.oneMiB)
+    }
+
+    func test_bodyLimit_twoArguments_calyxMCP_authorized_is32MiB() {
+        let limit = HTTPParser.bodyLimit(forHeaderString: headerBlock("POST /calyx-mcp HTTP/1.1", authorization: "Bearer s")) { _ in true }
+        XCTAssertEqual(limit, Self.thirtyTwoMiB)
+    }
+
+    func test_bodyLimit_twoArguments_calyxMCP_notAuthorized_is1MiB() {
+        let limit = HTTPParser.bodyLimit(forHeaderString: headerBlock("POST /calyx-mcp HTTP/1.1", authorization: "Bearer s")) { _ in false }
+        XCTAssertEqual(limit, Self.oneMiB)
+    }
+}
+
+// MARK: - Constant-time comparison (R3a)
+
+extension HTTPParserTests {
+
+    func test_constantTimeEquals_equalStrings_true() {
+        XCTAssertTrue(HTTPParser.constantTimeEquals("Bearer abc123", "Bearer abc123"))
+    }
+
+    func test_constantTimeEquals_differentLengths_false() {
+        XCTAssertFalse(HTTPParser.constantTimeEquals("abc", "abcd"))
+        XCTAssertFalse(HTTPParser.constantTimeEquals("abcd", "abc"))
+    }
+
+    func test_constantTimeEquals_prefixOfOther_false() {
+        XCTAssertFalse(HTTPParser.constantTimeEquals("", "a"))
+        XCTAssertFalse(HTTPParser.constantTimeEquals("a", ""))
+    }
+
+    func test_constantTimeEquals_differenceInFirstByte_false() {
+        XCTAssertFalse(HTTPParser.constantTimeEquals("xbcdef", "abcdef"))
+    }
+
+    func test_constantTimeEquals_differenceInLastByte_false() {
+        XCTAssertFalse(HTTPParser.constantTimeEquals("abcdef", "abcdeg"))
+    }
+
+    func test_constantTimeEquals_emptyStrings_true() {
+        XCTAssertTrue(HTTPParser.constantTimeEquals("", ""))
+    }
+
+    func test_constantTimeEquals_nonASCIIEqual_true() {
+        XCTAssertTrue(HTTPParser.constantTimeEquals("トークン-é", "トークン-é"))
+    }
+
+    func test_constantTimeEquals_nonASCIIDifferent_false() {
+        XCTAssertFalse(HTTPParser.constantTimeEquals("トークン-é", "トークン-e"))
+    }
+
+    /// Compares UTF-8 bytes, not Unicode canonical equivalence: precomposed
+    /// "é" (C3 A9) and "e" + combining acute (65 CC 81) are equal as Swift
+    /// Strings but differ as bytes.
+    func test_constantTimeEquals_comparesBytesNotCanonicalEquivalence() {
+        let precomposed = "\u{00E9}"
+        let decomposed = "e\u{0301}"
+        XCTAssertEqual(precomposed, decomposed, "Fixture check: Swift String equality is canonical")
+        XCTAssertFalse(HTTPParser.constantTimeEquals(precomposed, decomposed))
+    }
+}
+
+// MARK: - One reading of the credential: repeated Authorization (R3a round 2)
+
+extension HTTPParserTests {
+
+    private func parseRaw(_ headerLines: [String], body: String = "{}") throws -> HTTPRequest {
+        var raw = "POST /usage/v1/metrics HTTP/1.1\r\n"
+        for line in headerLines {
+            raw += line + "\r\n"
+        }
+        raw += "Content-Length: \(body.utf8.count)\r\n\r\n" + body
+        return try HTTPParser.parse(Data(raw.utf8))
+    }
+
+    func test_parse_twoAuthorizationHeaders_sameSpelling_setsRepeatsAuthorization() throws {
+        let request = try parseRaw(["Authorization: Bearer a", "Authorization: Bearer b"])
+        XCTAssertTrue(request.repeatsAuthorization)
+    }
+
+    func test_parse_twoAuthorizationHeaders_differentSpellings_setsRepeatsAuthorization() throws {
+        let request = try parseRaw(["authorization: Bearer a", "AUTHORIZATION: Bearer a"])
+        XCTAssertTrue(request.repeatsAuthorization)
+    }
+
+    func test_parse_oneAuthorizationHeader_doesNotSetRepeatsAuthorization() throws {
+        let request = try parseRaw(["Host: h", "authorization: Bearer a"])
+        XCTAssertFalse(request.repeatsAuthorization)
+    }
+
+    func test_parse_noAuthorizationHeader_doesNotSetRepeatsAuthorization() throws {
+        let request = try parseRaw(["Host: h"])
+        XCTAssertFalse(request.repeatsAuthorization)
+    }
+
+    func test_parse_otherRepeatedHeader_doesNotSetRepeatsAuthorization() throws {
+        let request = try parseRaw(["X-Other: 1", "X-Other: 2", "Authorization: Bearer a"])
+        XCTAssertFalse(request.repeatsAuthorization)
+    }
+
+    func test_handBuiltRequest_repeatsAuthorizationIsFalse() {
+        let request = HTTPRequest(method: "POST", path: "/usage/v1/metrics", headers: ["Authorization": "Bearer a"], body: nil)
+        XCTAssertFalse(request.repeatsAuthorization)
+    }
+
+    func test_requestTarget_oneHeader_answersPathAndTrimmedValue() throws {
+        let target = try XCTUnwrap(HTTPParser.requestTarget(inHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nHost: h\r\naUtHoRiZaTiOn:   Bearer v  "))
+        XCTAssertEqual(target.path, "/usage/v1/metrics")
+        XCTAssertEqual(target.authorization, "Bearer v")
+    }
+
+    func test_requestTarget_noHeader_answersNilValue() throws {
+        let target = try XCTUnwrap(HTTPParser.requestTarget(inHeaderString: "POST /calyx-mcp HTTP/1.1\r\nHost: h"))
+        XCTAssertEqual(target.path, "/calyx-mcp")
+        XCTAssertNil(target.authorization)
+    }
+
+    func test_requestTarget_repeatedHeader_sameSpelling_answersNilValue() throws {
+        let target = try XCTUnwrap(HTTPParser.requestTarget(inHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nAuthorization: Bearer v\r\nAuthorization: Bearer v"))
+        XCTAssertEqual(target.path, "/usage/v1/metrics")
+        XCTAssertNil(target.authorization)
+    }
+
+    func test_requestTarget_repeatedHeader_differentSpellings_answersNilValue() throws {
+        let target = try XCTUnwrap(HTTPParser.requestTarget(inHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nauthorization: Bearer v\r\nX: y\r\nAuthorization: Bearer w"))
+        XCTAssertNil(target.authorization)
+    }
+
+    func test_bodyLimit_usagePath_repeatedAuthorization_closureReceivesNil() {
+        var received: [String?] = []
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: "POST /usage/v1/metrics HTTP/1.1\r\nauthorization: Bearer v\r\nAuthorization: Bearer v",
+            isAuthorized: { _ in true },
+            isUsageAuthorized: { received.append($0); return $0 != nil }
+        )
+        XCTAssertEqual(received, [nil])
+        XCTAssertEqual(limit, 1024 * 1024)
+    }
+
+    func test_bodyLimit_calyxMCP_repeatedAuthorization_closureReceivesNil() {
+        var received: [String?] = []
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: "POST /calyx-mcp HTTP/1.1\r\nAuthorization: Bearer s\r\nAuthorization: Bearer s",
+            isAuthorized: { received.append($0); return $0 != nil },
+            isUsageAuthorized: { _ in true }
+        )
+        XCTAssertEqual(received, [nil])
+        XCTAssertEqual(limit, 1024 * 1024)
     }
 }

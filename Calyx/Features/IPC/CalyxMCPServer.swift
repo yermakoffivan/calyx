@@ -107,6 +107,11 @@ final class CalyxMCPServer {
     /// leak state across cases -- same rationale as `agentRegistry`.
     var commandLogStore: CommandLogStore = .shared
 
+    /// What `POST /usage/v1/metrics` hands its bodies to. Nil until the app
+    /// installs one; while nil the route answers 503 and the usage path
+    /// gets the ordinary body cap.
+    var usageIngest: UsageIngestEndpoint?
+
     /// Lazily constructed, cached `MCPCommandLogBridge` that `terminal_*`
     /// calls dispatch through. `lazy` so it's only built on first actual
     /// `terminal_*` dispatch (not at `CalyxMCPServer` init), by which
@@ -229,6 +234,11 @@ final class CalyxMCPServer {
     /// instance the same way as `agentRegistry`/`sessionSurfaceMap`.
     var agentSessionMetaBridge = AgentSessionMetaBridge()
 
+    /// Bridge that answers the usage_* MCP tools from the usage ledger.
+    /// nil (the default) until `AppDelegate.startUsageLedger` installs
+    /// one; while nil, a usage_* call is a "not available" tool error.
+    var usageBridge: MCPUsageBridge?
+
     /// Directory `agent-endpoint.json` is written to (by `finishStart`)
     /// and removed from (by `stop()`). Required at construction, not
     /// defaulted: a caller that forgets to wire this fails to build
@@ -306,8 +316,63 @@ final class CalyxMCPServer {
             return await Self.collect(await routeCalyxMCPStream(request: request))
         case ("DELETE", HTTPParser.calyxMCPPath):
             return await routeCalyxMCPDelete(request: request)
+        case ("POST", HTTPParser.usageMetricsPath):
+            return await routeUsageMetrics(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
+        }
+    }
+
+    // MARK: - Usage Metrics
+
+    /// `POST /usage/v1/metrics`: Claude Code's OTLP metric exports. The
+    /// checks run in a fixed order, each answering before the next is
+    /// looked at: no endpoint (503, nothing noted), any `Origin` (403: the
+    /// exporter never sends one, a browser always does), the usage token
+    /// (401), a non-empty body (400). The body is handed to `ingest`
+    /// untouched, so nothing proportional to its size runs here.
+    ///
+    /// The credential is the one the transport's cap judged: exactly one
+    /// `Authorization` header (`HTTPRequest.repeatsAuthorization` false)
+    /// whose value `UsageIngestEndpoint.accepts`.
+    ///
+    /// The endpoint's clock is read once, as soon as the request is known
+    /// to reach a verdict: that one date is both `receivedAtNs` and the
+    /// date given to `note`, however long `ingest` takes. A request is
+    /// finished with the endpoint it started with: if the app replaces or
+    /// removes `usageIngest` while `ingest` is suspended, the note still
+    /// goes to the endpoint that received the request, once.
+    private func routeUsageMetrics(request: HTTPRequest) async -> HTTPResponse {
+        guard let endpoint = usageIngest else {
+            return HTTPParser.response(statusCode: 503, body: nil)
+        }
+        let receivedAt = endpoint.now()
+
+        func reject(_ rejection: UsageIngestRejection, statusCode: Int) -> HTTPResponse {
+            endpoint.note(rejection, receivedAt)
+            return HTTPParser.response(statusCode: statusCode, body: nil)
+        }
+
+        guard header(named: "Origin", in: request.headers) == nil else {
+            return reject(.foreignOrigin, statusCode: 403)
+        }
+        let authorization = header(named: "Authorization", in: request.headers)
+        guard !request.repeatsAuthorization,
+              UsageIngestEndpoint.accepts(authorization: authorization, token: endpoint.token()) else {
+            return reject(.unauthorized, statusCode: 401)
+        }
+        guard let body = request.body, !body.isEmpty else {
+            return reject(.noBody, statusCode: 400)
+        }
+
+        switch await endpoint.ingest(body, UsageClock.nanoseconds(receivedAt)) {
+        case .stored, .dropped:
+            endpoint.note(nil, receivedAt)
+            return HTTPParser.response(statusCode: 200, body: Data("{}".utf8))
+        case .undecodable:
+            return reject(.undecodable, statusCode: 400)
+        case .unavailable:
+            return reject(.unavailable, statusCode: 503)
         }
     }
 
@@ -1498,6 +1563,10 @@ final class CalyxMCPServer {
         /// The body cap of the request being received, decided from its
         /// header block (`requestBodyLimit(forHeaderString:)`).
         var bodyLimit = HTTPParser.maxBodySize
+        /// Whether the request carries the usage credential, decided once
+        /// with `bodyLimit`; nil unless the request is on the usage path
+        /// and an endpoint was installed when the cap was chosen.
+        var usageVerdict: Bool?
         /// True from a streamed response's head until its last chunk.
         var isStreaming = false
     }
@@ -1549,13 +1618,9 @@ final class CalyxMCPServer {
     /// `Content-Length`-declared body arrive as separate TCP segments
     /// (more likely under load — see `CalyxMCPServerTests`'s
     /// `test_realHTTPRequest_headersAndBodySplitAcrossTCPSegments_stillParsesCompleteRequest`)
-    /// used to reach `HTTPParser.parse` with the body segment still
-    /// missing. `HTTPParser.parse` doesn't treat that as an error
-    /// either — with no body bytes yet present it silently returns
-    /// `HTTPRequest.body == nil` rather than raising an
-    /// `HTTPParseError` — so `routeMCP`'s `guard let body else { 400 }`
-    /// fired on a request that was actually well-formed, just not
-    /// fully arrived yet.
+    /// would otherwise reach `HTTPParser.parse` with the body segment
+    /// still missing and be answered `.incompleteBody` (400) although it
+    /// was well-formed, just not fully arrived yet.
     ///
     /// `HTTPParser.completeness(of:)` only ever inspects `accumulator.data`
     /// for completeness (and only until `accumulator.requiredTotal` is
@@ -1590,7 +1655,9 @@ final class CalyxMCPServer {
                     state = accumulator.data.count >= requiredTotal ? .complete : .incomplete
                 } else {
                     let (resolvedState, resolvedTotal) = HTTPParser.completeness(of: accumulator.data) { headerString in
-                        accumulator.bodyLimit = self.requestBodyLimit(forHeaderString: headerString)
+                        let decision = self.requestBodyLimit(forHeaderString: headerString)
+                        accumulator.bodyLimit = decision.limit
+                        accumulator.usageVerdict = decision.usageVerdict
                         return accumulator.bodyLimit
                     }
                     accumulator.requiredTotal = resolvedTotal
@@ -1606,12 +1673,15 @@ final class CalyxMCPServer {
                         // *stale* `receive()` call that only completed
                         // because the receive-deadline `Task` already
                         // sent a 408 and cancelled the connection out
-                        // from under it. Either way, hand whatever
-                        // bytes we do have to the same parse-and-respond
-                        // path a complete request goes through —
-                        // `sendHTTPResponse`'s `accumulator.didRespond`
-                        // guard is what actually decides whether this
-                        // particular call gets to respond.
+                        // from under it. Either way the buffer is not a
+                        // complete request, and `finishRequest` runs no
+                        // route on it: `HTTPParser.parse` rejects a body
+                        // shorter than its `Content-Length`
+                        // (`.incompleteBody`) or a cut-off header block,
+                        // and the resulting 400 goes through
+                        // `sendHTTPResponse`, whose
+                        // `accumulator.didRespond` guard drops it when
+                        // the 408 already went out.
                         deadlineTask.cancel()
                         await self.finishRequest(connection: connection, buffer: accumulator.data, accumulator: accumulator)
                         return
@@ -1622,7 +1692,7 @@ final class CalyxMCPServer {
                     await self.finishRequest(connection: connection, buffer: accumulator.data, accumulator: accumulator)
                 case .tooLarge:
                     deadlineTask.cancel()
-                    self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 413, body: nil), accumulator: accumulator)
+                    self.sendTooLarge(connection: connection, bodyRefused: true, accumulator: accumulator)
                 }
             }
         }
@@ -1636,12 +1706,24 @@ final class CalyxMCPServer {
     /// `route(request:)` takes is never bounded by it.
     ///
     /// Can be entered more than once for the same `accumulator` (see
-    /// `sendHTTPResponse`'s doc comment for how) — every exit path here
-    /// routes through `sendHTTPResponse`, which is what actually
-    /// guarantees only the first call gets to respond.
+    /// `sendHTTPResponse`'s doc comment for how). A parse error always
+    /// goes through `sendHTTPResponse`, which guarantees only the first
+    /// call gets to respond; a request that parsed on a connection already
+    /// answered ends before any route code runs.
     private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
         do {
             let httpRequest = try HTTPParser.parse(buffer, maxBodySize: accumulator.bodyLimit)
+            // A connection that was already answered runs no route, even
+            // for a request that parsed complete: the receive-deadline
+            // `Task` and the receive callback carrying the last body bytes
+            // can both be queued on the main actor, and when the 408 Task
+            // runs first, the callback then finds the buffer `.complete`
+            // and calls here. The client has its answer, so the route's side effects
+            // must not happen behind it, and its response would be dropped
+            // by `sendHTTPResponse` anyway. The check sits after the parse
+            // so a parse error still goes through `sendHTTPResponse`, whose
+            // `didRespond` guard drops it, exactly as before.
+            guard !accumulator.didRespond else { return }
             if httpRequest.path == HTTPParser.calyxMCPPath {
                 await serveCalyxMCP(connection: connection, request: httpRequest, accumulator: accumulator)
                 return
@@ -1651,8 +1733,13 @@ final class CalyxMCPServer {
         } catch let error as HTTPParseError {
             let statusCode: Int
             switch error {
-            case .headerTooLarge, .bodyTooLarge: statusCode = 413
-            case .invalidContentLength, .malformedRequest: statusCode = 400
+            case .headerTooLarge:
+                sendTooLarge(connection: connection, bodyRefused: false, accumulator: accumulator)
+                return
+            case .bodyTooLarge:
+                sendTooLarge(connection: connection, bodyRefused: true, accumulator: accumulator)
+                return
+            case .invalidContentLength, .incompleteBody, .malformedRequest: statusCode = 400
             case .timeout: statusCode = 408
             }
             self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: statusCode, body: nil), accumulator: accumulator)
@@ -1771,15 +1858,60 @@ final class CalyxMCPServer {
     }
 
     /// The body cap of the request whose header block is `headerString`:
-    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token, 1 MiB
-    /// otherwise, so the larger cap is never available before
+    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token, 16 MiB
+    /// for `/usage/v1/metrics` carrying a token the usage route would
+    /// accept (`UsageIngestEndpoint.accepts`, the route's own check), 1 MiB
+    /// otherwise, so a larger cap is never available before
     /// authentication.
-    private func requestBodyLimit(forHeaderString headerString: String) -> Int {
+    ///
+    /// For the usage path with an endpoint installed, `usageVerdict` is
+    /// whether the request carries the usage credential: the endpoint's
+    /// token is read here, once, and for no other path. The note for a
+    /// refused body reuses this verdict.
+    private func requestBodyLimit(forHeaderString headerString: String) -> (limit: Int, usageVerdict: Bool?) {
         let token = self.token
-        return HTTPParser.bodyLimit(forHeaderString: headerString) { authorization in
-            guard !token.isEmpty, let authorization, authorization.hasPrefix("Bearer ") else { return false }
-            return String(authorization.dropFirst(7)) == token
+        let endpoint = usageIngest
+        var usageVerdict: Bool?
+        let limit = HTTPParser.bodyLimit(
+            forHeaderString: headerString,
+            isAuthorized: { authorization in
+                guard !token.isEmpty, let authorization, authorization.hasPrefix("Bearer ") else { return false }
+                return String(authorization.dropFirst(7)) == token
+            },
+            isUsageAuthorized: { authorization in
+                guard let endpoint else { return false }
+                let carriesCredential = UsageIngestEndpoint.accepts(authorization: authorization, token: endpoint.token())
+                usageVerdict = carriesCredential
+                return carriesCredential
+            }
+        )
+        return (limit, usageVerdict)
+    }
+
+    /// Answers 413 for a request rejected as too large before any route
+    /// code ran. A refused BODY is noted when the cap was chosen for the
+    /// usage path with an endpoint installed (`accumulator.usageVerdict`)
+    /// and an endpoint is installed now: `.tooLarge` when the request
+    /// carried the usage credential (it exceeded the 16 MiB cap),
+    /// `.unauthorized` when it did not (only the 1 MiB cap applied; the
+    /// missing credential is the cause). The verdict is the one that chose
+    /// the cap; neither the token nor the header block is read again. A
+    /// refused header block is never noted. Nothing is noted once the
+    /// connection has been answered (`sendHTTPResponse` then sends nothing
+    /// either), so a request is noted at most once.
+    ///
+    /// A request on the usage path that the transport ends with 408 (the
+    /// body did not arrive in time) or a parse-level 400 (a malformed
+    /// request or `Content-Length`) is deliberately not noted: the notes
+    /// are about exports Calyx refused, not about broken connections.
+    private func sendTooLarge(connection: NWConnection, bodyRefused: Bool, accumulator: ReceiveAccumulator) {
+        if bodyRefused,
+           !accumulator.didRespond,
+           let carriesCredential = accumulator.usageVerdict,
+           let endpoint = usageIngest {
+            endpoint.note(carriesCredential ? .tooLarge : .unauthorized, endpoint.now())
         }
+        sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 413, body: nil), accumulator: accumulator)
     }
 
     /// The sentinel receive `dispatchRoute` arms for `/approval-request`
@@ -1826,10 +1958,11 @@ final class CalyxMCPServer {
     /// `connection.cancel()` completes whatever `receive()` call was
     /// still outstanding at that moment. That completion re-enters
     /// `receiveUntilComplete`'s `isComplete || error != nil` branch —
-    /// indistinguishable there from a genuine peer close — which would,
-    /// without this guard, call `finishRequest` and send a second,
-    /// spurious response on a connection already cancelled by the
-    /// first. `deadlineTask.cancel()` at each of `receiveUntilComplete`'s
+    /// indistinguishable there from a genuine peer close — which calls
+    /// `finishRequest` on the partial buffer. That buffer ends in a parse
+    /// error (no route runs on it, see `finishRequest`), and without this
+    /// guard its 400 would go out as a second, spurious response on a
+    /// connection already cancelled by the first. `deadlineTask.cancel()` at each of `receiveUntilComplete`'s
     /// terminal branches narrows the same race in the other direction
     /// but — being only a cooperative-cancellation flag — cannot fully
     /// close it either: this `didRespond` check is the actual
@@ -2030,6 +2163,16 @@ final class CalyxMCPServer {
                 id: id,
                 toolName: toolName,
                 params: params
+            )
+        }
+
+        // usage_* route — dispatched through `MCPUsageBridge`.
+        if MCPRouter.isUsageTool(name: toolName) {
+            return await handleUsageToolCall(
+                id: id,
+                toolName: toolName,
+                params: params,
+                surfaceID: surfaceID
             )
         }
 
@@ -2393,6 +2536,32 @@ final class CalyxMCPServer {
         }
     }
 
+    // MARK: - usage_* Tool Dispatch
+
+    /// Route a `usage_*` tool call to `MCPUsageBridge`, in
+    /// `handleTerminalToolCall`'s shape, passing the request's surface so
+    /// `session_id: "current"` can name the calling pane's session. The
+    /// bridge is optional (installed with the usage ledger), so without
+    /// one every usage_* name is the "not available" tool error. A thrown
+    /// error, the store's included, becomes the tool-error text.
+    private func handleUsageToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable],
+        surfaceID: UUID?
+    ) async -> (statusCode: Int, body: Data?) {
+        guard let usageBridge else {
+            return toolError(id: id, text: "Usage tracking is not available.")
+        }
+        let arguments = extractDict(params, "arguments") ?? [:]
+        do {
+            let text = try await usageBridge.handleToolCall(name: toolName, arguments: arguments, surfaceID: surfaceID)
+            return toolSuccess(id: id, text: text)
+        } catch {
+            return toolError(id: id, text: error.localizedDescription)
+        }
+    }
+
     // MARK: - Response Helpers
 
     private func unauthorizedResponse() -> (statusCode: Int, body: Data?) {
@@ -2500,5 +2669,42 @@ final class MCPSessionBearerToken: Sendable {
     var value: String {
         get { storage.withLock { $0 } }
         set { storage.withLock { $0 = newValue } }
+    }
+}
+
+// MARK: - Usage Ingest Endpoint
+
+/// What `UsageIngestEndpoint.ingest` made of one export.
+enum UsageIngestOutcome: Sendable, Equatable {
+    case stored        // decoded and committed
+    case dropped       // accepted and discarded on purpose (tracking is off, or data is being deleted)
+    case undecodable   // the body is not a metric export
+    case unavailable   // the store could not take it; the same data arrives again with the next export
+}
+
+/// Why a request on the usage path was not accepted.
+enum UsageIngestRejection: String, Sendable, Equatable {
+    case foreignOrigin, unauthorized, tooLarge, noBody, undecodable, unavailable
+}
+
+/// What the app installs on the server to receive usage exports.
+struct UsageIngestEndpoint {
+    /// The token to accept right now; nil when there is none (then every request is unauthorized).
+    let token: @MainActor () -> String?
+    let now: @MainActor () -> Date
+    let ingest: @Sendable (_ body: Data, _ receivedAtNs: Int64) async -> UsageIngestOutcome
+    /// Called for every request on the usage path that reached a verdict: nil for an accepted one (stored or dropped).
+    let note: @MainActor (_ rejection: UsageIngestRejection?, _ at: Date) -> Void
+}
+
+extension UsageIngestEndpoint {
+    /// Whether `authorization` is exactly `Bearer <token>` for a non-nil,
+    /// non-empty `token`. The whole value is compared in constant time
+    /// (`HTTPParser.constantTimeEquals`), so neither the scheme nor the
+    /// token is matched with an early exit. The single definition behind
+    /// both the usage path's transport cap and the route's own check.
+    static func accepts(authorization: String?, token: String?) -> Bool {
+        guard let token, !token.isEmpty, let authorization else { return false }
+        return HTTPParser.constantTimeEquals(authorization, "Bearer " + token)
     }
 }

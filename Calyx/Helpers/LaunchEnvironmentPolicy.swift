@@ -25,6 +25,12 @@
 // point that can trigger activation (the launch path and both Settings
 // handlers) must consult this same predicate rather than each carrying
 // its own copy of the condition.
+//
+// The same predicate decides whether usage tracking may run
+// (`UsageLedger.isTrackingEnabled`): in that launch `~/.claude/projects`
+// and the Application Support directory are the developer's real ones
+// too, so the ledger must neither read those transcripts nor create its
+// database there.
 
 import Foundation
 
@@ -54,6 +60,16 @@ enum LaunchEnvironmentPolicy {
     /// combination -- not `--uitesting` at all, or `--uitesting` WITH a
     /// scoped path root -- is safe to activate: a scoped path root
     /// confines every write this activation performs to that root.
+    ///
+    /// Also the launch condition of usage tracking
+    /// (`UsageLedger.isTrackingEnabled`), for the same reason: where this
+    /// is false, the transcripts the ledger would read and the directory
+    /// its database would be created in are the developer's real ones.
+    /// Where it is false the shared ledger's store is also moved to a
+    /// per-process temporary directory
+    /// (`UsageLedger.productionStoreDirectory`), because reading and
+    /// deleting (the Usage window) open an existing database even with
+    /// tracking off.
     static func mayPerformAgentIPCActivation(arguments: [String], hasScopedPathRoot: Bool) -> Bool {
         !(arguments.contains("--uitesting") && !hasScopedPathRoot)
     }

@@ -14,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     private var windowControllers: [CalyxWindowController] = []
     private var pendingURLs: [URL] = []
     private var quickTerminalController: QuickTerminalController?
+    /// The `.calyxIPCStateDidChange` observer `startUsageLedger` installs;
+    /// removed when this delegate goes away.
+    private var usageIPCStateObservation: NotificationObservation?
     /// The MCP Apps host (`MCPHostComposition.swift`). Built in
     /// `applicationDidFinishLaunching`, so nil in the unit-test host.
     private(set) var mcpHostComposition: MCPHostComposition?
@@ -1145,6 +1148,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // Before `resyncAgentHooksIfInstalled()`, so the IPC start it may
         // trigger reaches the MCP host.
         startMCPHost()
+        // Before `resyncAgentHooksIfInstalled()`, so the usage route's
+        // endpoint is in place before the IPC start it may trigger
+        // accepts an export.
+        startUsageLedger(server: .shared, ledger: .shared)
         resyncAgentHooksIfInstalled()
 
         browserTabBroker.appDelegate = self
@@ -1500,6 +1507,68 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     @objc private func handleApprovalInboxChangedForPanel(_ notification: Notification) {
         guard !isApplicationTerminating else { return }
         approvalPanelController.render()
+    }
+
+    // MARK: - Usage ledger
+
+    /// Connects `ledger` to `server`. Safe with tracking off: the ledger
+    /// then drops every export and creates nothing. Nothing here reads a
+    /// file or waits; the startup work runs in a task of its own.
+    ///
+    /// It installs the server's usage bridge, which answers the
+    /// usage_* MCP tools from the same ledger. Whether tracking is on is
+    /// the ledger's own `isTracking`, so the tool and the ledger never
+    /// disagree; `current` is looked up in the registry the server holds
+    /// at call time.
+    ///
+    /// R3b: it installs the usage route's endpoint (`server.usageIngest`),
+    /// which accepts the credential `credentialHolder` holds, hands every
+    /// export to `ledger.ingestExport` and notes every verdict in
+    /// `ingestMonitor`. Its startup work runs in one task, returned so a
+    /// caller can wait for it, at utility priority.
+    ///
+    /// R4b: that task awaits ONE `activation.reconcile()`, which loads the
+    /// credential (its loader owns the directory), syncs the store's
+    /// tracking flag and brings Claude Code's settings file in line with
+    /// the switches; then the catch-up runs.
+    /// Every `.calyxIPCStateDidChange` requests another reconcile; that
+    /// observer lives as long as this delegate (or until the next call)
+    /// and holds `activation` weakly.
+    ///
+    /// Token counts reach the ledger only through Claude Code's telemetry export; agent hooks do not feed it.
+    @discardableResult
+    func startUsageLedger(
+        server: CalyxMCPServer,
+        ledger: UsageLedger,
+        credentialHolder: UsageIngestCredentialHolder = .shared,
+        ingestMonitor: UsageIngestMonitor = .shared,
+        activation: UsageTelemetryActivation = .shared
+    ) -> Task<Void, Never> {
+        // Weak: the server owns the bridge, so a strong capture would be
+        // a cycle. The bridge is only reached through the server, so the
+        // server is alive whenever the closure runs.
+        server.usageBridge = MCPUsageBridge(
+            isEnabled: { ledger.isTracking },
+            reports: { queries, calendar in try await ledger.tokenReports(queries, calendar: calendar) },
+            currentSessionID: { [weak server] surfaceID in server?.agentRegistry.entries[surfaceID]?.sessionID },
+            now: { Date() },
+            calendar: { Calendar.current })
+        server.usageIngest = UsageIngestEndpoint(
+            token: { credentialHolder.credential?.token },
+            now: Date.init,
+            ingest: { body, receivedAtNs in await ledger.ingestExport(body, receivedAtNs: receivedAtNs) },
+            note: { ingestMonitor.note($0, at: $1) })
+        // Catch-up work: at utility priority it does not compete with the
+        // main thread while windows are being restored.
+        usageIPCStateObservation = NotificationObservation(
+            name: .calyxIPCStateDidChange
+        ) { [weak activation] in
+            await activation?.reconcile()
+        }
+        return Task(priority: .utility) {
+            await activation.reconcile()
+            await ledger.catchUp()
+        }
     }
 
     // MARK: - MCP Apps host
@@ -2632,6 +2701,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         )
         sessionBrowserItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(sessionBrowserItem)
+
+        let usageItem = NSMenuItem(
+            title: "Usage",
+            action: #selector(openUsageWindow(_:)),
+            keyEquivalent: "u"
+        )
+        usageItem.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(usageItem)
 
         // Window menu
         let windowMenuItem = NSMenuItem()
@@ -4490,6 +4567,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// palette command `session.attach`, the Settings panel button).
     @objc private func openSessionBrowser(_ sender: Any?) {
         SessionBrowserWindowController.shared.showBrowser()
+    }
+
+    /// View menu's "Usage" item (Option-Command-U; Shift-Command-U is
+    /// "Jump to Unread Tab"). The palette's `usage.show` command opens it too.
+    @objc private func openUsageWindow(_ sender: Any?) {
+        UsageWindowController.shared.showUsage()
     }
 }
 

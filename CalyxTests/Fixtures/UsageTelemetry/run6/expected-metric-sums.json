@@ -1,0 +1,10 @@
+{
+ "66666666-6666-4666-8666-666666666661": {
+  "claude-sonnet-5-5": {
+   "cacheCreation": 70,
+   "cacheRead": 50837,
+   "input": 2,
+   "output": 3
+  }
+ }
+}
