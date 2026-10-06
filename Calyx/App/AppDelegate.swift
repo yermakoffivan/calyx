@@ -2702,11 +2702,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         sessionBrowserItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(sessionBrowserItem)
 
-        viewMenu.addItem(
-            withTitle: "Usage",
+        let usageItem = NSMenuItem(
+            title: "Usage",
             action: #selector(openUsageWindow(_:)),
-            keyEquivalent: ""
+            keyEquivalent: "u"
         )
+        usageItem.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(usageItem)
 
         // Window menu
         let windowMenuItem = NSMenuItem()
@@ -4567,8 +4569,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         SessionBrowserWindowController.shared.showBrowser()
     }
 
-    /// View menu's "Usage" item (no key equivalent; the palette's
-    /// `usage.show` command is the keyboard path).
+    /// View menu's "Usage" item (Option-Command-U; Shift-Command-U is
+    /// "Jump to Unread Tab"). The palette's `usage.show` command opens it too.
     @objc private func openUsageWindow(_ sender: Any?) {
         UsageWindowController.shared.showUsage()
     }

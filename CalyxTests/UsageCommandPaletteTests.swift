@@ -3,8 +3,8 @@
 //  CalyxTests
 //
 //  Pins the command palette's entry for the Usage window: `usage.show`,
-//  titled "Usage…" (one ellipsis character) in the View category, with
-//  no shortcut, registered by `CalyxWindowController
+//  titled "Usage…" (one ellipsis character) in the View category, showing
+//  the View menu's shortcut "Cmd+Opt+U" (R5f), registered by `CalyxWindowController
 //  .setupCommandRegistry`. Queries `commandRegistry.allCommands`
 //  directly, like `SessionCommandPaletteTests`. The handler is not run:
 //  it opens the shared Usage window, whose model reads the app's real
@@ -41,6 +41,6 @@ final class UsageCommandPaletteTests: XCTestCase {
         let command = try XCTUnwrap(matches.first)
         XCTAssertEqual(command.title, "Usage\u{2026}")
         XCTAssertEqual(command.category, "View")
-        XCTAssertNil(command.shortcut)
+        XCTAssertEqual(command.shortcut, "Cmd+Opt+U")
     }
 }

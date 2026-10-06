@@ -6,8 +6,8 @@
 //  (`UsageWindowController.shared.showUsage()` through
 //  `AppDelegate.openUsageWindow(_:)`): it sits directly after "Session
 //  Browser", the other app-level window opened from that menu, and has
-//  no key equivalent (the window is opened rarely, and the palette's
-//  `usage.show` command is the keyboard path).
+//  the key equivalent Option-Command-U (Shift-Command-U is "Jump to
+//  Unread Tab"; R5f).
 //
 //  The action is pinned by its selector NAME, so this file compiles
 //  without the method; a missing item fails at runtime. As in
@@ -51,12 +51,37 @@ final class AppDelegateUsageMenuItemTests: XCTestCase {
         XCTAssertEqual(items.filter { $0.title == "Usage" }.count, 1)
     }
 
-    func test_usageItem_opensTheUsageWindow_andHasNoKeyEquivalent() throws {
+    func test_usageItem_opensTheUsageWindow_andHasOptionCommandU() throws {
         let item = try XCTUnwrap(try viewMenu().items.first { $0.title == "Usage" }, "View > Usage is missing")
 
         XCTAssertEqual(item.action.map(NSStringFromSelector), "openUsageWindow:")
-        XCTAssertEqual(item.keyEquivalent, "")
+        XCTAssertEqual(item.keyEquivalent, "u")
+        XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .option])
         XCTAssertNil(item.submenu)
+    }
+
+    func test_optionCommandU_isUsedOnlyByTheUsageItem() throws {
+        let appDelegate = AppDelegate()
+        appDelegate.setupMainMenu()
+        let mainMenu = try XCTUnwrap(NSApp.mainMenu)
+        let users = allItems(in: mainMenu).filter {
+            $0.keyEquivalent.lowercased() == "u"
+                && $0.keyEquivalentModifierMask.intersection(.deviceIndependentFlagsMask) == [.command, .option]
+        }
+        XCTAssertEqual(users.map(\.title), ["Usage"])
+    }
+
+    /// AppKit clears the key equivalent of a menu item that collides with
+    /// one already in the tree, so a Usage item on Shift-Command-U would
+    /// leave the uniqueness test below green and silently take the
+    /// shortcut from "Jump to Unread Tab". Pin the neighbour directly.
+    func test_jumpToUnreadTab_keepsShiftCommandU() throws {
+        let appDelegate = AppDelegate()
+        appDelegate.setupMainMenu()
+        let mainMenu = try XCTUnwrap(NSApp.mainMenu)
+        let item = try XCTUnwrap(allItems(in: mainMenu).first { $0.title == "Jump to Unread Tab" })
+        XCTAssertEqual(item.keyEquivalent, "u")
+        XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .shift])
     }
 
     /// Same invariant as the Session Browser menu test: no two items in

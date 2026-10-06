@@ -29,7 +29,7 @@ final class UsageWindowController: NSWindowController {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 860, height: 480),
+            contentRect: NSRect(origin: .zero, size: UsageWindowView.initialSize),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false

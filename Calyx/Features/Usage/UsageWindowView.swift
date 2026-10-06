@@ -55,7 +55,7 @@ struct UsageWindowView: View {
             }
         }
         .padding(14)
-        .frame(minWidth: 760, minHeight: 360)
+        .frame(minWidth: Self.minimumWidth, minHeight: Self.minimumHeight)
         .onChange(of: model.period) { refresh() }
         .onChange(of: model.project) { refresh() }
         .onChange(of: model.thread) { refresh() }
@@ -68,6 +68,34 @@ struct UsageWindowView: View {
             }
         } message: {
             Text(Self.deleteDialogMessage)
+        }
+    }
+
+    // MARK: - Size
+
+    /// The window's minimum content size: wide enough for four key
+    /// columns and the four token columns at their ideal widths, plus the
+    /// padding, the column gaps and the scroller.
+    static let minimumWidth: CGFloat = 1220
+    static let minimumHeight: CGFloat = 360
+
+    /// The window's content size when it is first opened.
+    static let initialSize = CGSize(width: 1220, height: 520)
+
+    /// A table column's minimum and ideal width.
+    struct ColumnWidth: Equatable {
+        let min: CGFloat
+        let ideal: CGFloat
+    }
+
+    /// The width of every token column.
+    static let tokenColumnWidth = ColumnWidth(min: 90, ideal: 110)
+
+    /// The width of a key column.
+    static func columnWidth(for dimension: UsageTokenQuery.Dimension) -> ColumnWidth {
+        switch dimension {
+        case .day: ColumnWidth(min: 90, ideal: 100)
+        case .model, .effort, .thread, .project, .agentType, .session: ColumnWidth(min: 90, ideal: 140)
         }
     }
 
@@ -328,6 +356,12 @@ private struct UsageTable: View {
 
     private typealias Column = UsageWindowView.Column
 
+    private let tokenWidth = UsageWindowView.tokenColumnWidth
+
+    private func keyWidth(_ dimension: UsageTokenQuery.Dimension) -> UsageWindowView.ColumnWidth {
+        UsageWindowView.columnWidth(for: dimension)
+    }
+
     /// One key column: its position in the key and its dimension.
     private struct KeyColumn: Hashable {
         let index: Int
@@ -340,11 +374,16 @@ private struct UsageTable: View {
                 TableColumn(UsageWindowView.columnTitle(for: column.dimension)) { line in
                     cell(column.index < line.cells.count ? line.cells[column.index] : "", line)
                 }
+                .width(min: keyWidth(column.dimension).min, ideal: keyWidth(column.dimension).ideal)
             }
             TableColumn(Column.input) { line in number(line.tokens.input, line) }
+                .width(min: tokenWidth.min, ideal: tokenWidth.ideal)
             TableColumn(Column.cacheRead) { line in number(line.tokens.cacheRead, line) }
+                .width(min: tokenWidth.min, ideal: tokenWidth.ideal)
             TableColumn(Column.cacheWrite) { line in number(line.tokens.cacheCreation, line) }
+                .width(min: tokenWidth.min, ideal: tokenWidth.ideal)
             TableColumn(Column.output) { line in number(line.tokens.output, line) }
+                .width(min: tokenWidth.min, ideal: tokenWidth.ideal)
         }
         .id(groupBy)
         .accessibilityIdentifier(AccessibilityID.Usage.table)

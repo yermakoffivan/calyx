@@ -217,3 +217,43 @@ final class UsageWindowViewPinsTests: XCTestCase {
             "Not receiving: AI Agent IPC is off.")
     }
 }
+
+// MARK: - Window size and column widths (R5f)
+
+@MainActor
+final class UsageWindowViewSizePinsTests: XCTestCase {
+
+    func test_minimumSize_is1220By360() {
+        XCTAssertEqual(UsageWindowView.minimumWidth, 1220)
+        XCTAssertEqual(UsageWindowView.minimumHeight, 360)
+    }
+
+    func test_initialSize_is1220By520() {
+        XCTAssertEqual(UsageWindowView.initialSize, CGSize(width: 1220, height: 520))
+    }
+
+    func test_keyColumnWidths_dayIs90To100_othersAre90To140() {
+        XCTAssertEqual(UsageWindowView.columnWidth(for: .day), UsageWindowView.ColumnWidth(min: 90, ideal: 100))
+        for dimension: UsageTokenQuery.Dimension in [.model, .effort, .thread, .project] {
+            XCTAssertEqual(
+                UsageWindowView.columnWidth(for: dimension), UsageWindowView.ColumnWidth(min: 90, ideal: 140),
+                "\(dimension)")
+        }
+    }
+
+    func test_tokenColumnWidth_is90To110() {
+        XCTAssertEqual(UsageWindowView.tokenColumnWidth, UsageWindowView.ColumnWidth(min: 90, ideal: 110))
+    }
+
+    /// The default eight columns' ideal widths (4 * 140 + 4 * 110 = 1000)
+    /// plus the window's 2 * 14 padding and an allowance of 20 for each of
+    /// the 7 column gaps, the table's insets and the scroller (9 * 20)
+    /// fit in the minimum width: 1208 <= 1220.
+    func test_defaultEightColumns_idealWidths_fitTheMinimumWidth() {
+        let keys: [UsageTokenQuery.Dimension] = [.model, .effort, .thread, .project]
+        let total = keys.map { UsageWindowView.columnWidth(for: $0).ideal }.reduce(0, +)
+            + 4 * UsageWindowView.tokenColumnWidth.ideal
+        XCTAssertEqual(total, 1000)
+        XCTAssertLessThanOrEqual(total + 28 + 9 * 20, UsageWindowView.minimumWidth)
+    }
+}
