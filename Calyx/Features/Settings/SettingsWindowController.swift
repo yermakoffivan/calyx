@@ -998,22 +998,20 @@ private final class SettingsTabViewController: NSTabViewController {
 /// Hosts one SettingsPane's content stack at a fixed width, inside a
 /// vertically scrolling NSScrollView. NSTabViewController (tabStyle
 /// .toolbar) resizes the Settings window to each tab's
-/// preferredContentSize on selection: a pane whose content fits within
-/// the screen sizes the window exactly to that content (the scroller
-/// stays auto-hidden, so this is visually identical to a plain
-/// fixed-height view), while a pane taller than the screen's visible
-/// height instead caps the window there and reveals the scroller, so
-/// its trailing rows stay reachable instead of being clipped below the
-/// window with no way to scroll to them.
+/// preferredContentSize on selection: a pane whose content is no taller
+/// than `SettingsLayout.maxPaneContentHeight` sizes the window exactly to
+/// that content (the scroller stays auto-hidden, so this is visually
+/// identical to a plain fixed-height view), while a taller pane stops at
+/// that height and reveals the scroller, so its trailing rows are reached
+/// by scrolling. The window keeps its top edge, x and width when fitted to
+/// a pane, and its bottom edge stays `SettingsLayout.screenBottomMargin`
+/// above the bottom of its screen's visible frame.
 @MainActor
 final class SettingsPaneContentViewController: NSViewController {
 
-    /// Vertical space reserved for the window's title bar, the Settings
-    /// toolbar, and top/bottom margins when a pane's natural content
-    /// height must be capped to the screen's visible height.
-    private static let verticalChrome: CGFloat = 120
-    /// Floor under the height cap so a missing/tiny screen can never
-    /// collapse the window to something unusably short.
+    /// Floor under the pane's content height, and under the window height
+    /// when the window's top is too close to the screen bottom to fit more,
+    /// so the window never collapses to something unusably short.
     private static let minimumContentHeight: CGFloat = 200
 
     /// The scroll view's document view. Flipped so content starts at the
@@ -1072,54 +1070,109 @@ final class SettingsPaneContentViewController: NSViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        measurePreferredContentSize()
+        measurePreferredContentSize(in: nil)
     }
 
     /// Measures the pane again after its content changed height, and
     /// resizes the window to it when this pane is the one on screen. A
-    /// pane not on screen is resized by `viewDidAppear()` when selected.
-    /// Does nothing before the view is loaded: `viewDidLoad()` measures.
+    /// pane not on screen is measured again by `viewDidAppear()` when its
+    /// tab is selected. Does nothing before the view is loaded:
+    /// `viewDidLoad()` measures.
     func contentDidChange() {
         guard isViewLoaded else { return }
-        measurePreferredContentSize()
+        measurePreferredContentSize(in: view.window)
         fitWindowToPreferredHeight()
     }
 
-    private func measurePreferredContentSize() {
+    /// Sets `preferredContentSize` once to the pane's natural height capped
+    /// at `SettingsLayout.maxPaneContentHeight`, further limited, when
+    /// `window` is given, to the content height of the frame
+    /// `fittedWindowFrame` gives that window for it.
+    private func measurePreferredContentSize(in window: NSWindow?) {
         documentView.layoutSubtreeIfNeeded()
         let naturalHeight = documentView.fittingSize.height
-        let maxHeight = (NSScreen.main?.visibleFrame.height ?? naturalHeight) - Self.verticalChrome
-        let cappedHeight = max(Self.minimumContentHeight, min(naturalHeight, maxHeight))
-        preferredContentSize = NSSize(width: width, height: cappedHeight)
+        var height = max(Self.minimumContentHeight,
+                         min(naturalHeight, SettingsLayout.maxPaneContentHeight))
+        if let window {
+            height = window.contentRect(forFrameRect: fittedFrame(of: window, contentHeight: height)).height
+        }
+        preferredContentSize = NSSize(width: width, height: height)
     }
 
-    /// Grow (or shrink) the window to this pane's `preferredContentSize`
-    /// height. NSTabViewController sizes each selected pane's view to its
-    /// `preferredContentSize`, but when a pane is loaded lazily on tab
-    /// selection it reads that size before this controller has computed it
-    /// and so leaves the window at the previously shown (shorter) pane's
-    /// height: the taller pane's scroll view then overflows the window's
-    /// bottom edge, and because its clip view fills that same overflowing
-    /// frame there is no scroll range, so the pane's trailing rows are
-    /// clipped off-screen with no way to reach them. Matching the window's
-    /// content height to the pane here shows the whole pane on any screen
-    /// tall enough for it, and leaves the scroll view to scroll only when
-    /// the screen-height cap made the window shorter than the content.
+    /// Showing the window: when the window is ordered in, NSTabViewController
+    /// resizes it to the selected pane's `preferredContentSize` (keeping
+    /// the top edge) before `viewDidAppear()`. That size was measured with
+    /// no window, so it is limited here for the window's position first;
+    /// otherwise that resize would push the bottom edge past the
+    /// screen-bottom margin until `viewDidAppear()` corrected it. On a tab
+    /// switch `view.window` is still nil here, so this returns without
+    /// measuring and `viewDidAppear()` measures instead.
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        guard let window = view.window else { return }
+        measurePreferredContentSize(in: window)
+    }
+
+    /// Tab switches: the incoming pane is in the window only from here on
+    /// (`viewWillAppear()` sees no window then), so it is measured for the
+    /// window's position and the window is fitted to it, keeping the top
+    /// edge, stopping the bottom edge `SettingsLayout.screenBottomMargin`
+    /// above the screen's visible bottom, floored at `minimumContentHeight`.
+    /// The measure must come first: NSTabViewController sets the window
+    /// back to the pane's `preferredContentSize` after a frame change made
+    /// during the switch, so a fit to a size it does not also prefer would
+    /// be undone.
     override func viewDidAppear() {
         super.viewDidAppear()
+        measurePreferredContentSize(in: view.window)
         fitWindowToPreferredHeight()
+    }
+
+    /// The frame for a window currently at `current` fitted to
+    /// `targetFrameHeight`: top edge, x and width unchanged, and the height
+    /// reduced so the bottom edge stays `bottomMargin` above
+    /// `visibleFrame.minY`, but never below `minimumFrameHeight`. A nil
+    /// `visibleFrame` (window on no screen) applies no screen limit.
+    static func fittedWindowFrame(
+        current: NSRect,
+        targetFrameHeight: CGFloat,
+        minimumFrameHeight: CGFloat,
+        visibleFrame: NSRect?,
+        bottomMargin: CGFloat
+    ) -> NSRect {
+        var height = targetFrameHeight
+        if let visibleFrame {
+            let availableHeight = current.maxY - (visibleFrame.minY + bottomMargin)
+            height = max(minimumFrameHeight, min(targetFrameHeight, availableHeight))
+        }
+        return NSRect(x: current.minX, y: current.maxY - height, width: current.width, height: height)
+    }
+
+    /// `window`'s frame fitted to `contentHeight` on the screen it is on.
+    private func fittedFrame(of window: NSWindow, contentHeight: CGFloat) -> NSRect {
+        let contentRect = window.contentRect(forFrameRect: window.frame)
+        func frameHeight(forContentHeight height: CGFloat) -> CGFloat {
+            window.frameRect(forContentRect: NSRect(
+                x: contentRect.minX, y: contentRect.minY,
+                width: contentRect.width, height: height)).height
+        }
+        return Self.fittedWindowFrame(
+            current: window.frame,
+            targetFrameHeight: frameHeight(forContentHeight: contentHeight),
+            minimumFrameHeight: frameHeight(forContentHeight: Self.minimumContentHeight),
+            visibleFrame: window.screen?.visibleFrame,
+            bottomMargin: SettingsLayout.screenBottomMargin)
     }
 
     private func fitWindowToPreferredHeight() {
         guard let window = view.window else { return }
-        var contentRect = window.contentRect(forFrameRect: window.frame)
-        let targetHeight = preferredContentSize.height
-        guard abs(contentRect.height - targetHeight) > 0.5 else { return }
-        // Keep the title bar fixed and grow/shrink downward: in AppKit's
-        // bottom-left window coordinates that means moving the origin by
-        // the height delta as the height changes.
-        contentRect.origin.y += contentRect.height - targetHeight
-        contentRect.size.height = targetHeight
-        window.setFrame(window.frameRect(forContentRect: contentRect), display: true, animate: false)
+        let fitted = fittedFrame(of: window, contentHeight: preferredContentSize.height)
+        let current = window.frame
+        let differs = abs(fitted.minX - current.minX) > 0.5
+            || abs(fitted.minY - current.minY) > 0.5
+            || abs(fitted.width - current.width) > 0.5
+            || abs(fitted.height - current.height) > 0.5
+        guard differs else { return }
+        window.setFrame(fitted, display: true, animate: false)
     }
 }

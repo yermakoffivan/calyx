@@ -22,6 +22,12 @@ enum SettingsLayout {
     static let paneContentInset: CGFloat = 24
     /// Width available to a pane's content.
     static let contentWidth: CGFloat = paneWidth - 2 * paneContentInset
+    /// Tallest content height a pane sizes the window to. A pane whose
+    /// content is taller stops here and scrolls inside its scroll view.
+    static let maxPaneContentHeight: CGFloat = 640
+    /// Minimum gap kept between the Settings window's bottom edge and the
+    /// bottom of its screen's visible frame when the window grows downward.
+    static let screenBottomMargin: CGFloat = 48
     /// Vertical gap between consecutive items of a pane: heading,
     /// description, rows, separators, and the lines inside a section.
     static let itemSpacing: CGFloat = 18
