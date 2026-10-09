@@ -6,6 +6,10 @@
 import Foundation
 
 enum AccessibilityID {
+    enum Terminal {
+        static let panePrefix = "calyx.terminal.pane."
+        static func pane(_ id: UUID) -> String { panePrefix + id.uuidString }
+    }
     enum Sidebar {
         static let container = "calyx.sidebar"
         static let newGroupButton = "calyx.sidebar.newGroupButton"
