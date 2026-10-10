@@ -87,6 +87,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **Search and Navigation** -- highlighted scrollback search, native overlay scrollbar, smooth trackpad and mouse-wheel scrolling, and prompt-line cursor click-to-move
 - **Input Tools** -- shell-escaped drag and drop, multiline Compose Overlay, clipboard safety confirmation, and Secure Keyboard Entry that turns on automatically at password prompts, including inside local persistent sessions
 - **Quick Terminal and Notifications** -- a system-wide drop-down terminal plus OSC 9/99/777 desktop notifications
+- **VoiceOver and XCUITest** -- every terminal pane is an AXTextArea named "Terminal" (identifier `calyx.terminal.pane.<uuid>`) that exposes the visible viewport line by line with the current selection and on-screen frames; scrollback is not exposed
 - **Liquid Glass Appearance** -- macOS 26-native glass UI drawn as one seamless sheet of window chrome, eight theme presets, custom colors, adaptive text color, an optional opacity pass that reaches cells an app paints itself, and a fully opaque window under Reduce Transparency ([demo video](https://www.youtube.com/watch?v=cUYc7yzI_eM))
 - **About Window and Help Menu** -- **About Calyx** shows the version, build, and a linked git commit with **Docs** and **GitHub** buttons; **Help -> Calyx Help** (`Cmd+?`) opens the help center
 
