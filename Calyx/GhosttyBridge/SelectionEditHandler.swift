@@ -135,6 +135,16 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
     func readAndDecodeText(
         _ read: (inout ghostty_text_s) -> Bool
     ) -> (text: String, raw: ghostty_text_s)? {
+        readAndDecodeTextAllowingEmpty(read).flatMap { $0.text.isEmpty ? nil : $0 }
+    }
+
+    /// The single read/decode/free path (`readAndDecodeText(_:)` wraps it); an
+    /// empty or absent buffer yields `""` instead of nil, so callers still
+    /// get `raw`'s `tl_px_x`/`tl_px_y`/`offset_start`/`offset_len`.
+    /// Returns nil only when `read` reports failure.
+    func readAndDecodeTextAllowingEmpty(
+        _ read: (inout ghostty_text_s) -> Bool
+    ) -> (text: String, raw: ghostty_text_s)? {
         var text = ghostty_text_s()
         guard read(&text) else { return nil }
         defer {
@@ -143,16 +153,54 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
         }
 
         let len = Int(text.text_len)
-        guard len > 0, let ptr = text.text else { return nil }
+        guard len > 0, let ptr = text.text else { return (text: "", raw: text) }
 
         let uint8Ptr = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
         let buffer = UnsafeBufferPointer(start: uint8Ptr, count: len)
-        let decoded = String(decoding: buffer, as: UTF8.self)
-        guard !decoded.isEmpty else { return nil }
+        return (text: String(decoding: buffer, as: UTF8.self), raw: text)
+    }
 
-        return (text: decoded, raw: text)
+    /// Reads one viewport row as a rectangle selection
+    /// `VIEWPORT/EXACT (0,row)..(columns-1,row)`. `rectangle: true` disables
+    /// ghostty's spacer_head extension into the next row (formatter.zig:908),
+    /// so soft-wrapped rows keep their own boundaries.
+    func readViewportRow(_ row: Int, columns: Int) -> TerminalAXRowRead? {
+        guard row >= 0, columns > 0 else { return nil }
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: 0,
+                y: UInt32(row)
+            ),
+            bottom_right: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: UInt32(columns - 1),
+                y: UInt32(row)
+            ),
+            rectangle: true
+        )
+        guard let result = readAndDecodeTextAllowingEmpty({
+            GhosttyFFI.surfaceReadText(surface, selection: selection, text: &$0)
+        }) else { return nil }
+        return TerminalAXRowRead(text: result.text, tlPxX: result.raw.tl_px_x, tlPxY: result.raw.tl_px_y)
+    }
+
+    /// Viewport grid size; nil when the surface reports no columns or rows.
+    func gridSize() -> TerminalAXGridSize? {
+        let size = GhosttyFFI.surfaceSize(surface)
+        guard size.columns > 0, size.rows > 0 else { return nil }
+        return TerminalAXGridSize(
+            columns: Int(size.columns),
+            rows: Int(size.rows),
+            cellWidthPx: Int(size.cell_width_px),
+            cellHeightPx: Int(size.cell_height_px)
+        )
     }
 }
+
+extension GhosttySurfaceSelectionReader: TerminalAXTextSource {}
 
 /// Writes text to the system pasteboard.
 @MainActor

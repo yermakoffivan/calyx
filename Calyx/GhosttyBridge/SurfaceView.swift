@@ -100,6 +100,26 @@ class SurfaceView: NSView {
     /// Non-nil when we are inside a keyDown handler.
     private var keyTextAccumulator: [String]? = nil
 
+    // MARK: - Accessibility Snapshot
+
+    /// Last built AX snapshot of the viewport, reused for `axSnapshotTTL`.
+    /// `font` is the quicklook font fetched once per build.
+    private var axSnapshotCache: (snapshot: TerminalAXSnapshot, leftPaddingPt: CGFloat?, font: CTFont?, builtAt: Date)?
+
+    /// Last non-nil left padding seen across rebuilds.
+    private var axLastLeftPaddingPt: CGFloat?
+
+    /// How long an AX snapshot is reused before re-reading the viewport.
+    var axSnapshotTTL: TimeInterval = 0.1
+
+    /// Clock for the AX snapshot cache (injectable for tests).
+    var axNow: () -> Date = Date.init
+
+    #if DEBUG
+    /// Test-only text source used instead of the ghostty surface.
+    var axTextSourceOverrideForTesting: TerminalAXTextSource?
+    #endif
+
     // MARK: - Smooth Scrolling
 
     /// Accumulated pixel offset for smooth scrolling (mirrors ghostty's pending_scroll_y).
@@ -254,6 +274,7 @@ class SurfaceView: NSView {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        axSnapshotCache = nil
 
         // Skip zero-size updates to prevent Metal layer bad state.
         guard newSize.width > 0, newSize.height > 0 else { return }
@@ -1133,16 +1154,30 @@ extension SurfaceView: @preconcurrency NSTextInputClient {
         let imePos = surfaceController.imePoint()
         let cellSize = surfaceController.cellSize
 
-        // Ghostty coordinates are top-left origin; convert to bottom-left for AppKit.
-        // SUBTRACT smoothScrollPixelOffset here (opposite sign from sendMousePos) because
-        // this converts FROM content-space TO screen-space for IME candidate placement.
-        let viewRect = NSRect(
+        // imePos.y is the bottom of the cursor cell in top-left content space,
+        // so the content rect's maxY is imePos.y.
+        let height = max(imePos.height, cellSize.height)
+        let contentRect = NSRect(
             x: imePos.x,
-            y: frame.height - imePos.y - smoothScrollPixelOffset,
+            y: imePos.y - height,
             width: max(imePos.width, cellSize.width),
-            height: max(imePos.height, cellSize.height)
+            height: height
         )
+        return screenRect(forContentRect: contentRect)
+    }
 
+    /// Converts a content-space rect (top-left origin, points) to screen
+    /// coordinates. Ghostty coordinates are top-left origin; convert to
+    /// bottom-left for AppKit. SUBTRACT smoothScrollPixelOffset here
+    /// (opposite sign from sendMousePos) because this converts FROM
+    /// content-space TO screen-space. Without a window, returns the
+    /// window-space rect.
+    func screenRect(forContentRect contentRect: NSRect) -> NSRect {
+        let viewRect = TerminalAXGeometry.viewRect(
+            contentRect: contentRect,
+            viewHeight: frame.height,
+            smoothScrollPixelOffset: smoothScrollPixelOffset
+        )
         let winRect = convert(viewRect, to: nil)
         guard let window else { return winRect }
         return window.convertToScreen(winRect)
@@ -1399,3 +1434,156 @@ extension SurfaceView {
 
 }
 
+
+// MARK: - Accessibility
+
+/// Exposes the terminal viewport as an AXTextArea. Text is read row by row
+/// into a `TerminalAXSnapshot` (UTF-16 throughout) and cached for
+/// `axSnapshotTTL`.
+///
+/// Known limitations:
+/// - Only the viewport (visible rows) is exposed; scrollback is not.
+/// - With `window-padding-y` >= the cell height, frames shift by whole rows
+///   (string and line APIs are unaffected).
+/// - Under mode 2027 (grapheme clustering), column math for composite emoji
+///   is off, so selection ranges and frames can drift (string and line APIs
+///   are unaffected).
+/// - During a resize the row count can briefly mismatch and the last row may
+///   be duplicated until the TTL expires.
+extension SurfaceView {
+
+    private func currentAXSnapshot() -> (snapshot: TerminalAXSnapshot, leftPaddingPt: CGFloat?, font: CTFont?) {
+        let now = axNow()
+        if let cache = axSnapshotCache, now.timeIntervalSince(cache.builtAt) < axSnapshotTTL {
+            return (cache.snapshot, cache.leftPaddingPt, cache.font)
+        }
+        let scale = window?.backingScaleFactor ?? 2.0
+        let source: TerminalAXTextSource?
+        #if DEBUG
+        if let override = axTextSourceOverrideForTesting {
+            source = override
+        } else {
+            source = surfaceController?.surface.map { GhosttySurfaceSelectionReader(surface: $0) }
+        }
+        #else
+        source = surfaceController?.surface.map { GhosttySurfaceSelectionReader(surface: $0) }
+        #endif
+        // A failed build is not cached so the next query retries.
+        guard let built = source.flatMap({ TerminalAXSnapshotBuilder.build(from: $0, scale: scale) }) else {
+            return (.empty, axLastLeftPaddingPt, nil)
+        }
+        if let left = built.leftPaddingPt { axLastLeftPaddingPt = left }
+        let leftPadding = built.leftPaddingPt ?? axLastLeftPaddingPt
+        // ghostty_surface_quicklook_font returns a +1 retained CTFont (embedded.zig:2159-2165).
+        let font = surfaceController?.surface
+            .flatMap { GhosttyFFI.surfaceQuicklookFont($0) }
+            .map { Unmanaged<CTFont>.fromOpaque($0).takeRetainedValue() }
+        axSnapshotCache = (built.snapshot, leftPadding, font, now)
+        return (built.snapshot, leftPadding, font)
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+
+    override func accessibilityLabel() -> String? { "Terminal" }
+
+    override func accessibilityIdentifier() -> String {
+        guard let surfaceController else { return "calyx.terminal.pane" }
+        return AccessibilityID.Terminal.pane(surfaceController.id)
+    }
+
+    override func accessibilityHelp() -> String? { "Terminal content area" }
+
+    override func accessibilityValue() -> Any? {
+        currentAXSnapshot().snapshot.text
+    }
+
+    override func accessibilityNumberOfCharacters() -> Int {
+        currentAXSnapshot().snapshot.utf16Count
+    }
+
+    override func accessibilityVisibleCharacterRange() -> NSRange {
+        NSRange(location: 0, length: currentAXSnapshot().snapshot.utf16Count)
+    }
+
+    override func accessibilityLine(for index: Int) -> Int {
+        currentAXSnapshot().snapshot.line(forUTF16Index: index)
+    }
+
+    override func accessibilityRange(forLine line: Int) -> NSRange {
+        currentAXSnapshot().snapshot.range(forLine: line)
+    }
+
+    override func accessibilityRange(for index: Int) -> NSRange {
+        let text = currentAXSnapshot().snapshot.text as NSString
+        guard text.length > 0 else { return NSRange(location: 0, length: 0) }
+        let clamped = min(max(0, index), text.length - 1)
+        return text.rangeOfComposedCharacterSequence(at: clamped)
+    }
+
+    override func accessibilityString(for range: NSRange) -> String? {
+        currentAXSnapshot().snapshot.string(for: range)
+    }
+
+    /// Uses the quicklook font cached with the snapshot. Returning an
+    /// unstyled string when no surface or font is available is intentional.
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        let current = currentAXSnapshot()
+        guard let string = current.snapshot.string(for: range) else { return nil }
+        guard let font = current.font else { return NSAttributedString(string: string) }
+        return NSAttributedString(string: string, attributes: [.font: font])
+    }
+
+    override func accessibilitySelectedTextRange() -> NSRange {
+        guard let surface = surfaceController?.surface,
+              GhosttyFFI.surfaceHasSelection(surface) else {
+            return NSRange(location: 0, length: 0)
+        }
+        let reader = GhosttySurfaceSelectionReader(surface: surface)
+        guard let result = reader.readAndDecodeTextAllowingEmpty({
+            GhosttyFFI.surfaceReadSelection(surface, text: &$0)
+        }), result.raw.tl_px_x >= 0 else {
+            return NSRange(location: 0, length: 0)
+        }
+        // Resolve the selection offsets against rows read at the same moment.
+        axSnapshotCache = nil
+        return currentAXSnapshot().snapshot.selectedRange(
+            offsetStart: Int(result.raw.offset_start),
+            offsetLen: Int(result.raw.offset_len)
+        )
+    }
+
+    override func accessibilitySelectedText() -> String? {
+        guard let surface = surfaceController?.surface else { return nil }
+        return GhosttySurfaceSelectionReader(surface: surface).readAndDecodeText({
+            GhosttyFFI.surfaceReadSelection(surface, text: &$0)
+        })?.text
+    }
+
+    override func accessibilityFrame(for range: NSRange) -> NSRect {
+        guard let surfaceController, let surface = surfaceController.surface else { return .zero }
+        let current = currentAXSnapshot()
+        let spans = current.snapshot.cellSpans(forUTF16Range: range)
+        guard !spans.isEmpty else { return .zero }
+        let scale = window?.backingScaleFactor ?? 2.0
+        let size = GhosttyFFI.surfaceSize(surface)
+        let geometry = TerminalAXGeometry(
+            cellSizePt: CGSize(
+                width: CGFloat(size.cell_width_px) / scale,
+                height: CGFloat(size.cell_height_px) / scale
+            ),
+            leftPaddingPt: current.leftPaddingPt ?? 0,
+            topPaddingPt: TerminalAXGeometry.topPaddingPt(
+                imePointY: surfaceController.imePoint().y,
+                scale: scale,
+                cellHeightPx: Int(size.cell_height_px)
+            )
+        )
+        return spans
+            .map { screenRect(forContentRect: geometry.contentRect(row: $0.row, colStart: $0.colStart, colEnd: $0.colEnd)) }
+            .reduce(NSRect.null) { $0.union($1) }
+    }
+
+    override func accessibilityChildren() -> [Any]? { [] }
+}
