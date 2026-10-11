@@ -11,6 +11,14 @@
 //  caller. Editability is a parameter because SwiftUI's `.disabled` does
 //  not reach the `NSTextView`'s own `isEditable`.
 //
+//  Escape: `NSTextView` turns Escape into `cancelOperation(_:)`, which it
+//  does not implement, so `doCommand(by:)` hands it up the responder
+//  chain to `NSWindow.cancelOperation(_:)`. The key event itself never
+//  reaches the window's key-equivalent dispatch, where SwiftUI's
+//  `.keyboardShortcut(.cancelAction)` lives, so a sheet's Cancel button
+//  does not fire while this view has focus. `onCancel` lets the caller
+//  run its cancel action for that command instead.
+//
 
 import AppKit
 import SwiftUI
@@ -25,6 +33,10 @@ struct PlainTextView: NSViewRepresentable {
     /// text inset. AppKit's default is 5 pt; the default here is 0 so
     /// `textContainerInset` alone states where the text starts.
     var lineFragmentPadding: CGFloat = 0
+    /// Run for the text view's `cancelOperation(_:)` command (Escape),
+    /// instead of `NSTextView`'s handling of it. `nil` leaves the command
+    /// to `NSTextView`.
+    var onCancel: (@MainActor () -> Void)? = nil
 
     /// Turns off every rewrite of typed or pasted text, applies this
     /// view's font, inset and editability, and sets the accessibility
@@ -61,6 +73,7 @@ struct PlainTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         context.coordinator.text = $text
+        context.coordinator.onCancel = onCancel
         let textView = Self.textView(in: scrollView)
         configure(textView)
         if textView.string != text {
@@ -86,15 +99,24 @@ struct PlainTextView: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, onCancel: onCancel)
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
+        var onCancel: (@MainActor () -> Void)?
 
-        init(text: Binding<String>) {
+        init(text: Binding<String>, onCancel: (@MainActor () -> Void)?) {
             self.text = text
+            self.onCancel = onCancel
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard commandSelector == #selector(NSResponder.cancelOperation(_:)),
+                  let onCancel else { return false }
+            onCancel()
+            return true
         }
 
         func textDidChange(_ notification: Notification) {

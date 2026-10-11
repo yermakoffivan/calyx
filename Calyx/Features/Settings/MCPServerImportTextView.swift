@@ -4,7 +4,8 @@
 //
 //  The JSON text area of the MCP server import sheet: a `PlainTextView`
 //  (no smart quotes or dashes, which would break or silently alter the
-//  JSON) in a monospaced font.
+//  JSON) in a monospaced font. Escape in it runs `onCancel`, the
+//  sheet's Cancel action.
 //
 
 import AppKit
@@ -12,15 +13,20 @@ import SwiftUI
 
 struct MCPServerImportTextView: View {
     @Binding var text: String
+    var onCancel: (@MainActor () -> Void)? = nil
 
-    private static func plainTextView(text: Binding<String>) -> PlainTextView {
+    private static func plainTextView(
+        text: Binding<String>,
+        onCancel: (@MainActor () -> Void)? = nil
+    ) -> PlainTextView {
         PlainTextView(
             text: text,
             font: .monospacedSystemFont(ofSize: 12, weight: .regular),
             textContainerInset: .zero,
             accessibilityIdentifier: AccessibilityID.MCPServersSettings.importTextView,
             // AppKit's default padding, which this view has always used.
-            lineFragmentPadding: 5
+            lineFragmentPadding: 5,
+            onCancel: onCancel
         )
     }
 
@@ -31,6 +37,6 @@ struct MCPServerImportTextView: View {
     }
 
     var body: some View {
-        Self.plainTextView(text: $text)
+        Self.plainTextView(text: $text, onCancel: onCancel)
     }
 }

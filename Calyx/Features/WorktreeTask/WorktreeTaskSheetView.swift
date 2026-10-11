@@ -139,20 +139,26 @@ struct WorktreeTaskSheetView: View {
 
     /// The prompt editor: a `PlainTextView`, so a prompt containing `"`
     /// or `--flag` reaches the agent without smart-quote/dash rewrites.
-    static func promptTextView(text: Binding<String>, isEditable: Bool) -> PlainTextView {
+    /// Escape in the editor runs `onCancel`, the Cancel button's action.
+    static func promptTextView(
+        text: Binding<String>,
+        isEditable: Bool,
+        onCancel: @escaping () -> Void
+    ) -> PlainTextView {
         PlainTextView(
             text: text,
             font: .preferredFont(forTextStyle: .body),
             textContainerInset: promptTextInset,
             accessibilityIdentifier: AccessibilityID.WorktreeTask.promptField,
-            isEditable: isEditable
+            isEditable: isEditable,
+            onCancel: onCancel
         )
     }
 
     private var promptEditor: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Initial prompt (optional)").font(.callout).foregroundStyle(.secondary)
-            Self.promptTextView(text: $model.prompt, isEditable: model.acceptsPrompt)
+            Self.promptTextView(text: $model.prompt, isEditable: model.acceptsPrompt, onCancel: onCancel)
                 .frame(height: 100)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(
