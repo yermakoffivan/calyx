@@ -170,6 +170,58 @@ struct WorktreeTaskPlannerTests {
         #expect(text == "it's|a\nb|--x|")
     }
 
+    /// Regression guard for shell injection through the prompt. Emulates
+    /// both shell layers the passthrough spawn relies on:
+    /// - Layer 1 (ghostty on macOS, ghostty/src/termio/Exec.zig, `.shell`
+    ///   case): `/bin/bash --noprofile --norc -c "exec -l <command>"` where
+    ///   `<command>` is built exactly like `CalyxWindowController.createManagedSurface`.
+    /// - Layer 2: the login shell `[shell, "-i", "-l", "-c", "exec '<tok>' ..."]`
+    ///   from `spawnArgv`, emulated by interactive zsh (history expansion on,
+    ///   rc files off via -f) with `exec` redefined as a NUL-separated argv dumper.
+    @Test func test_spawnArgv_hostilePrompts_surviveGhosttyAndLoginShellLayersWithoutExecution() throws {
+        let pwned = "/tmp/CALYX_PWNED"
+        defer { try? FileManager.default.removeItem(atPath: pwned) }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-loginshell-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let script = dir.appendingPathComponent("fake-login-shell")
+        let body = """
+        #!/bin/sh
+        for last; do :; done
+        exec /bin/zsh -f -i -l -c 'exec() { printf "%s\\0" "$@"; }; eval "$1"' zsh "$last"
+
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let corpus = [
+            "fix Bob's bug\nthen test", "$(touch /tmp/CALYX_PWNED) `id`", "!! !$ ^foo^bar",
+            "say \"hi\" ; rm -rf x", "--help me", "a\\b\\\\c", "日本語 'quoted'", "$HOME ${HOME} ~",
+            "*.swift ?", "#comment", "&& echo x | cat > /dev/null", "", "   ",
+        ]
+        for prompt in corpus {
+            let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, prompt: prompt).argv
+            let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: script.path)
+            let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
+            process.environment = ["PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8"]
+            process.standardInput = FileHandle.nullDevice
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            var tokens = String(decoding: data, as: UTF8.self).components(separatedBy: "\0")
+            if tokens.last == "" { tokens.removeLast() }
+            #expect(tokens == expected, "prompt: \(prompt.debugDescription)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: pwned))
+    }
+
     // MARK: - loginShell
 
     @Test func test_loginShell_prefersPasswdThenEnvironmentThenZsh() {
