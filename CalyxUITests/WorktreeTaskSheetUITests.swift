@@ -42,4 +42,23 @@ final class WorktreeTaskSheetUITests: CalyxUITestCase {
         element("calyx.worktreeTask.cancelButton").click()
         waitForNonExistence(sheet)
     }
+
+    /// Cmd+Shift+N must open the sheet even while a terminal pane is the
+    /// first responder (the pane must not swallow the key equivalent).
+    func test_cmdShiftN_withTerminalFocused_opensSheet() {
+        XCTAssertTrue(waitFor(app.windows.firstMatch, timeout: 10), "main window did not appear")
+        let pane = app.textViews
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "calyx.terminal.pane."))
+            .firstMatch
+        XCTAssertTrue(waitFor(pane, timeout: 10), "terminal pane AX text area not found")
+        pane.click()
+
+        app.typeKey("n", modifierFlags: [.command, .shift])
+
+        let sheet = element("calyx.worktreeTask.sheet")
+        XCTAssertTrue(waitFor(sheet), "New Worktree Task sheet should appear on Cmd+Shift+N")
+
+        element("calyx.worktreeTask.cancelButton").click()
+        waitForNonExistence(sheet)
+    }
 }

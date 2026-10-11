@@ -34,7 +34,7 @@ final class CalyxWindowControllerWorktreeTaskCommandTests: XCTestCase {
         XCTAssertEqual(matches.count, 1, "git.newWorktreeTask must be registered exactly once")
         let command = try XCTUnwrap(matches.first)
         XCTAssertEqual(command.title, "New Worktree Task\u{2026}")
-        XCTAssertEqual(command.shortcut, "Cmd+Shift+T")
+        XCTAssertEqual(command.shortcut, "Cmd+Shift+N")
         XCTAssertEqual(command.category, "Git")
     }
 }

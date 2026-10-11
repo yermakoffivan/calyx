@@ -2530,7 +2530,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         let newWorktreeTaskItem = NSMenuItem(
             title: "New Worktree Task\u{2026}",
             action: #selector(CalyxWindowController.newWorktreeTask(_:)),
-            keyEquivalent: "t"
+            keyEquivalent: "n"
         )
         newWorktreeTaskItem.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(newWorktreeTaskItem)

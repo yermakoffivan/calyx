@@ -806,7 +806,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             self?.refreshGitSidebar(trigger: .manualRefresh)
         })
         commandRegistry.register(PaletteCommand(
-            id: "git.newWorktreeTask", title: "New Worktree Task\u{2026}", shortcut: "Cmd+Shift+T", category: "Git"
+            id: "git.newWorktreeTask", title: "New Worktree Task\u{2026}", shortcut: "Cmd+Shift+N", category: "Git"
         ) { [weak self] in
             self?.presentWorktreeTaskSheet()
         })

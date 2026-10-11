@@ -2,7 +2,7 @@
 //  AppDelegateFileMenuWorktreeTaskItemTests.swift
 //  CalyxTests
 //
-//  Pins the File menu's "New Worktree Task…" item: Cmd+Shift+T, nil
+//  Pins the File menu's "New Worktree Task…" item: Cmd+Shift+N, nil
 //  target (resolved through the key window's responder chain like the
 //  other New items), placed immediately after "New Tab". Same bare
 //  `AppDelegate().setupMainMenu()` approach as
@@ -35,7 +35,7 @@ final class AppDelegateFileMenuWorktreeTaskItemTests: XCTestCase {
             "File menu must contain \"New Worktree Task…\""
         )
 
-        XCTAssertEqual(item.keyEquivalent, "t")
+        XCTAssertEqual(item.keyEquivalent, "n")
         XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .shift])
         XCTAssertEqual(item.action, #selector(CalyxWindowController.newWorktreeTask(_:)))
         XCTAssertNil(item.target, "nil target so the key window's controller receives it")
