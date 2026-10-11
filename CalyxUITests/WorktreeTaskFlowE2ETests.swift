@@ -33,6 +33,9 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
     private var repoDir: String = ""
     private let repoName = "e2erepo"
     private var counter = 0
+    /// Tab-bar identifier of the tab whose pane runs a plain shell, recorded
+    /// before the task tab opens so tearDown can return to it for cleanup.
+    private var originalTabID: String?
 
     private static let fieldSeparator = "\u{1F}"
     private static let taskArgv = [
@@ -62,10 +65,37 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
     }
 
     override func tearDown() async throws {
+        // The scratch HOME (repo, `.calyx/worktrees/...`) was created by the
+        // pane's shell; the sandboxed test runner cannot delete it, so the
+        // pane must remove it before super.tearDown() terminates the app.
+        // Runs on failure too, since XCTest always calls tearDown.
+        removeScratchHomeViaPane()
         try await super.tearDown()
+        // Fallback only; normally fails silently under the runner sandbox.
         if !homeDir.isEmpty {
             try? FileManager.default.removeItem(atPath: homeDir)
         }
+    }
+
+    private func removeScratchHomeViaPane() {
+        guard !homeDir.isEmpty, let app, app.state == .runningForeground || app.state == .runningBackground else { return }
+        // Dismiss the New Worktree Task sheet if a failure left it up.
+        let sheet = element("calyx.worktreeTask.sheet")
+        if sheet.exists {
+            app.typeKey(.escape, modifierFlags: [])
+            _ = waitUntil(timeout: 5) { !sheet.exists }
+        }
+        if let originalTabID {
+            let tab = element(originalTabID)
+            if tab.exists { tab.click() }
+        }
+        let pane = app.textViews
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "calyx.terminal.pane."))
+            .firstMatch
+        guard pane.waitForExistence(timeout: 5) else { return }
+        pane.click()
+        // cd out first: the pane's cwd may lie inside the tree being removed.
+        _ = shell("cd / && rm -rf '\(homeDir)' && echo removed")
     }
 
     // MARK: - Helpers
@@ -108,6 +138,7 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
 
         let originalTabCount = countTabBarTabs()
         let originalTabIDs = currentTabBarTabIdentifiers()
+        originalTabID = originalTabIDs.first
 
         // Create the task from the sheet.
         pane.click()
