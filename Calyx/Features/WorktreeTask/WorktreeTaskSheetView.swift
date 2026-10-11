@@ -4,6 +4,7 @@
 // The New Worktree Task sheet: branch name, base branch, agent CLI and an
 // optional initial prompt.
 
+import AppKit
 import Observation
 import SwiftUI
 
@@ -127,16 +128,38 @@ struct WorktreeTaskSheetView: View {
         .accessibilityIdentifier(AccessibilityID.WorktreeTask.agentPicker)
     }
 
+    /// Text inset of the prompt editor. These are measured values, not
+    /// derived from NSTextField internals: at 1x, the roundedBorder Branch
+    /// field above draws its first ink pixel 7 pt in from its outer border
+    /// line and 9 pt down; this inset reproduces those border-to-ink
+    /// distances inside the editor's 0.5 pt stroke. `PlainTextView` sets
+    /// `lineFragmentPadding` to 0, so this inset alone positions the text
+    /// (height applies to top and bottom).
+    static let promptTextInset = NSSize(width: 6.5, height: 4.5)
+
+    /// The prompt editor: a `PlainTextView`, so a prompt containing `"`
+    /// or `--flag` reaches the agent without smart-quote/dash rewrites.
+    static func promptTextView(text: Binding<String>, isEditable: Bool) -> PlainTextView {
+        PlainTextView(
+            text: text,
+            font: .preferredFont(forTextStyle: .body),
+            textContainerInset: promptTextInset,
+            accessibilityIdentifier: AccessibilityID.WorktreeTask.promptField,
+            isEditable: isEditable
+        )
+    }
+
     private var promptEditor: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Initial prompt (optional)").font(.callout).foregroundStyle(.secondary)
-            TextEditor(text: $model.prompt)
-                .font(.body)
+            Self.promptTextView(text: $model.prompt, isEditable: model.acceptsPrompt)
                 .frame(height: 100)
-                .border(Color.secondary.opacity(0.3))
-                .disabled(!model.acceptsPrompt)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
+                )
                 .opacity(model.acceptsPrompt ? 1 : 0.5)
-                .accessibilityIdentifier(AccessibilityID.WorktreeTask.promptField)
             if !model.acceptsPrompt {
                 Text("\(model.agent.displayName) starts without an initial prompt")
                     .font(.caption)
