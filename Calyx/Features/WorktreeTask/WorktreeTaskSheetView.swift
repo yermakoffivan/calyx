@@ -107,20 +107,7 @@ struct WorktreeTaskSheetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            Form {
-                TextField("Branch", text: $model.branch, prompt: Text("task/my-change"))
-                    .accessibilityIdentifier(AccessibilityID.WorktreeTask.branchField)
-                basePicker
-                agentPicker
-                LabeledContent("Arguments") {
-                    Self.argumentsTextField(text: $model.argumentsText)
-                }
-                if let message = model.argumentsError {
-                    Text(message)
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-            }
+            fields
             promptEditor
             if let message = model.errorMessage {
                 Text(message)
@@ -134,6 +121,55 @@ struct WorktreeTaskSheetView: View {
         .frame(width: 480)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.WorktreeTask.sheet)
+    }
+
+    /// The labelled controls. A two-column `Grid` rather than a `Form`:
+    /// a Form spaces rows by each control's intrinsic height (26 pt for a
+    /// roundedBorder text field, 24 pt for a popup), which left 5/9/9 px
+    /// gaps on screen. The Grid applies the same 8 pt between every row,
+    /// with labels right-aligned against the control column like a Form.
+    private var fields: some View {
+        Grid(alignment: .trailing, horizontalSpacing: 8, verticalSpacing: 8) {
+            GridRow {
+                fieldLabel("Branch")
+                TextField("Branch", text: $model.branch, prompt: Text("task/my-change"))
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                    .accessibilityIdentifier(AccessibilityID.WorktreeTask.branchField)
+            }
+            GridRow {
+                fieldLabel("Base")
+                basePicker
+                    .labelsHidden()
+                    .fixedSize()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                fieldLabel("Agent")
+                agentPicker
+                    .labelsHidden()
+                    .fixedSize()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                fieldLabel("Arguments")
+                Self.argumentsTextField(text: $model.argumentsText)
+                    .frame(maxWidth: .infinity)
+            }
+            if let message = model.argumentsError {
+                GridRow {
+                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                    Text(message)
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func fieldLabel(_ title: String) -> some View {
+        Text(title).gridColumnAlignment(.trailing)
     }
 
     private var header: some View {
