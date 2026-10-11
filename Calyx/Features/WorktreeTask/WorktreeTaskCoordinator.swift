@@ -132,7 +132,8 @@ final class WorktreeTaskCoordinator {
                 ?? WorktreeTaskPlanner.launchPlan(
                     agent: request.agent, arguments: request.arguments, prompt: request.prompt
                 ).argv,
-            loginShell: host.loginShell
+            loginShell: host.loginShell,
+            fallbackDirectory: repository.location.workTree
         )
         if host.openTaskPane(cwd: task.path, spawnArgv: spawnArgv) == nil {
             host.presentError(WorktreeTaskError.paneCreationFailed(task.path))

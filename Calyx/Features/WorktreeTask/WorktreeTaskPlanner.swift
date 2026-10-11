@@ -66,7 +66,7 @@ enum WorktreeTaskPlanner {
     /// login shell anyway, but not an interactive one; on `.persistent`
     /// the session daemon execs this argv directly, so `-l` is needed.
     ///
-    /// The `-c` string is `<agent argv>; exec <shell> -i -l`: once the
+    /// The `-c` string is `<agent argv>; <cwd fallback>; exec <shell> -i -l`: once the
     /// agent exits (any status, e.g. Claude Code's `/exit` or "command
     /// not found"), the pane continues as an interactive login shell in
     /// the same worktree directory instead of leaving a dead pane.
@@ -77,9 +77,19 @@ enum WorktreeTaskPlanner {
     /// exits. On `.persistent` the session ends when the final shell
     /// exits and the pane follows `SessionReconnectCoordinator`'s
     /// handling of an ended session.
-    static func spawnArgv(launchArgv: [String], loginShell: String) -> [String] {
+    ///
+    /// Between the agent and the `exec`, `if ! [ -d "$PWD" ]; then cd
+    /// <fallbackDirectory> 2>/dev/null || cd; fi` moves to
+    /// `fallbackDirectory` (the repository the task was created from)
+    /// when the agent deleted its own worktree (e.g. `git worktree
+    /// remove` on its cwd); otherwise the follow-up shell would start in
+    /// a deleted directory and zsh prints `getcwd` errors. If the
+    /// fallback is gone too, `cd` goes to `$HOME`.
+    static func spawnArgv(launchArgv: [String], loginShell: String, fallbackDirectory: String) -> [String] {
         let agent = launchArgv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
-        let command = agent + "; exec " + SessionCommandSynthesizer.shSafeToken(loginShell) + " -i -l"
+        let command = agent
+            + "; if ! [ -d \"$PWD\" ]; then cd " + SessionCommandSynthesizer.shSafeToken(fallbackDirectory)
+            + " 2>/dev/null || cd; fi; exec " + SessionCommandSynthesizer.shSafeToken(loginShell) + " -i -l"
         return [loginShell, "-i", "-l", "-c", command]
     }
 

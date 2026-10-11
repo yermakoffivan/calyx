@@ -209,14 +209,26 @@ struct WorktreeTaskPlannerTests {
     @Test func test_spawnArgv_wrapsInInteractiveLoginShellExecWithEveryTokenQuoted() {
         let argv = WorktreeTaskPlanner.spawnArgv(
             launchArgv: ["claude", "fix Bob's bug\nthen test"],
-            loginShell: "/bin/zsh"
+            loginShell: "/bin/zsh",
+            fallbackDirectory: "/Users/me/repo"
         )
-        #expect(argv == ["/bin/zsh", "-i", "-l", "-c", "'claude' 'fix Bob'\\''s bug\nthen test'; exec '/bin/zsh' -i -l"])
+        #expect(argv == ["/bin/zsh", "-i", "-l", "-c",
+                         "'claude' 'fix Bob'\\''s bug\nthen test'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l"])
     }
 
     @Test func test_spawnArgv_bareArgvAndOtherShell() {
-        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: ["hermes", "chat"], loginShell: "/opt/homebrew/bin/bash")
-        #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "'hermes' 'chat'; exec '/opt/homebrew/bin/bash' -i -l"])
+        let argv = WorktreeTaskPlanner.spawnArgv(
+            launchArgv: ["hermes", "chat"], loginShell: "/opt/homebrew/bin/bash", fallbackDirectory: "/r"
+        )
+        #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c",
+                         "'hermes' 'chat'; if ! [ -d \"$PWD\" ]; then cd '/r' 2>/dev/null || cd; fi; exec '/opt/homebrew/bin/bash' -i -l"])
+    }
+
+    @Test func test_spawnArgv_fallbackDirectoryWithQuoteAndSpaceIsQuoted() {
+        let argv = WorktreeTaskPlanner.spawnArgv(
+            launchArgv: ["claude"], loginShell: "/bin/zsh", fallbackDirectory: "/Users/me/Bob's repo"
+        )
+        #expect(argv.last == "'claude'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/Bob'\\''s repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l")
     }
 
     /// Writes a stub agent named `claude` (prints its argv NUL-separated,
@@ -233,13 +245,14 @@ struct WorktreeTaskPlannerTests {
         try """
         #!/bin/sh
         printf '%s\\0' "$(basename "$0")" "$@"
+        if [ -n "$STUB_AGENT_RM_CWD" ]; then rm -rf "$PWD"; fi
         exit "${STUB_AGENT_EXIT:-0}"
 
         """.write(to: agent, atomically: true, encoding: .utf8)
         let shell = dir.appendingPathComponent("fake-login-shell")
         try """
         #!/bin/sh
-        if [ "$#" -eq 2 ] && [ "$1" = "-i" ] && [ "$2" = "-l" ]; then printf 'SHELL-STARTED'; exit 0; fi
+        if [ "$#" -eq 2 ] && [ "$1" = "-i" ] && [ "$2" = "-l" ]; then printf 'SHELL-STARTED'; if [ -n "$STUB_PRINT_PWD" ]; then printf '\\n%s' "$(pwd -P)"; fi; exit 0; fi
         for last; do :; done
         exec /bin/zsh -f -i -l -c "$last"
 
@@ -254,22 +267,39 @@ struct WorktreeTaskPlannerTests {
     /// (`/bin/bash --noprofile --norc -c "exec -l <command>"`, see
     /// ghostty/src/termio/Exec.zig) and returns stdout.
     private func runThroughGhosttyLayer(_ argv: [String], stubDir: URL, agentExit: Int32 = 0) throws -> String {
+        try runThroughGhosttyLayerCapturing(argv, stubDir: stubDir, agentExit: agentExit).stdout
+    }
+
+    /// Like `runThroughGhosttyLayer`, but starts the process in `cwd`,
+    /// passes `extraEnvironment`, and also returns stderr.
+    private func runThroughGhosttyLayerCapturing(
+        _ argv: [String], stubDir: URL, agentExit: Int32 = 0,
+        cwd: URL? = nil, extraEnvironment: [String: String] = [:]
+    ) throws -> (stdout: String, stderr: String) {
         let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
-        process.environment = [
+        var environment = [
             "PATH": stubDir.path + ":/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8",
             "STUB_AGENT_EXIT": String(agentExit),
         ]
+        environment.merge(extraEnvironment) { _, new in new }
+        process.environment = environment
+        if let cwd { process.currentDirectoryURL = cwd }
         process.standardInput = FileHandle.nullDevice
         let out = Pipe()
+        let errFile = stubDir.appendingPathComponent("stderr-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: errFile.path, contents: nil)
+        let errHandle = try FileHandle(forWritingTo: errFile)
+        defer { try? errHandle.close() }
         process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errHandle
         try process.run()
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(decoding: data, as: UTF8.self)
+        let errData = try Data(contentsOf: errFile)
+        return (String(decoding: data, as: UTF8.self), String(decoding: errData, as: UTF8.self))
     }
 
     /// Splits stub output into the agent's argv and asserts the login
@@ -289,12 +319,75 @@ struct WorktreeTaskPlannerTests {
         let stubs = try makeStubs()
         defer { try? FileManager.default.removeItem(at: stubs.dir) }
         let launch = ["claude", "%s|", "it's", "a\nb", "--x"]
-        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: stubs.shell)
+        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: stubs.shell, fallbackDirectory: "/")
         #expect(argv.dropLast() == [stubs.shell, "-i", "-l", "-c"])
         for status: Int32 in [0, 1, 127] {
             let text = try runThroughGhosttyLayer(argv, stubDir: stubs.dir, agentExit: status)
             #expect(agentArgvThenShell(text, "exit \(status)") == launch, "exit \(status)")
         }
+    }
+
+    /// When the agent deletes its own cwd (e.g. `git worktree remove` on
+    /// the task worktree), the follow-up login shell starts in
+    /// `fallbackDirectory` instead of a deleted directory (no zsh
+    /// `getcwd` errors).
+    @Test func test_spawnArgv_cwdDeletedByAgent_shellStartsInFallbackDirectory() throws {
+        let stubs = try makeStubs()
+        defer { try? FileManager.default.removeItem(at: stubs.dir) }
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-fallback-\(UUID().uuidString)")
+        let fallback = base.appendingPathComponent("Bob's repo")
+        let doomed = base.appendingPathComponent("doomed-worktree")
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: doomed, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let argv = WorktreeTaskPlanner.spawnArgv(
+            launchArgv: ["claude"], loginShell: stubs.shell, fallbackDirectory: fallback.path
+        )
+
+        let result = try runThroughGhosttyLayerCapturing(
+            argv, stubDir: stubs.dir, cwd: doomed,
+            extraEnvironment: ["STUB_AGENT_RM_CWD": "1", "STUB_PRINT_PWD": "1"]
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: doomed.path), "the stub agent deleted its cwd")
+        #expect(result.stdout.hasSuffix("SHELL-STARTED\n" + realpathString(fallback.path)),
+                "stdout: \(result.stdout.debugDescription)")
+        #expect(!result.stderr.contains("getcwd"), "stderr: \(result.stderr)")
+    }
+
+    /// When the cwd still exists after the agent exits, the login shell
+    /// starts there; the fallback is not used.
+    @Test func test_spawnArgv_cwdStillExists_shellStartsInCwd() throws {
+        let stubs = try makeStubs()
+        defer { try? FileManager.default.removeItem(at: stubs.dir) }
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-fallback-\(UUID().uuidString)")
+        let fallback = base.appendingPathComponent("repo")
+        let worktree = base.appendingPathComponent("worktree")
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let argv = WorktreeTaskPlanner.spawnArgv(
+            launchArgv: ["claude"], loginShell: stubs.shell, fallbackDirectory: fallback.path
+        )
+
+        let result = try runThroughGhosttyLayerCapturing(
+            argv, stubDir: stubs.dir, cwd: worktree, extraEnvironment: ["STUB_PRINT_PWD": "1"]
+        )
+
+        #expect(result.stdout.hasSuffix("SHELL-STARTED\n" + realpathString(worktree.path)),
+                "stdout: \(result.stdout.debugDescription)")
+        #expect(!result.stderr.contains("getcwd"), "stderr: \(result.stderr)")
+    }
+
+    private func realpathString(_ path: String) -> String {
+        guard let resolved = realpath(path, nil) else {
+            Issue.record("realpath failed for \(path)")
+            return path
+        }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// Regression guard for shell injection through the prompt. Emulates
@@ -321,7 +414,7 @@ struct WorktreeTaskPlannerTests {
             for args in [[], arguments] {
                 let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: args, prompt: prompt).argv
                 #expect(Array(expected.prefix(args.count + 1)) == ["claude"] + args)
-                let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: stubs.shell)
+                let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: stubs.shell, fallbackDirectory: "/")
                 let text = try runThroughGhosttyLayer(argv, stubDir: stubs.dir)
                 let comment: Comment = "arguments \(args), prompt: \(prompt.debugDescription)"
                 #expect(agentArgvThenShell(text, comment) == expected, comment)
