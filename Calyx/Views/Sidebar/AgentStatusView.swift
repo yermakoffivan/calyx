@@ -783,7 +783,7 @@ private struct AgentRowView: View {
                     .fill(Color.white.opacity(reduceTransparency ? 0.08 : 0.05))
             }
         }
-        .opacity(controlActiveState == .key ? 1.0 : 0.5)
+        .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
     }
 }
 
@@ -936,7 +936,7 @@ private struct AgentSubRowView: View {
                     .fill(Color.white.opacity(reduceTransparency ? 0.08 : 0.05))
             }
         }
-        .opacity(controlActiveState == .key ? 1.0 : 0.5)
+        .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
         // See AgentRowView.rowContent's own `.accessibilityElement`
         // comment: `.combine` makes this row one VoiceOver stop, and the
         // elapsed duration is left out of the merged content for the

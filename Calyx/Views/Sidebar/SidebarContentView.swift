@@ -167,7 +167,7 @@ struct SidebarContentView: View {
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
-            .opacity(controlActiveState == .key ? 1.0 : 0.5)
+            .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Sidebar mode")
             .accessibilityValue({
@@ -306,7 +306,7 @@ private struct GlassButtonModifier: ViewModifier {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color.black.opacity(0.2))
                 )
-                .opacity(controlActiveState == .key ? 1.0 : 0.5)
+                .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
         }
     }
 }
@@ -736,10 +736,10 @@ private struct GroupHeaderBackgroundModifier: ViewModifier {
                         .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
                         .allowsHitTesting(false)
                 }
-                .opacity(controlActiveState == .key ? 1.0 : 0.5)
+                .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
         } else {
             content
-                .opacity(controlActiveState == .key ? 1.0 : 0.5)
+                .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
         }
     }
 }

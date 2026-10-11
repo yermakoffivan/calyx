@@ -12,8 +12,10 @@
 // - Above-one input clamped to 1.0 -> 1.00
 // - Theme color derivation: chromeTint(for:glassOpacity:), atmosphereTop(for:),
 //   atmosphereBottom(for:), accentGradient(for:)
+// - isInactiveWindowChrome(_:): only `.inactive` gets the inactive treatment
 
 import AppKit
+import SwiftUI
 import Testing
 @testable import Calyx
 
@@ -236,5 +238,28 @@ struct GlassThemeReducedTransparencyFillTests {
         #expect(abs(g - 13.0 / 255.0) < tolerance)
         #expect(abs(b - 28.0 / 255.0) < tolerance)
         #expect(abs(a - 1.0) < tolerance)
+    }
+}
+
+@Suite("GlassTheme isInactiveWindowChrome")
+struct GlassThemeInactiveWindowChromeTests {
+
+    // A window whose own sheet is key is main but not key, which SwiftUI
+    // reports as `.active`; it must keep its active chrome.
+    @Test("window with an attached key sheet (.active) is not inactive")
+    func windowWithAttachedSheetIsNotInactive() {
+        #expect(GlassTheme.isInactiveWindowChrome(.active) == false)
+    }
+
+    @Test("key window is not inactive")
+    func keyWindowIsNotInactive() {
+        #expect(GlassTheme.isInactiveWindowChrome(.key) == false)
+    }
+
+    // Issue #44: a window that is neither key nor main, or any window
+    // while Calyx is not the active app, still gets the inactive tint.
+    @Test("inactive window is inactive")
+    func inactiveWindowIsInactive() {
+        #expect(GlassTheme.isInactiveWindowChrome(.inactive) == true)
     }
 }
