@@ -21,11 +21,9 @@ protocol WorktreeTaskHost: AnyObject {
     /// The user's login shell, used to exec the agent CLI.
     var loginShell: String { get }
 
-    /// Presents the New Worktree Task sheet; its model reads remembered
-    /// "Arguments" from `argumentMemory`, the coordinator's own memory.
+    /// Presents the New Worktree Task sheet.
     func presentTaskSheet(
         cwd: String?,
-        argumentMemory: WorktreeTaskArgumentMemory?,
         onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void
     )
     func dismissTaskSheet()
@@ -71,9 +69,6 @@ final class WorktreeTaskCoordinator {
     /// process; resolved by the app side, see
     /// `CalyxWindowController.worktreeTaskUITestLaunchArgvOverride`).
     private let launchArgvOverride: [String]?
-    /// Where a created task's "Arguments" text is remembered for its
-    /// agent; nil remembers nothing.
-    private let argumentMemory: WorktreeTaskArgumentMemory?
 
     /// True while `create` runs; a second `create` from the sheet in that
     /// time is ignored.
@@ -85,19 +80,17 @@ final class WorktreeTaskCoordinator {
     init(
         host: any WorktreeTaskHost,
         ledger: WorktreeTaskOperationLedger = .shared,
-        launchArgvOverride: [String]? = nil,
-        argumentMemory: WorktreeTaskArgumentMemory? = nil
+        launchArgvOverride: [String]? = nil
     ) {
         self.host = host
         self.ledger = ledger
         self.launchArgvOverride = launchArgvOverride
-        self.argumentMemory = argumentMemory
     }
 
     /// Opens the New Worktree Task sheet against the focused pane's cwd.
     func presentSheet() {
         guard let host else { return }
-        host.presentTaskSheet(cwd: host.focusedPaneCwd, argumentMemory: argumentMemory) { [weak self] request, repository in
+        host.presentTaskSheet(cwd: host.focusedPaneCwd) { [weak self] request, repository in
             Task { @MainActor in
                 await self?.create(request: request, repository: repository)
             }
@@ -133,7 +126,6 @@ final class WorktreeTaskCoordinator {
             host.presentError(error)
             return
         }
-        argumentMemory?.remember(request.argumentsText, for: request.agent)
         host.dismissTaskSheet()
         let spawnArgv = WorktreeTaskPlanner.spawnArgv(
             launchArgv: launchArgvOverride

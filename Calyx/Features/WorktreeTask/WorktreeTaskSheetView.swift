@@ -13,14 +13,9 @@ import SwiftUI
 final class WorktreeTaskSheetModel {
     var branch = ""
     var base = ""
-    /// Switching agents keeps what was typed: the text is stashed under
-    /// the previous agent and the new agent gets its stashed text from
-    /// this sheet, else its remembered text.
+    /// Switching agents keeps the typed "Arguments" text and revalidates it.
     var agent: WorktreeTaskAgentKind = .claudeCode {
-        didSet {
-            argumentsStash[oldValue] = argumentsText
-            argumentsText = argumentsStash[agent] ?? remembered(for: agent)
-        }
+        didSet { parseArguments() }
     }
     var prompt = ""
     /// The "Arguments" field as typed; `argumentsError` follows it.
@@ -40,23 +35,6 @@ final class WorktreeTaskSheetModel {
     /// The repository the sheet was opened against; nil until described
     /// or when the pane is not inside a git repository.
     var repository: WorktreeTaskRepositoryDescription?
-
-    /// Where the last-used "Arguments" text per agent is remembered; nil
-    /// remembers nothing (the coordinator's contract).
-    @ObservationIgnored private let argumentMemory: WorktreeTaskArgumentMemory?
-    /// "Arguments" text typed in this sheet, per agent switched away from.
-    @ObservationIgnored private var argumentsStash: [WorktreeTaskAgentKind: String] = [:]
-
-    init(argumentMemory: WorktreeTaskArgumentMemory?) {
-        self.argumentMemory = argumentMemory
-        argumentsText = remembered(for: agent)
-        parseArguments()
-    }
-
-    private func remembered(for kind: WorktreeTaskAgentKind) -> String {
-        guard let argumentMemory else { return "" }
-        return argumentMemory.arguments(for: kind)
-    }
 
     private func parseArguments() {
         do {
@@ -116,8 +94,7 @@ final class WorktreeTaskSheetModel {
             base: base,
             agent: agent,
             prompt: prompt,
-            arguments: parsedArguments,
-            argumentsText: argumentsText
+            arguments: parsedArguments
         )
     }
 }
@@ -130,7 +107,20 @@ struct WorktreeTaskSheetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            fields
+            Form {
+                TextField("Branch", text: $model.branch, prompt: Text("task/my-change"))
+                    .accessibilityIdentifier(AccessibilityID.WorktreeTask.branchField)
+                basePicker
+                agentPicker
+                LabeledContent("Arguments") {
+                    Self.argumentsTextField(text: $model.argumentsText)
+                }
+                if let message = model.argumentsError {
+                    Text(message)
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
+            }
             promptEditor
             if let message = model.errorMessage {
                 Text(message)
@@ -155,56 +145,6 @@ struct WorktreeTaskSheetView: View {
             } else if let name = model.repoDisplayName {
                 Text(name).foregroundStyle(.secondary)
             }
-        }
-    }
-
-    /// Width of the widest field label, measured from the rendered
-    /// labels; nil until the first layout pass reports it.
-    @State private var labelWidth: CGFloat?
-
-    /// Horizontal gap between a label and its control.
-    private static let labelSpacing: CGFloat = 8
-
-    /// One labelled row: the label left-aligned in a column as wide as the
-    /// widest label, the control starting right after it.
-    private func fieldRow<Control: View>(_ label: String, @ViewBuilder control: () -> Control) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: Self.labelSpacing) {
-            Text(label)
-                .fixedSize()
-                .background(GeometryReader { proxy in
-                    Color.clear.preference(key: FieldLabelWidthKey.self, value: proxy.size.width)
-                })
-                .frame(width: labelWidth, alignment: .leading)
-            control()
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    /// The labelled rows. Each row is an explicit HStack whose label
-    /// frame is `.leading`-aligned, so labels share the content's left
-    /// edge and every control starts at labelWidth + 8.
-    private var fields: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            fieldRow("Branch") {
-                TextField("Branch", text: $model.branch, prompt: Text("task/my-change"))
-                    .textFieldStyle(.roundedBorder)
-                    .labelsHidden()
-                    .accessibilityIdentifier(AccessibilityID.WorktreeTask.branchField)
-            }
-            fieldRow("Base") {
-                basePicker
-                    .labelsHidden()
-                    .fixedSize()
-            }
-            fieldRow("Agent") {
-                agentPicker
-                    .labelsHidden()
-                    .fixedSize()
-            }
-            argumentsField
-        }
-        .onPreferenceChange(FieldLabelWidthKey.self) { width in
-            labelWidth = width
         }
     }
 
@@ -242,22 +182,6 @@ struct WorktreeTaskSheetView: View {
             font: .monospacedSystemFont(ofSize: NSFont.preferredFont(forTextStyle: .body).pointSize, weight: .regular),
             accessibilityIdentifier: AccessibilityID.WorktreeTask.argumentsField
         )
-    }
-
-    /// Extra CLI arguments, split by `WorktreeTaskArgumentParser`.
-    /// A parse error shows below the field, in the control column.
-    private var argumentsField: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            fieldRow("Arguments") {
-                Self.argumentsTextField(text: $model.argumentsText)
-            }
-            if let message = model.argumentsError {
-                Text(message)
-                    .foregroundStyle(.red)
-                    .font(.caption)
-                    .padding(.leading, (labelWidth ?? 0) + Self.labelSpacing)
-            }
-        }
     }
 
     /// Text inset of the prompt editor. These are measured values, not
@@ -317,13 +241,5 @@ struct WorktreeTaskSheetView: View {
                 .disabled(!model.canCreate)
                 .accessibilityIdentifier(AccessibilityID.WorktreeTask.createButton)
         }
-    }
-}
-
-/// The widest field label width in the New Worktree Task sheet.
-private struct FieldLabelWidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }

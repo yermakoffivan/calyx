@@ -43,12 +43,11 @@ extension CalyxWindowController: WorktreeTaskHost {
     /// Presents the New Worktree Task sheet; ignored while one is up.
     func presentTaskSheet(
         cwd: String?,
-        argumentMemory: WorktreeTaskArgumentMemory?,
         onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void
     ) {
         guard let window, worktreeTaskSheetController == nil else { return }
         let sheet = WorktreeTaskSheetController(
-            cwd: cwd, argumentMemory: argumentMemory, onCreate: onCreate, onCancel: {}
+            cwd: cwd, onCreate: onCreate, onCancel: {}
         )
         guard let sheetWindow = sheet.window else { return }
         worktreeTaskSheetController = sheet

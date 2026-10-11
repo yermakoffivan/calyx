@@ -41,7 +41,7 @@ final class CalyxWindowControllerWorktreeTaskCommandTests: XCTestCase {
     // MARK: - Sheet end
 
     private func makeSheet() -> WorktreeTaskSheetController {
-        WorktreeTaskSheetController(cwd: nil, argumentMemory: nil, onCreate: { _, _ in }, onCancel: {})
+        WorktreeTaskSheetController(cwd: nil, onCreate: { _, _ in }, onCancel: {})
     }
 
     /// A sheet's end (its `beginSheet` completion, which runs after

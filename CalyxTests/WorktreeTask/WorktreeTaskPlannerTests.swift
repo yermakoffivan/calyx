@@ -338,7 +338,7 @@ struct WorktreeTaskPlannerTests {
     }
 
     @Test @MainActor func test_sheetModel_acceptsPromptFollowsSelectedAgent() {
-        let model = WorktreeTaskSheetModel(argumentMemory: nil)
+        let model = WorktreeTaskSheetModel()
         #expect(model.acceptsPrompt)
         model.agent = .hermes
         #expect(!model.acceptsPrompt)
@@ -348,8 +348,8 @@ struct WorktreeTaskPlannerTests {
 
     // MARK: - Sheet model arguments
 
-    @MainActor private func readyModel(memory: WorktreeTaskArgumentMemory) -> WorktreeTaskSheetModel {
-        let model = WorktreeTaskSheetModel(argumentMemory: memory)
+    @MainActor private func readyModel() -> WorktreeTaskSheetModel {
+        let model = WorktreeTaskSheetModel()
         model.apply(WorktreeTaskRepositoryDescription(
             location: GitRepositoryLocation(workTree: "/r", gitDirectory: "/r/.git", gitCommonDirectory: "/r/.git"),
             displayName: "r", localBranches: ["main"], headBranch: "main"
@@ -359,21 +359,16 @@ struct WorktreeTaskPlannerTests {
     }
 
     @Test @MainActor func test_sheetModel_requestArgumentsParsedFromText() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        let model = readyModel()
         #expect(model.request.arguments == [])
         model.argumentsText = "--model opus --effort 'very high'"
         #expect(model.argumentsError == nil)
         #expect(model.canCreate)
         #expect(model.request.arguments == ["--model", "opus", "--effort", "very high"])
-        #expect(model.request.argumentsText == "--model opus --effort 'very high'")
     }
 
     @Test @MainActor func test_sheetModel_invalidArgumentsBlockCreateUntilFixed() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        let model = readyModel()
         #expect(model.canCreate)
         model.argumentsText = "--x 'oops"
         #expect(model.argumentsError != nil)
@@ -386,9 +381,7 @@ struct WorktreeTaskPlannerTests {
     }
 
     @Test @MainActor func test_sheetModel_danglingEscapeSetsError_escapedBackslashDoesNot() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        let model = readyModel()
         model.argumentsText = "--x tail\\"          // text: --x tail\   (dangling)
         #expect(model.argumentsError != nil)
         #expect(!model.canCreate)
@@ -397,47 +390,8 @@ struct WorktreeTaskPlannerTests {
         #expect(model.request.arguments == ["--x", "tail\\"])
     }
 
-    @Test @MainActor func test_sheetModel_agentChangeRestoresRememberedArguments() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
-        memory.remember("--model opus", for: .claudeCode)
-        memory.remember("-m o3", for: .codex)
-
-        let model = WorktreeTaskSheetModel(argumentMemory: memory)
-        #expect(model.agent == .claudeCode)
-        #expect(model.argumentsText == "--model opus", "initial agent's text is restored on init")
-        model.agent = .codex
-        #expect(model.argumentsText == "-m o3")
-        model.agent = .grok
-        #expect(model.argumentsText == "")
-        model.agent = .claudeCode
-        #expect(model.argumentsText == "--model opus")
-    }
-
-    @Test @MainActor func test_sheetModel_agentChangeKeepsTypedTextPerAgent() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
-        memory.remember("--model opus", for: .claudeCode)
-        memory.remember("-m o3", for: .codex)
-        let model = WorktreeTaskSheetModel(argumentMemory: memory)
-
-        model.argumentsText = "--typed claude"
-        model.agent = .codex
-        #expect(model.argumentsText == "-m o3", "an agent not switched away from yet gets its remembered text")
-        model.argumentsText = "--typed codex"
-        model.agent = .claudeCode
-        #expect(model.argumentsText == "--typed claude", "typed text survives switching away and back")
-        model.agent = .codex
-        #expect(model.argumentsText == "--typed codex")
-        #expect(memory.arguments(for: .claudeCode) == "--model opus", "the stash is not persisted")
-    }
-
     @Test @MainActor func test_sheetModel_beginCreate_marksBusyAtOnceSoASecondIsRefused() throws {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        let model = readyModel()
 
         let first = try #require(model.beginCreate())
         #expect(first.request.branch == "task/x")
@@ -445,14 +399,17 @@ struct WorktreeTaskPlannerTests {
         #expect(model.beginCreate() == nil)
     }
 
-    @Test @MainActor func test_sheetModel_agentChangeRevalidatesRestoredText() {
-        let scratch = ScratchDefaults()
-        defer { scratch.cleanup() }
-        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+    @Test @MainActor func test_sheetModel_agentChangeKeepsTextAndRevalidates() {
+        let model = readyModel()
         model.argumentsText = "'broken"
         #expect(model.argumentsError != nil)
         model.agent = .codex
-        #expect(model.argumentsText == "")
+        #expect(model.argumentsText == "'broken", "switching agents keeps the typed text")
+        #expect(model.argumentsError != nil)
+        #expect(!model.canCreate)
+        model.argumentsText = "--model o3"
+        model.agent = .claudeCode
+        #expect(model.argumentsText == "--model o3")
         #expect(model.argumentsError == nil)
         #expect(model.canCreate)
     }

@@ -267,8 +267,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         launchArgvOverride: Self.worktreeTaskUITestLaunchArgvOverride(
             arguments: ProcessInfo.processInfo.arguments,
             environment: ProcessInfo.processInfo.environment
-        ),
-        argumentMemory: WorktreeTaskArgumentMemory()
+        )
     )
     private var composeOverlayTargetSurfaceID: UUID?
     /// Git badges for Mission Map's cards. Polls only while the map is

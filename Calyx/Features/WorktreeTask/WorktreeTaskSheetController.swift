@@ -21,11 +21,10 @@ final class WorktreeTaskSheetController: NSWindowController, NSWindowDelegate {
 
     init(
         cwd: String?,
-        argumentMemory: WorktreeTaskArgumentMemory?,
         onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void,
         onCancel: @escaping () -> Void
     ) {
-        self.model = WorktreeTaskSheetModel(argumentMemory: argumentMemory)
+        self.model = WorktreeTaskSheetModel()
         self.onCreate = onCreate
         self.onCancel = onCancel
 
