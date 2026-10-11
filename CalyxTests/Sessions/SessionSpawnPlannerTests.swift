@@ -217,6 +217,50 @@ final class SessionSpawnPlannerTests: XCTestCase {
         XCTAssertEqual(argv[rowsIndex + 1], "31")
     }
 
+    func test_plan_argv_isForwardedAfterCwdAsArgvFlags() throws {
+        SessionSettings.persistentSessionsEnabled = true
+        let context = SessionSpawnContext(
+            cwd: "/Users/dev/repo",
+            origin: .tab,
+            argv: ["/bin/zsh", "-l", "-c", "exec 'claude' 'x'"]
+        )
+
+        guard let (_, _, argv) = try capturedArgv(for: context) else {
+            XCTFail("A persistent tab must produce an attach command")
+            return
+        }
+        guard let cwdIndex = argv.firstIndex(of: "--cwd") else {
+            XCTFail("The attach command must carry --cwd")
+            return
+        }
+        XCTAssertEqual(Array(argv[cwdIndex...]), [
+            "--cwd", "/Users/dev/repo",
+            "--argv", "/bin/zsh", "--argv", "-l", "--argv", "-c", "--argv", "exec 'claude' 'x'",
+        ])
+    }
+
+    func test_plan_remote_argv_isForwardedToRemoteAttachCommand() {
+        SessionSettings.persistentSessionsEnabled = true
+        let argv = ["/bin/zsh", "-i", "-l", "-c", "exec 'claude'"]
+        let context = SessionSpawnContext(cwd: "/Users/dev/repo", host: "box", origin: .tab, argv: argv)
+
+        guard case .persistent(let sessionID, let command, let host) = SessionSpawnPlanner.plan(for: context) else {
+            XCTFail("A remote persistent tab must produce a remote attach command")
+            return
+        }
+        XCTAssertEqual(host, "box")
+        XCTAssertEqual(command, SessionCommandSynthesizer.remoteAttachCommand(
+            host: "box", sessionID: sessionID, cwd: "/Users/dev/repo", argv: argv
+        ))
+        XCTAssertNotEqual(command, SessionCommandSynthesizer.remoteAttachCommand(
+            host: "box", sessionID: sessionID, cwd: "/Users/dev/repo"
+        ), "the argv must not be dropped on the remote branch")
+    }
+
+    func test_contextArgv_defaultsToNil() {
+        XCTAssertNil(SessionSpawnContext(cwd: "/tmp").argv)
+    }
+
     // MARK: - Enabled, .quickTerminal origin
 
     func test_plan_enabledQuickTerminalOrigin_stillReturnsPassthrough() {

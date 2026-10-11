@@ -257,11 +257,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var reconnectEstablishGraceTasks = KeyedTaskRegistry<UUID>()
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
-    /// The New Worktree Task sheet while it is presented.
-    private var worktreeTaskSheetController: WorktreeTaskSheetController?
-    /// Standardized worktree roots with a Merge or Discard running, so a
-    /// second click on the same task is ignored instead of racing it.
-    private var worktreeTaskOperationsInFlight: Set<String> = []
+    /// The New Worktree Task sheet while it is presented. Internal, not
+    /// `private`, for the `WorktreeTaskHost` extension in
+    /// CalyxWindowController+WorktreeTaskHost.swift.
+    var worktreeTaskSheetController: WorktreeTaskSheetController?
+    /// Worktree Task orchestration; this controller is its host.
+    lazy var worktreeTaskCoordinator = WorktreeTaskCoordinator(
+        host: self,
+        launchArgvOverride: Self.worktreeTaskUITestLaunchArgvOverride(
+            arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment
+        )
+    )
     private var composeOverlayTargetSurfaceID: UUID?
     /// Git badges for Mission Map's cards. Polls only while the map is
     /// shown: started by `showMissionMap()`, stopped by
@@ -382,6 +389,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// to churn. `nil` (the default) leaves production behavior
     /// unchanged. DO NOT use from production code.
     var _createManagedSurfacePwdObserverForTesting: ((String?) -> Void)?
+
+    /// Test seam (Worktree Tasks): when non-nil, called with the
+    /// `spawnArgv` `createManagedSurface` received, at the same point and
+    /// in both branches like `_createManagedSurfacePwdObserverForTesting`.
+    /// DO NOT use from production code.
+    var _createManagedSurfaceSpawnArgvObserverForTesting: (([String]?) -> Void)?
+
+    /// Test seam (Worktree Tasks): when non-nil, called with the
+    /// `command:` that reaches `SurfaceRegistry.createSurface` (nil on
+    /// `.passthrough` without a spawn argv), at the same point and in
+    /// both branches like `_createManagedSurfacePwdObserverForTesting`.
+    /// DO NOT use from production code.
+    var _createManagedSurfaceCommandObserverForTesting: ((String?) -> Void)?
 
     /// Test seam, remote sessions: when non-nil,
     /// called with `(sessionID, host)` immediately before
@@ -808,7 +828,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         commandRegistry.register(PaletteCommand(
             id: "git.newWorktreeTask", title: "New Worktree Task\u{2026}", shortcut: "Cmd+Shift+N", category: "Git"
         ) { [weak self] in
-            self?.presentWorktreeTaskSheet()
+            self?.worktreeTaskCoordinator.presentSheet()
         })
         commandRegistry.register(PaletteCommand(id: "cli.install", title: "Install CLI to PATH", category: "System") {
             let appPath = Bundle.main.bundlePath
@@ -1043,6 +1063,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// to the owning tab's last-known `pwd` when that pane hasn't reported
     /// one yet (e.g. a snapshot-restored pane before its first OSC 7, or any
     /// surface created before `SurfacePropertyStore.startObserving()`).
+    /// The focused pane's live cwd (`WorktreeTaskHost` requirement;
+    /// declared here because `activeTab`/`livePaneCwd` are private).
+    var focusedPaneCwd: String? {
+        livePaneCwd(of: activeTab?.splitTree.focusedLeafID, in: activeTab)
+    }
+
     private func livePaneCwd(of surfaceID: UUID?, in tab: Tab?) -> String? {
         surfaceID.flatMap { SurfacePropertyStore.shared.cwd(for: $0) } ?? tab?.pwd
     }
@@ -1139,27 +1165,43 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         sessionFallbackCwd: String?,
         origin: SessionSpawnOrigin,
         host: String? = nil,
-        initialGridSize: SessionInitialGridSize? = nil
+        initialGridSize: SessionInitialGridSize? = nil,
+        spawnArgv: [String]? = nil
     ) -> UUID? {
         let sessionCwd = explicitCwd ?? sessionFallbackCwd ?? NSHomeDirectory()
         let context = SessionSpawnContext(
             cwd: sessionCwd,
             host: host,
             origin: origin,
-            initialGridSize: initialGridSize
+            initialGridSize: initialGridSize,
+            argv: spawnArgv
         )
         switch SessionSpawnPlanner.plan(for: context) {
         case .passthrough:
+            // `spawnArgv` becomes the surface's `command`. On macOS ghostty
+            // runs a surface `command` as
+            // `/bin/bash --noprofile --norc -c "exec -l <command>"`
+            // (ghostty/src/termio/Exec.zig, the `.shell` case; see the
+            // SessionCommandSynthesizer header), so each token is
+            // single-quoted and the string re-tokenizes to exactly
+            // `spawnArgv`.
+            let command = spawnArgv.flatMap { argv in
+                argv.isEmpty ? nil : argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+            }
             #if DEBUG
             _createManagedSurfacePwdObserverForTesting?(explicitCwd)
+            _createManagedSurfaceSpawnArgvObserverForTesting?(spawnArgv)
+            _createManagedSurfaceCommandObserverForTesting?(command)
             if let hook = _createManagedSurfaceHookForTesting {
                 return hook()
             }
             #endif
-            return tab.registry.createSurface(app: app, config: config, pwd: explicitCwd)
+            return tab.registry.createSurface(app: app, config: config, pwd: explicitCwd, command: command)
         case .persistent(let sessionID, let command, let planHost):
             #if DEBUG
             _createManagedSurfacePwdObserverForTesting?(sessionCwd)
+            _createManagedSurfaceSpawnArgvObserverForTesting?(spawnArgv)
+            _createManagedSurfaceCommandObserverForTesting?(command)
             if let hook = _createManagedSurfaceHookForTesting {
                 guard let surfaceID = hook() else { return nil }
                 tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID, host: planHost)
@@ -1442,9 +1484,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self?.expandCommit(repoID: repoID, hash: hash)
             },
             onToggleGitRepoSection: { [weak self] repoID in self?.toggleGitRepoSection(repoID: repoID) },
-            onNewWorktreeTask: { [weak self] in self?.presentWorktreeTaskSheet() },
-            onMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(root: root) },
-            onDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(root: root) },
+            onNewWorktreeTask: { [weak self] in self?.worktreeTaskCoordinator.presentSheet() },
+            onMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(worktreeRoot: root) },
+            onDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(worktreeRoot: root) },
             onRetryGitRepoSection: { [weak self] repoID in self?.retryGitRepoSection(repoID: repoID) },
             onSelectRefFilter: { [weak self] repoID, selection in
                 self?.setGitRefSelection(repoID: repoID, selection: selection)
@@ -1504,8 +1546,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onMissionMapSelectableIDsChange: { [weak self] ids in self?.missionMapSelectableIDsChanged(ids) },
             onMissionMapAllow: { [weak self] requestID in self?.allowApprovalFromMissionMap(requestID) },
             onMissionMapOpenApproval: { [weak self] requestID in self?.openApprovalFromMissionMap(requestID) },
-            onMissionMapMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(root: root) },
-            onMissionMapDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(root: root) },
+            onMissionMapMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(worktreeRoot: root) },
+            onMissionMapDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(worktreeRoot: root) },
             onMissionMapKeyCatcherReady: { [weak self] view in self?.missionMapKeyCatcherReady(view) },
             onMissionMapPopoverPlacementChange: { [weak self] placement in
                 self?.missionMapPopoverPlacementChanged(placement)
@@ -1682,6 +1724,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// so libghostty performs its own live-OSC-7-based inheritance
     /// exactly as before this parameter existed.
     ///
+    /// `spawnArgv` (Worktree Tasks): the program the new pane runs
+    /// instead of the user's shell -- the surface `command` on
+    /// `.passthrough`, `attach --argv` flags on `.persistent` (see
+    /// `createManagedSurface`). `nil` launches the shell as before.
+    ///
     /// Thin wrapper resolving `GhosttyAppController.shared.app` and
     /// delegating everything else to `performCreateNewTab` -- same split,
     /// same reason, as `handleNewSplitNotification`/`performSplit`: that
@@ -1693,9 +1740,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// Returns the new tab's leaf surface ID, or nil when no tab was
     /// created.
     @discardableResult
-    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil) -> UUID? {
+    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil, spawnArgv: [String]? = nil) -> UUID? {
         guard let app = GhosttyAppController.shared.app else { return nil }
-        return performCreateNewTab(app: app, inheritedConfig: inheritedConfig, host: host, spawnCwd: spawnCwd)
+        return performCreateNewTab(app: app, inheritedConfig: inheritedConfig, host: host, spawnCwd: spawnCwd, spawnArgv: spawnArgv)
     }
 
     /// `createNewTab`'s body, taking `app` directly instead of resolving
@@ -1733,7 +1780,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// parameter from the caller, is what makes this method drivable by
     /// a test in the first place.
     @discardableResult
-    func performCreateNewTab(app: ghostty_app_t, inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil) -> UUID? {
+    func performCreateNewTab(app: ghostty_app_t, inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil, spawnArgv: [String]? = nil) -> UUID? {
         guard let window = self.window, let group = windowSession.activeGroup else { return nil }
 
         let tab = Tab()
@@ -1751,7 +1798,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             tab: tab, app: app, config: config,
             explicitCwd: Self.normalizedCwdOverride(spawnCwd),
             sessionFallbackCwd: livePaneCwd(of: activeTab?.splitTree.focusedLeafID, in: activeTab),
-            origin: .tab, host: host, initialGridSize: initialGridSize
+            origin: .tab, host: host, initialGridSize: initialGridSize,
+            spawnArgv: spawnArgv
         ) else {
             logger.error("Failed to create surface for new tab")
             return nil
@@ -5016,7 +5064,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func newWorktreeTask(_ sender: Any?) {
-        presentWorktreeTaskSheet()
+        worktreeTaskCoordinator.presentSheet()
     }
 
     @objc func closeTab(_ sender: Any?) {
@@ -5477,7 +5525,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// The single entry point for every Changes-sidebar refresh. Each
     /// trigger pays only for what its event can have changed; see
     /// `GitSidebarRefreshTrigger`.
-    private func refreshGitSidebar(trigger: GitSidebarRefreshTrigger) {
+    ///
+    /// Internal, not `private`: used by the `WorktreeTaskHost` extension
+    /// (CalyxWindowController+WorktreeTaskHost.swift).
+    func refreshGitSidebar(trigger: GitSidebarRefreshTrigger) {
         switch trigger {
         case .sidebarShown:
             runGitDiscovery(scope: .everySection, isUserInitiated: false)
@@ -6385,196 +6436,4 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         alert.runModal()
     }
 
-}
-
-// MARK: - Worktree Tasks
-
-extension CalyxWindowController {
-
-    /// Opens the New Worktree Task sheet against the focused pane's cwd.
-    /// Outside a repository the sheet still opens, with Create disabled.
-    func presentWorktreeTaskSheet() {
-        guard let window, worktreeTaskSheetController == nil else { return }
-        let cwd = livePaneCwd(of: activeTab?.splitTree.focusedLeafID, in: activeTab)
-        let sheet = WorktreeTaskSheetController(
-            cwd: cwd,
-            onCreate: { [weak self] request, repository in
-                self?.createWorktreeTask(request: request, repository: repository)
-            },
-            onCancel: {}
-        )
-        guard let sheetWindow = sheet.window else { return }
-        worktreeTaskSheetController = sheet
-        window.beginSheet(sheetWindow) { [weak self] _ in
-            self?.worktreeTaskSheetController = nil
-        }
-    }
-
-    /// Creates the task worktree, then opens a tab in it and types the
-    /// agent's launch command. A failure is shown over the sheet, which
-    /// stays open so the request can be corrected.
-    private func createWorktreeTask(request: WorktreeTaskRequest, repository: WorktreeTaskRepositoryDescription) {
-        guard let sheet = worktreeTaskSheetController else { return }
-        let path = WorktreeTaskPlanner.worktreePath(
-            sessionRoot: SessionRootResolver().resolve(),
-            repoDisplayName: repository.displayName,
-            branch: request.branch
-        )
-        sheet.setBusy(true)
-        Task { @MainActor [weak self] in
-            do {
-                let task = try await WorktreeTaskService.create(
-                    request: request,
-                    location: repository.location,
-                    repoDisplayName: repository.displayName,
-                    path: path
-                )
-                sheet.dismiss()
-                self?.launchWorktreeTask(task, request: request)
-            } catch {
-                sheet.setBusy(false)
-                Self.presentWorktreeTaskAlert(for: error, on: sheet.window)
-            }
-        }
-    }
-
-    /// Opens a tab at the task worktree and types the launch command
-    /// after `launchCommandDelay`. A deferred prompt is typed only once
-    /// the agent has registered in `AgentRegistry` for that pane (polled
-    /// every `deferredPromptPollInterval`); if it has not within
-    /// `deferredPromptTimeout` the prompt is dropped, because typing it
-    /// into a shell would run it as a command. Each send re-checks that
-    /// the pane still exists in this window.
-    private func launchWorktreeTask(_ task: WorktreeTask, request: WorktreeTaskRequest) {
-        guard let surfaceID = createNewTab(spawnCwd: task.path) else {
-            logger.error("Failed to create the tab for worktree task \(task.branch, privacy: .public)")
-            refreshGitSidebar(trigger: .manualRefresh)
-            return
-        }
-        refreshGitSidebar(trigger: .manualRefresh)
-        let plan = WorktreeTaskPlanner.launchPlan(agent: request.agent, prompt: request.prompt)
-        Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: WorktreeTaskPlanner.launchCommandDelay)
-            } catch {
-                return
-            }
-            guard let self, self.ownsSplitLeaf(surfaceID) else { return }
-            _ = self.cockpitSendCommand(surfaceID: surfaceID, command: plan.command, doubleReturn: false)
-            guard let prompt = plan.deferredPrompt else { return }
-            let clock = ContinuousClock()
-            let deadline = clock.now + WorktreeTaskPlanner.deferredPromptTimeout
-            while AgentRegistry.shared.entries[surfaceID] == nil {
-                guard clock.now < deadline else {
-                    logger.notice("Agent for worktree task \(task.branch, privacy: .public) did not register in time; deferred prompt dropped")
-                    return
-                }
-                do {
-                    try await Task.sleep(for: WorktreeTaskPlanner.deferredPromptPollInterval)
-                } catch {
-                    return
-                }
-                guard self.ownsSplitLeaf(surfaceID) else { return }
-            }
-            guard self.ownsSplitLeaf(surfaceID) else { return }
-            _ = self.cockpitSendCommand(surfaceID: surfaceID, command: prompt, doubleReturn: false)
-        }
-    }
-
-    /// Merges the task rooted at `root` into its base, removes the
-    /// worktree and deletes the branch, and only then closes the task's
-    /// panes (a failed git step leaves the agent running). The sidebar is
-    /// refreshed after the panes close so no stale cwd keeps the section.
-    /// Ignored while a Merge or Discard for the same root is running.
-    func mergeWorktreeTask(root: String) {
-        let key = GitRepositoryLocation.standardize(root)
-        guard !worktreeTaskOperationsInFlight.contains(key) else { return }
-        worktreeTaskOperationsInFlight.insert(key)
-        Task { @MainActor [weak self] in
-            defer { self?.worktreeTaskOperationsInFlight.remove(key) }
-            do {
-                guard let task = try await WorktreeTaskService.task(forWorktreeRoot: root) else {
-                    throw WorktreeTaskError.notATask(root)
-                }
-                let basePath = try await WorktreeTaskService.merge(task: task)
-                try await WorktreeTaskService.finishMerge(task: task, basePath: basePath)
-                self?.closePanes(insideWorktree: task.path, replacementCwd: basePath)
-                self?.refreshGitSidebar(trigger: .manualRefresh)
-            } catch {
-                Self.presentWorktreeTaskAlert(for: error, on: self?.window)
-            }
-        }
-    }
-
-    /// After confirmation, force-removes the task's worktree and
-    /// force-deletes its branch, then closes its panes and refreshes the
-    /// sidebar. Ignored while a Merge or Discard for the same root is
-    /// running.
-    func discardWorktreeTask(root: String) {
-        let key = GitRepositoryLocation.standardize(root)
-        guard !worktreeTaskOperationsInFlight.contains(key) else { return }
-        worktreeTaskOperationsInFlight.insert(key)
-        Task { @MainActor [weak self] in
-            defer { self?.worktreeTaskOperationsInFlight.remove(key) }
-            do {
-                guard let task = try await WorktreeTaskService.task(forWorktreeRoot: root) else {
-                    throw WorktreeTaskError.notATask(root)
-                }
-                guard let window = self?.window else { return }
-                let alert = NSAlert()
-                alert.messageText = "Discard worktree task \(task.branch)?"
-                alert.informativeText = "The worktree at \(task.path), its uncommitted changes and the branch \(task.branch) will be deleted, and its panes closed."
-                alert.alertStyle = .warning
-                let discardButton = alert.addButton(withTitle: "Discard")
-                discardButton.hasDestructiveAction = true
-                alert.addButton(withTitle: "Cancel")
-                let response = await alert.beginSheetModal(for: window)
-                guard response == .alertFirstButtonReturn else { return }
-
-                guard let mainWorktree = try await GitService.worktreeList(workDir: root).first else {
-                    throw WorktreeTaskError.notATask(root)
-                }
-                try await WorktreeTaskService.discard(task: task, workDir: mainWorktree.path)
-                self?.closePanes(insideWorktree: task.path, replacementCwd: mainWorktree.path)
-                self?.refreshGitSidebar(trigger: .manualRefresh)
-            } catch {
-                Self.presentWorktreeTaskAlert(for: error, on: self?.window)
-            }
-        }
-    }
-
-    /// Closes every pane, in every window, whose cwd is inside `path`. A
-    /// window that would lose all its panes first gets a tab at
-    /// `replacementCwd` so it stays open.
-    private func closePanes(insideWorktree path: String, replacementCwd: String) {
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
-        let closing = WorktreeTaskPlanner.surfacesInside(path: path, panes: LiveCockpitAppAccess().listPanes())
-        guard !closing.isEmpty else { return }
-        for controller in appDelegate.allWindowControllers {
-            let leafIDs = controller.windowSession.groups
-                .flatMap(\.tabs)
-                .flatMap { $0.splitTree.allLeafIDs() }
-            if WorktreeTaskPlanner.needsReplacementTab(windowLeafIDs: leafIDs, closing: closing) {
-                controller.createNewTab(spawnCwd: replacementCwd)
-            }
-            for surfaceID in closing {
-                controller.closeSurfaceIfOwned(surfaceID)
-            }
-        }
-    }
-
-    /// Shows `error` as a sheet on `window` (the error's
-    /// `localizedDescription`; a failed merge carries git's stderr).
-    private static func presentWorktreeTaskAlert(for error: Error, on window: NSWindow?) {
-        let alert = NSAlert()
-        alert.messageText = "Worktree Task"
-        alert.informativeText = error.localizedDescription
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
-        if let window {
-            alert.beginSheetModal(for: window)
-        } else {
-            alert.runModal()
-        }
-    }
 }

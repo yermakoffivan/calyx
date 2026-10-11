@@ -2,9 +2,11 @@
 // Calyx
 //
 // Builds the shell command string used as a ghostty surface's `command`
-// config when persistent sessions are enabled. Ghostty runs any command
-// with additional arguments through `/bin/sh -c` (see
-// `ghostty/src/config/Config.zig`'s `command` doc comment), so every
+// config when persistent sessions are enabled. A surface `command` is
+// run through a shell: on macOS ghostty spawns
+// `/bin/bash --noprofile --norc -c "exec -l <command>"`
+// (`ghostty/src/termio/Exec.zig`, the `.shell` case; `Config.zig`'s
+// `command` doc describes this generically as `/bin/sh -c`), so every
 // token below must be shell-safe on its own — `shSafeToken(_:)` is
 // applied to each argument that can contain attacker/user-controlled
 // text (the binary path, sessionID, and cwd).
@@ -128,9 +130,13 @@ enum SessionCommandSynthesizer {
         sessionID: String,
         cwd: String,
         initialGridSize: SessionInitialGridSize? = nil,
+        argv: [String]? = nil,
         rootResolver: SessionRootResolverProtocol = SessionRootResolver()
     ) -> String {
         let root = rootResolver.resolve()
+        // One `--argv <tok>` per element: the session runs that program
+        // instead of the user's shell. nil or empty leaves the shell.
+        let argvArguments = (argv ?? []).map { " --argv \(shSafeToken($0))" }.joined()
         let initialGridArguments: String
         if let initialGridSize {
             initialGridArguments = " --initial-cols \(shSafeToken(String(initialGridSize.columns)))"
@@ -138,7 +144,7 @@ enum SessionCommandSynthesizer {
         } else {
             initialGridArguments = ""
         }
-        return "\(shSafeToken(binaryPath)) --runtime-dir \(shSafeToken(root + "/.calyx/run")) --state-dir \(shSafeToken(root + "/.calyx/state")) attach \(shSafeToken(sessionID)) --create\(initialGridArguments) --cwd \(shSafeToken(cwd))"
+        return "\(shSafeToken(binaryPath)) --runtime-dir \(shSafeToken(root + "/.calyx/run")) --state-dir \(shSafeToken(root + "/.calyx/state")) attach \(shSafeToken(sessionID)) --create\(initialGridArguments) --cwd \(shSafeToken(cwd))\(argvArguments)"
     }
 
     /// Builds the attach command for re-attaching to an *existing*
@@ -220,8 +226,13 @@ enum SessionCommandSynthesizer {
         sessionID: String,
         cwd: String,
         initialGridSize: SessionInitialGridSize? = nil,
+        argv: [String]? = nil,
         sshResolver: SSHBinaryResolverProtocol = SSHBinaryResolver()
     ) -> String {
+        // Same `--argv <tok>` flags as `attachCommand`, quoted for the
+        // remote shell here and quoted once more for the local shell with
+        // the whole remote command below.
+        let argvArguments = (argv ?? []).map { " --argv \(shSafeToken($0))" }.joined()
         let initialGridArguments: String
         if let initialGridSize {
             initialGridArguments = " --initial-cols \(shSafeToken(String(initialGridSize.columns)))"
@@ -229,7 +240,7 @@ enum SessionCommandSynthesizer {
         } else {
             initialGridArguments = ""
         }
-        let remoteCommand = "$HOME/.calyx/bin/calyx-session attach \(shSafeToken(sessionID)) --create\(initialGridArguments) --cwd \(shSafeToken(cwd))"
+        let remoteCommand = "$HOME/.calyx/bin/calyx-session attach \(shSafeToken(sessionID)) --create\(initialGridArguments) --cwd \(shSafeToken(cwd))\(argvArguments)"
         return "\(shSafeToken(sshResolver.resolve())) -t -- \(shSafeToken(host)) \(shSafeToken(remoteCommand))"
     }
 }

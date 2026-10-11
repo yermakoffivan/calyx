@@ -35,25 +35,26 @@ enum WorktreeTaskAgentKind: String, CaseIterable, Identifiable, Hashable, Sendab
         AgentEntry.displayName(forKind: agentEntryKind)
     }
 
-    /// The command typed into the new tab, before any prompt argument.
-    var baseCommand: String {
+    /// The CLI's argv before any prompt argument.
+    var baseArgv: [String] {
         switch self {
-        case .claudeCode: "claude"
-        case .codex: "codex"
-        case .openCode: "opencode"
-        case .hermes: "hermes chat"
-        case .grok: "grok"
-        case .pi: "pi"
+        case .claudeCode: ["claude"]
+        case .codex: ["codex"]
+        case .openCode: ["opencode"]
+        case .hermes: ["hermes", "chat"]
+        case .grok: ["grok"]
+        case .pi: ["pi"]
         }
     }
 
-    /// Whether the CLI takes the initial prompt as a positional argument.
-    /// The others are started bare and the prompt is typed into their TUI
-    /// once it is up.
-    var acceptsPromptArgument: Bool {
+    /// Whether the CLI can start an interactive session with an initial
+    /// prompt. `hermes chat -q` is single-query, non-interactive mode
+    /// (it answers once and exits) and Hermes has no flag for a first
+    /// prompt in interactive mode, so Hermes starts without one.
+    var acceptsInitialPrompt: Bool {
         switch self {
-        case .claudeCode, .codex, .grok: true
-        case .openCode, .hermes, .pi: false
+        case .claudeCode, .codex, .openCode, .grok, .pi: true
+        case .hermes: false
         }
     }
 }
@@ -78,13 +79,10 @@ struct WorktreeTaskRequest: Equatable, Sendable {
     let prompt: String
 }
 
-/// What gets typed into the task's new tab.
+/// The agent CLI's argv for a task: the program the task's pane runs,
+/// with the prompt as one argument (never typed into a shell).
 struct WorktreeTaskLaunchPlan: Equatable, Sendable {
-    /// Typed first, followed by Return.
-    let command: String
-    /// Typed `WorktreeTaskPlanner.deferredPromptDelay` after `command`,
-    /// for CLIs that cannot take the prompt as an argument.
-    let deferredPrompt: String?
+    let argv: [String]
 }
 
 /// The repository a New Worktree Task sheet is opened against.

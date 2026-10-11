@@ -24,6 +24,12 @@ final class WorktreeTaskSheetModel {
     /// or when the pane is not inside a git repository.
     var repository: WorktreeTaskRepositoryDescription?
 
+    /// Whether the selected agent takes the initial prompt; the prompt
+    /// field is disabled when it does not.
+    var acceptsPrompt: Bool {
+        agent.acceptsInitialPrompt
+    }
+
     var canCreate: Bool {
         !branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !base.isEmpty
@@ -128,7 +134,14 @@ struct WorktreeTaskSheetView: View {
                 .font(.body)
                 .frame(height: 100)
                 .border(Color.secondary.opacity(0.3))
+                .disabled(!model.acceptsPrompt)
+                .opacity(model.acceptsPrompt ? 1 : 0.5)
                 .accessibilityIdentifier(AccessibilityID.WorktreeTask.promptField)
+            if !model.acceptsPrompt {
+                Text("\(model.agent.displayName) starts without an initial prompt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

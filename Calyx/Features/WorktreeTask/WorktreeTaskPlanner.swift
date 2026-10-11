@@ -2,26 +2,12 @@
 // Calyx
 //
 // The pure half of Worktree Tasks: where a task's worktree lives, what is
-// typed into its tab, which worktree hosts a branch, which panes sit
+// spawned in its tab, which worktree hosts a branch, which panes sit
 // inside a worktree, and whether closing them would empty a window.
 
 import Foundation
 
 enum WorktreeTaskPlanner {
-
-    /// Delay between creating the task's tab and typing the launch
-    /// command, so the shell has printed its prompt.
-    static let launchCommandDelay: Duration = .milliseconds(800)
-
-    /// How often to check whether the agent has registered (its hooks
-    /// fired or its MCP connection initialized) before typing a deferred
-    /// prompt.
-    static let deferredPromptPollInterval: Duration = .milliseconds(250)
-
-    /// How long to wait for the agent to register. When it elapses the
-    /// deferred prompt is dropped rather than typed into what may still
-    /// be the shell.
-    static let deferredPromptTimeout: Duration = .seconds(30)
 
     /// `<sessionRoot>/.calyx/worktrees/<repo>/<branch with "/" → "-">`.
     static func worktreePath(sessionRoot: String, repoDisplayName: String, branch: String) -> String {
@@ -31,27 +17,65 @@ enum WorktreeTaskPlanner {
             .appendingPathComponent(repoDisplayName + "/" + leaf)
     }
 
-    /// The command for `agent`, with `prompt` trimmed. Argument-taking
-    /// CLIs get it shell-quoted as one positional argument (newlines kept
-    /// inside the quotes, preceded by `--` when it starts with `-`); the others start bare and get the prompt typed
-    /// later with newlines collapsed to spaces, because a typed newline
-    /// would submit it early.
+    /// The argv for `agent` with `prompt` trimmed and passed as one
+    /// argument: positional for claude / codex / grok / pi (preceded by
+    /// `--` when it starts with `-`, so it is not parsed as an option),
+    /// `opencode --prompt <p>`. An empty prompt, or a kind that does not
+    /// `acceptsInitialPrompt` (hermes), gives the bare `baseArgv`.
     static func launchPlan(agent: WorktreeTaskAgentKind, prompt: String) -> WorktreeTaskLaunchPlan {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return WorktreeTaskLaunchPlan(command: agent.baseCommand, deferredPrompt: nil)
+        guard agent.acceptsInitialPrompt, !trimmed.isEmpty else {
+            return WorktreeTaskLaunchPlan(argv: agent.baseArgv)
         }
-        if agent.acceptsPromptArgument {
-            // `--` ends option parsing so a prompt starting with `-` stays
-            // a positional argument.
-            let separator = trimmed.hasPrefix("-") ? " --" : ""
-            return WorktreeTaskLaunchPlan(
-                command: agent.baseCommand + separator + " " + SessionCommandSynthesizer.shSafeToken(trimmed),
-                deferredPrompt: nil
-            )
+        switch agent {
+        case .claudeCode, .codex, .grok, .pi:
+            let separator = trimmed.hasPrefix("-") ? ["--"] : []
+            return WorktreeTaskLaunchPlan(argv: agent.baseArgv + separator + [trimmed])
+        case .openCode:
+            return WorktreeTaskLaunchPlan(argv: agent.baseArgv + ["--prompt", trimmed])
+        case .hermes:
+            // Not `acceptsInitialPrompt`: handled by the guard above.
+            return WorktreeTaskLaunchPlan(argv: agent.baseArgv)
         }
-        let collapsed = trimmed.components(separatedBy: .newlines).joined(separator: " ")
-        return WorktreeTaskLaunchPlan(command: agent.baseCommand, deferredPrompt: collapsed)
+    }
+
+    /// The argv the task's pane is spawned with: `launchArgv` exec'd by
+    /// the user's shell as an interactive login shell,
+    /// `[loginShell, "-i", "-l", "-c", "exec <tokens>"]`, every token
+    /// single-quoted. `-i` makes zsh/bash source the rc files (`~/.zshrc`,
+    /// `~/.bashrc`), where nvm and `~/.local/bin` PATH setup usually
+    /// live; `-l` sources the profile files. On `.passthrough` ghostty
+    /// already runs the surface `command` as
+    /// `/bin/bash --noprofile --norc -c "exec -l <command>"`
+    /// (ghostty/src/termio/Exec.zig), whose `exec -l` makes this shell a
+    /// login shell anyway, but not an interactive one; on `.persistent`
+    /// the session daemon execs this argv directly, so `-l` is needed.
+    ///
+    /// A failing agent (e.g. "command not found") stays visible on
+    /// `.passthrough`: setting a surface `command` makes ghostty force
+    /// `wait-after-command` on (ghostty/src/apprt/embedded.zig,
+    /// `Surface.init`; see `SurfaceRegistry.createSurface(app:config:pwd:command:)`),
+    /// so the pane is kept open after the exec'd process exits. On
+    /// `.persistent` the session's process ends instead and the pane
+    /// follows `SessionReconnectCoordinator`'s handling of an ended
+    /// session.
+    static func spawnArgv(launchArgv: [String], loginShell: String) -> [String] {
+        let command = "exec " + launchArgv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+        return [loginShell, "-i", "-l", "-c", command]
+    }
+
+    /// The shell `spawnArgv` wraps the agent in: the account's login
+    /// shell (`passwdShell`, from `getpwuid`), else `$SHELL`
+    /// (`environmentShell`), else `/bin/zsh`; empty strings count as
+    /// absent. A shell that is not POSIX-compatible (csh, tcsh, fish,
+    /// nu) is replaced by `/bin/zsh`, because the single-quoted
+    /// `exec` string assumes POSIX quoting.
+    static func loginShell(passwdShell: String?, environmentShell: String?) -> String {
+        let candidate = [passwdShell, environmentShell]
+            .compactMap { $0 }
+            .first { !$0.isEmpty } ?? "/bin/zsh"
+        let nonPOSIX: Set<String> = ["csh", "tcsh", "fish", "nu"]
+        return nonPOSIX.contains((candidate as NSString).lastPathComponent) ? "/bin/zsh" : candidate
     }
 
     /// Path of the live (non-bare, non-prunable) worktree that has

@@ -2,8 +2,8 @@
 // CalyxTests
 //
 // Pins WorktreeTaskPlanner, the pure half of Worktree Tasks: where a
-// task's worktree lives, what gets typed into the new tab for each agent
-// CLI, which worktree hosts a branch, which panes sit inside a worktree,
+// task's worktree lives, the argv each agent CLI is spawned with,
+// which worktree hosts a branch, which panes sit inside a worktree,
 // and whether closing them would empty the window.
 
 import Foundation
@@ -34,13 +34,13 @@ struct WorktreeTaskPlannerTests {
 
     // MARK: - Agent kinds
 
-    @Test func test_agentKind_baseCommands() {
-        #expect(WorktreeTaskAgentKind.claudeCode.baseCommand == "claude")
-        #expect(WorktreeTaskAgentKind.codex.baseCommand == "codex")
-        #expect(WorktreeTaskAgentKind.openCode.baseCommand == "opencode")
-        #expect(WorktreeTaskAgentKind.hermes.baseCommand == "hermes chat")
-        #expect(WorktreeTaskAgentKind.grok.baseCommand == "grok")
-        #expect(WorktreeTaskAgentKind.pi.baseCommand == "pi")
+    @Test func test_agentKind_baseArgv() {
+        #expect(WorktreeTaskAgentKind.claudeCode.baseArgv == ["claude"])
+        #expect(WorktreeTaskAgentKind.codex.baseArgv == ["codex"])
+        #expect(WorktreeTaskAgentKind.openCode.baseArgv == ["opencode"])
+        #expect(WorktreeTaskAgentKind.hermes.baseArgv == ["hermes", "chat"])
+        #expect(WorktreeTaskAgentKind.grok.baseArgv == ["grok"])
+        #expect(WorktreeTaskAgentKind.pi.baseArgv == ["pi"])
         #expect(WorktreeTaskAgentKind.allCases.count == 6)
     }
 
@@ -52,92 +52,159 @@ struct WorktreeTaskPlannerTests {
 
     // MARK: - launchPlan: positional-argument kinds
 
-    /// `'` becomes `'\''` and the newline survives inside the quotes.
+    /// Trimmed, but the inner `'` and newline survive verbatim: the
+    /// prompt is one argv element, never parsed by a shell.
     private let trickyPrompt = "  fix Bob's bug\nthen test \n"
-    private let quotedTricky = "'fix Bob'\\''s bug\nthen test'"
+    private let trimmedTricky = "fix Bob's bug\nthen test"
 
-    @Test func test_launchPlan_claudeCode_quotesTrimmedPromptAsArgument() {
+    @Test func test_launchPlan_claudeCode_promptIsOneArgvElement() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "claude " + quotedTricky, deferredPrompt: nil))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["claude", trimmedTricky]))
     }
 
-    @Test func test_launchPlan_codex_quotesTrimmedPromptAsArgument() {
+    @Test func test_launchPlan_codex_promptIsOneArgvElement() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .codex, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "codex " + quotedTricky, deferredPrompt: nil))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["codex", trimmedTricky]))
     }
 
-    @Test func test_launchPlan_grok_quotesTrimmedPromptAsArgument() {
+    @Test func test_launchPlan_grok_promptIsOneArgvElement() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .grok, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "grok " + quotedTricky, deferredPrompt: nil))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["grok", trimmedTricky]))
+    }
+
+    @Test func test_launchPlan_pi_promptIsOneArgvElement() {
+        let plan = WorktreeTaskPlanner.launchPlan(agent: .pi, prompt: trickyPrompt)
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["pi", trimmedTricky]))
     }
 
     @Test func test_launchPlan_claudeCode_simplePrompt() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, prompt: "add tests")
-        #expect(plan == WorktreeTaskLaunchPlan(command: "claude 'add tests'", deferredPrompt: nil))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["claude", "add tests"]))
     }
 
-    // MARK: - launchPlan: typed-prompt kinds
+    // MARK: - launchPlan: flag kinds
 
-    @Test func test_launchPlan_openCode_bareCommandAndDeferredPromptWithNewlinesCollapsed() {
+    @Test func test_launchPlan_openCode_promptAfterPromptFlag() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .openCode, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "opencode", deferredPrompt: "fix Bob's bug then test"))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["opencode", "--prompt", trimmedTricky]))
     }
 
-    @Test func test_launchPlan_hermes_bareCommandAndDeferredPrompt() {
+    /// `hermes chat -q` is single-query mode (answers once and exits),
+    /// so Hermes launches interactive and the prompt is ignored.
+    @Test func test_launchPlan_hermes_ignoresPrompt() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .hermes, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "hermes chat", deferredPrompt: "fix Bob's bug then test"))
-    }
-
-    @Test func test_launchPlan_pi_bareCommandAndDeferredPrompt() {
-        let plan = WorktreeTaskPlanner.launchPlan(agent: .pi, prompt: trickyPrompt)
-        #expect(plan == WorktreeTaskLaunchPlan(command: "pi", deferredPrompt: "fix Bob's bug then test"))
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["hermes", "chat"]))
     }
 
     // MARK: - launchPlan: empty prompt
 
-    @Test func test_launchPlan_emptyOrWhitespacePrompt_isBareCommandWithNoDeferredPrompt() {
-        let expected: [WorktreeTaskAgentKind: String] = [
-            .claudeCode: "claude", .codex: "codex", .openCode: "opencode",
-            .hermes: "hermes chat", .grok: "grok", .pi: "pi",
+    @Test func test_launchPlan_emptyOrWhitespacePrompt_isBareArgv() {
+        let expected: [WorktreeTaskAgentKind: [String]] = [
+            .claudeCode: ["claude"], .codex: ["codex"], .openCode: ["opencode"],
+            .hermes: ["hermes", "chat"], .grok: ["grok"], .pi: ["pi"],
         ]
         for kind in WorktreeTaskAgentKind.allCases {
             for prompt in ["", "  \n "] {
                 let plan = WorktreeTaskPlanner.launchPlan(agent: kind, prompt: prompt)
-                #expect(plan == WorktreeTaskLaunchPlan(command: expected[kind]!, deferredPrompt: nil),
+                #expect(plan == WorktreeTaskLaunchPlan(argv: expected[kind]!),
                         "kind \(kind.rawValue), prompt \(prompt.debugDescription)")
             }
         }
-    }
-
-    // MARK: - Delays
-
-    @Test func test_delays_launchDelayAndPromptReadinessWait() {
-        #expect(WorktreeTaskPlanner.launchCommandDelay == .milliseconds(800))
-        #expect(WorktreeTaskPlanner.deferredPromptPollInterval == .milliseconds(250))
-        #expect(WorktreeTaskPlanner.deferredPromptTimeout == .seconds(30))
     }
 
     // MARK: - launchPlan: prompt starting with "-"
 
     @Test func test_launchPlan_dashPrompt_positionalKindsGetOptionTerminator() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, prompt: "  --help me ")
-        #expect(plan == WorktreeTaskLaunchPlan(command: "claude -- '--help me'", deferredPrompt: nil))
-        for kind in WorktreeTaskAgentKind.allCases where kind.acceptsPromptArgument {
-            let command = WorktreeTaskPlanner.launchPlan(agent: kind, prompt: "-x").command
-            #expect(command == kind.baseCommand + " -- '-x'", "kind \(kind.rawValue)")
+        #expect(plan == WorktreeTaskLaunchPlan(argv: ["claude", "--", "--help me"]))
+        let expected: [WorktreeTaskAgentKind: [String]] = [
+            .claudeCode: ["claude", "--", "-x"], .codex: ["codex", "--", "-x"],
+            .grok: ["grok", "--", "-x"], .pi: ["pi", "--", "-x"],
+        ]
+        for (kind, argv) in expected {
+            #expect(WorktreeTaskPlanner.launchPlan(agent: kind, prompt: "-x").argv == argv, "kind \(kind.rawValue)")
         }
     }
 
-    @Test func test_launchPlan_dashPrompt_deferredKindsUnchanged() {
-        for kind in WorktreeTaskAgentKind.allCases where !kind.acceptsPromptArgument {
-            let plan = WorktreeTaskPlanner.launchPlan(agent: kind, prompt: "-x")
-            #expect(plan == WorktreeTaskLaunchPlan(command: kind.baseCommand, deferredPrompt: "-x"))
-        }
+    @Test func test_launchPlan_dashPrompt_flagKindsGetNoOptionTerminator() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .openCode, prompt: "-x")
+            == WorktreeTaskLaunchPlan(argv: ["opencode", "--prompt", "-x"]))
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .hermes, prompt: "-x")
+            == WorktreeTaskLaunchPlan(argv: ["hermes", "chat"]))
     }
 
     @Test func test_launchPlan_innerDashPrompt_noOptionTerminator() {
         let plan = WorktreeTaskPlanner.launchPlan(agent: .codex, prompt: "fix -x")
-        #expect(plan.command == "codex 'fix -x'")
+        #expect(plan.argv == ["codex", "fix -x"])
+    }
+
+    // MARK: - spawnArgv
+
+    @Test func test_spawnArgv_wrapsInInteractiveLoginShellExecWithEveryTokenQuoted() {
+        let argv = WorktreeTaskPlanner.spawnArgv(
+            launchArgv: ["claude", "fix Bob's bug\nthen test"],
+            loginShell: "/bin/zsh"
+        )
+        #expect(argv == ["/bin/zsh", "-i", "-l", "-c", "exec 'claude' 'fix Bob'\\''s bug\nthen test'"])
+    }
+
+    @Test func test_spawnArgv_bareArgvAndOtherShell() {
+        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: ["hermes", "chat"], loginShell: "/opt/homebrew/bin/bash")
+        #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "exec 'hermes' 'chat'"])
+    }
+
+    /// The `-c` string, run by a real `/bin/sh`, must hand the agent
+    /// exactly the original argv (quote and newline intact).
+    @Test func test_spawnArgv_commandStringRoundTripsThroughRealShell() throws {
+        let launch = ["/usr/bin/printf", "%s|", "it's", "a\nb", "--x"]
+        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: "/bin/sh")
+        #expect(argv.dropLast() == ["/bin/sh", "-i", "-l", "-c"])
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", try #require(argv.last)]
+        let out = Pipe()
+        process.standardOutput = out
+        try process.run()
+        process.waitUntilExit()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(text == "it's|a\nb|--x|")
+    }
+
+    // MARK: - loginShell
+
+    @Test func test_loginShell_prefersPasswdThenEnvironmentThenZsh() {
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: "/bin/bash", environmentShell: "/bin/ksh") == "/bin/bash")
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: nil, environmentShell: "/bin/ksh") == "/bin/ksh")
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: "", environmentShell: "/bin/ksh") == "/bin/ksh")
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: nil, environmentShell: nil) == "/bin/zsh")
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: nil, environmentShell: "") == "/bin/zsh")
+    }
+
+    @Test func test_loginShell_nonPOSIXShellFallsBackToZsh() {
+        for shell in ["/bin/csh", "/bin/tcsh", "/opt/homebrew/bin/fish", "/opt/homebrew/bin/nu"] {
+            #expect(WorktreeTaskPlanner.loginShell(passwdShell: shell, environmentShell: "/bin/bash") == "/bin/zsh",
+                    "\(shell)")
+            #expect(WorktreeTaskPlanner.loginShell(passwdShell: nil, environmentShell: shell) == "/bin/zsh", "\(shell)")
+        }
+        #expect(WorktreeTaskPlanner.loginShell(passwdShell: "/usr/local/bin/fishy", environmentShell: nil)
+            == "/usr/local/bin/fishy", "only exact basenames are non-POSIX")
+    }
+
+    // MARK: - acceptsInitialPrompt
+
+    @Test func test_acceptsInitialPrompt_falseOnlyForHermes() {
+        for kind in WorktreeTaskAgentKind.allCases {
+            #expect(kind.acceptsInitialPrompt == (kind != .hermes), "kind \(kind.rawValue)")
+        }
+    }
+
+    @Test @MainActor func test_sheetModel_acceptsPromptFollowsSelectedAgent() {
+        let model = WorktreeTaskSheetModel()
+        #expect(model.acceptsPrompt)
+        model.agent = .hermes
+        #expect(!model.acceptsPrompt)
+        model.agent = .codex
+        #expect(model.acceptsPrompt)
     }
 
     // MARK: - worktreeHosting

@@ -17,6 +17,11 @@ enum WorktreeTaskError: Error, Equatable, LocalizedError {
     case baseMergeInProgress(String)
     case pathExists(String)
     case baseMissing(String)
+    /// The task worktree at the path was created but its pane could not
+    /// be opened.
+    case paneCreationFailed(String)
+    /// A Merge or Discard is already running for the task on the branch.
+    case operationInProgress(String)
 
     var errorDescription: String? {
         switch self {
@@ -38,6 +43,10 @@ enum WorktreeTaskError: Error, Equatable, LocalizedError {
             "The worktree directory already exists. Remove it or choose another branch name.\n\(path)"
         case .baseMissing(let base):
             "The base branch \"\(base)\" does not exist."
+        case .paneCreationFailed(let path):
+            "The task worktree was created, but its pane could not be opened, so the agent was not started. The worktree is kept and is shown in the Changes sidebar.\n\(path)"
+        case .operationInProgress(let branch):
+            "A merge or discard of the worktree task \"\(branch)\" is already in progress."
         }
     }
 }

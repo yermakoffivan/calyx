@@ -514,4 +514,91 @@ final class CockpitTabCreateCwdWiringTests: XCTestCase {
         XCTAssertEqual(newTab.splitTree.allLeafIDs().first, newSurfaceID, "precondition: the hook's ID is the leaf")
         XCTAssertEqual(returned, newSurfaceID)
     }
+
+    // MARK: - spawnArgv (Worktree Tasks, Revision 1)
+    //
+    // The agent CLI is the pane's process: `spawnArgv` must reach
+    // `createManagedSurface` and become the surface's `command` at
+    // creation time (never typed into a shell later). Observed through two
+    // NEW seams that mirror `_createManagedSurfacePwdObserverForTesting`
+    // (fire in both branches, before the hook short-circuit):
+    // - `_createManagedSurfaceSpawnArgvObserverForTesting: (([String]?) -> Void)?`
+    //   -- the `spawnArgv` createManagedSurface received.
+    // - `_createManagedSurfaceCommandObserverForTesting: ((String?) -> Void)?`
+    //   -- the `command:` that would reach `SurfaceRegistry.createSurface`
+    //   (nil on `.passthrough` without argv).
+    // `.persistent` is reached LOCALLY here via the `CALYX_SESSION_BIN`
+    // override (see CockpitSplitAndGroupCwdWiringTests' header), because
+    // the argv suffix is specified for the local attach command only.
+
+    private let taskArgv = ["/bin/zsh", "-l", "-c", "exec claude 'x'"]
+
+    func test_passthroughBranch_spawnArgv_reachesCreateManagedSurfaceAsShellCommand() {
+        SessionSettings.persistentSessionsEnabled = false
+        let (controller, _) = makeController()
+        let newSurfaceID = UUID()
+        controller._createManagedSurfaceHookForTesting = { newSurfaceID }
+        var observedArgv: [[String]?] = []
+        var observedCommand: [String?] = []
+        controller._createManagedSurfaceSpawnArgvObserverForTesting = { observedArgv.append($0) }
+        controller._createManagedSurfaceCommandObserverForTesting = { observedCommand.append($0) }
+
+        let returned = controller.performCreateNewTab(app: dummyApp, spawnCwd: "/tmp", spawnArgv: taskArgv)
+
+        XCTAssertEqual(returned, newSurfaceID)
+        XCTAssertEqual(observedArgv, [taskArgv])
+        XCTAssertEqual(observedCommand, ["'/bin/zsh' '-l' '-c' 'exec claude '\\''x'\\'''"],
+                       "passthrough must spawn the argv as the surface command, each token sh-quoted")
+    }
+
+    func test_passthroughBranch_noSpawnArgv_commandStaysNil() {
+        SessionSettings.persistentSessionsEnabled = false
+        let (controller, _) = makeController()
+        controller._createManagedSurfaceHookForTesting = { UUID() }
+        var observedArgv: [[String]?] = []
+        var observedCommand: [String?] = []
+        controller._createManagedSurfaceSpawnArgvObserverForTesting = { observedArgv.append($0) }
+        controller._createManagedSurfaceCommandObserverForTesting = { observedCommand.append($0) }
+
+        controller.performCreateNewTab(app: dummyApp)
+
+        XCTAssertEqual(observedArgv, [nil])
+        XCTAssertEqual(observedCommand, [nil], "a plain new tab must keep launching the user's shell")
+    }
+
+    func test_persistentBranch_spawnArgv_reachesAttachCommandAsArgvFlags() throws {
+        SessionSettings.persistentSessionsEnabled = true
+        let originalBinPath = ProcessInfo.processInfo.environment["CALYX_SESSION_BIN"]
+        setenv("CALYX_SESSION_BIN", "/usr/bin/true", 1)
+        defer {
+            if let originalBinPath {
+                setenv("CALYX_SESSION_BIN", originalBinPath, 1)
+            } else {
+                unsetenv("CALYX_SESSION_BIN")
+            }
+        }
+        let (controller, _) = makeController()
+        let newSurfaceID = UUID()
+        controller._createManagedSurfaceHookForTesting = { newSurfaceID }
+        var observedArgv: [[String]?] = []
+        var observedCommand: [String?] = []
+        controller._createManagedSurfaceSpawnArgvObserverForTesting = { observedArgv.append($0) }
+        controller._createManagedSurfaceCommandObserverForTesting = { observedCommand.append($0) }
+
+        controller.performCreateNewTab(app: dummyApp, spawnCwd: "/tmp", spawnArgv: taskArgv)
+        defer {
+            if let sessionID = createdSessionID(controller: controller, surfaceID: newSurfaceID) {
+                SessionSurfaceMap.shared.unregister(sessionID: sessionID)
+            }
+        }
+
+        XCTAssertNotNil(createdSessionID(controller: controller, surfaceID: newSurfaceID),
+                        "precondition: the .persistent branch must have run")
+        XCTAssertEqual(observedArgv, [taskArgv])
+        let command = try XCTUnwrap(observedCommand.first ?? nil)
+        XCTAssertTrue(
+            command.hasSuffix(" --cwd '/tmp' --argv '/bin/zsh' --argv '-l' --argv '-c' --argv 'exec claude '\\''x'\\'''"),
+            "the persistent attach command must carry the spawn argv to the daemon: \(command)"
+        )
+    }
 }

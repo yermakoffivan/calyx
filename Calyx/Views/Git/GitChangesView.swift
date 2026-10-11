@@ -135,6 +135,11 @@ struct GitChangesView: View {
                         onExpandCommit: { hash in onExpandCommit?(section.id, hash) },
                         onSelectRefFilter: { selection in onSelectRefFilter?(section.id, selection) }
                     )
+                    // `.contain` makes the section its own container element so
+                    // the identifier below names the section only, instead of
+                    // propagating onto (and overriding) the identifiers of the
+                    // task menu, its items, and the ref picker inside it.
+                    .accessibilityElement(children: .contain)
                     .accessibilityIdentifier(AccessibilityID.Git.repoSection(section.id))
                 }
             }
