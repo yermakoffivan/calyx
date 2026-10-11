@@ -73,16 +73,33 @@ final class PlainTextViewTests: XCTestCase {
         XCTAssertEqual(textView.textContainer?.lineFragmentPadding, 0)
     }
 
-    func test_configure_appliesEditability() {
+    func test_applyEditability_appliesEditability() {
         let editable = makeSubstitutingTextView()
-        makeView(isEditable: true).configure(editable)
+        makeView(isEditable: true).applyEditability(editable)
         XCTAssertTrue(editable.isEditable)
         XCTAssertTrue(editable.isSelectable)
 
         let readOnly = makeSubstitutingTextView()
-        makeView(isEditable: false).configure(readOnly)
+        makeView(isEditable: false).applyEditability(readOnly)
         XCTAssertFalse(readOnly.isEditable)
         XCTAssertFalse(readOnly.isSelectable)
+    }
+
+    /// What `updateNSView` applies: editability only; the one-time
+    /// configuration (font, inset, substitutions) is left as it is.
+    func test_applyEditability_leavesOneTimeConfigurationAlone() {
+        let textView = NSTextView()
+        makeView().configure(textView)
+        textView.font = .systemFont(ofSize: 9)
+        textView.textContainerInset = NSSize(width: 1, height: 1)
+        textView.isAutomaticQuoteSubstitutionEnabled = true
+
+        makeView(isEditable: false).applyEditability(textView)
+
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertEqual(textView.font, NSFont.systemFont(ofSize: 9))
+        XCTAssertEqual(textView.textContainerInset, NSSize(width: 1, height: 1))
+        XCTAssertTrue(textView.isAutomaticQuoteSubstitutionEnabled)
     }
 
     func test_worktreePromptEditor_usesBodyFontInsetAndPromptIdentifier() {
@@ -101,7 +118,7 @@ final class PlainTextViewTests: XCTestCase {
     func test_worktreePromptEditor_isReadOnlyWhenPromptNotAccepted() {
         let view = WorktreeTaskSheetView.promptTextView(text: .constant(""), isEditable: false, onCancel: {})
         let textView = makeSubstitutingTextView()
-        view.configure(textView)
+        view.applyEditability(textView)
         XCTAssertFalse(textView.isEditable)
     }
 

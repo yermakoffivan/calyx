@@ -138,6 +138,72 @@ struct WorktreeTaskPlannerTests {
         #expect(plan.argv == ["codex", "fix -x"])
     }
 
+    // MARK: - launchPlan with arguments
+
+    private let args = ["--model", "opus", "-x"]
+
+    @Test func test_launchPlan_arguments_doubleDashKinds_terminatorBeforePrompt() {
+        for (kind, program) in [(WorktreeTaskAgentKind.claudeCode, "claude"), (.codex, "codex"), (.grok, "grok")] {
+            #expect(WorktreeTaskPlanner.launchPlan(agent: kind, arguments: args, prompt: " fix it ").argv
+                == [program, "--model", "opus", "-x", "--", "fix it"], "\(kind.rawValue)")
+        }
+    }
+
+    /// pi's handling of `--` after other options is unverified, so it
+    /// keeps the dash-only rule.
+    @Test func test_launchPlan_arguments_pi_terminatorOnlyForDashPrompt() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .pi, arguments: args, prompt: " fix it ").argv
+            == ["pi", "--model", "opus", "-x", "fix it"])
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .pi, arguments: args, prompt: "-y").argv
+            == ["pi", "--model", "opus", "-x", "--", "-y"])
+    }
+
+    @Test func test_launchPlan_noArguments_plainPrompt_noTerminator() {
+        for (kind, program) in [(WorktreeTaskAgentKind.claudeCode, "claude"), (.codex, "codex"), (.grok, "grok"), (.pi, "pi")] {
+            #expect(WorktreeTaskPlanner.launchPlan(agent: kind, arguments: [], prompt: "fix it").argv
+                == [program, "fix it"], "\(kind.rawValue)")
+        }
+    }
+
+    @Test func test_launchPlan_arguments_dashPrompt_terminatorOnlyBeforePrompt() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: ["--model", "opus"], prompt: "-x").argv
+            == ["claude", "--model", "opus", "--", "-x"])
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .codex, arguments: ["--model", "opus"], prompt: "-x").argv
+            == ["codex", "--model", "opus", "--", "-x"])
+    }
+
+    @Test func test_launchPlan_arguments_openCode_beforePromptFlag() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .openCode, arguments: args, prompt: "go").argv
+            == ["opencode", "--model", "opus", "-x", "--prompt", "go"])
+    }
+
+    @Test func test_launchPlan_arguments_hermes_afterChatPromptIgnored() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .hermes, arguments: args, prompt: "go").argv
+            == ["hermes", "chat", "--model", "opus", "-x"])
+    }
+
+    @Test func test_launchPlan_arguments_emptyPrompt_baseArgvPlusArguments() {
+        let expected: [WorktreeTaskAgentKind: [String]] = [
+            .claudeCode: ["claude", "-a", "b c"], .codex: ["codex", "-a", "b c"],
+            .openCode: ["opencode", "-a", "b c"], .hermes: ["hermes", "chat", "-a", "b c"],
+            .grok: ["grok", "-a", "b c"], .pi: ["pi", "-a", "b c"],
+        ]
+        for kind in WorktreeTaskAgentKind.allCases {
+            #expect(WorktreeTaskPlanner.launchPlan(agent: kind, arguments: ["-a", "b c"], prompt: "  ").argv
+                == expected[kind], "\(kind.rawValue)")
+        }
+    }
+
+    @Test func test_launchPlan_arguments_passedVerbatimWithoutTerminatorOrTrimming() {
+        let verbatim = ["--", "-", " spaced ", "", "--prompt"]
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: verbatim, prompt: "").argv
+            == ["claude", "--", "-", " spaced ", "", "--prompt"])
+    }
+
+    @Test func test_launchPlan_defaultArguments_isUnchanged() {
+        #expect(WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: [], prompt: "hi").argv == ["claude", "hi"])
+    }
+
     // MARK: - spawnArgv
 
     @Test func test_spawnArgv_wrapsInInteractiveLoginShellExecWithEveryTokenQuoted() {
@@ -219,6 +285,27 @@ struct WorktreeTaskPlannerTests {
             if tokens.last == "" { tokens.removeLast() }
             #expect(tokens == expected, "prompt: \(prompt.debugDescription)")
         }
+        let arguments = ["--model", "opus", "--effort", "it's high"]
+        for prompt in corpus {
+            let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: arguments, prompt: prompt).argv
+            #expect(Array(expected.prefix(5)) == ["claude"] + arguments)
+            let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: script.path)
+            let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
+            process.environment = ["PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8"]
+            process.standardInput = FileHandle.nullDevice
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            var tokens = String(decoding: data, as: UTF8.self).components(separatedBy: "\0")
+            if tokens.last == "" { tokens.removeLast() }
+            #expect(tokens == expected, "with arguments, prompt: \(prompt.debugDescription)")
+        }
         #expect(!FileManager.default.fileExists(atPath: pwned))
     }
 
@@ -251,12 +338,123 @@ struct WorktreeTaskPlannerTests {
     }
 
     @Test @MainActor func test_sheetModel_acceptsPromptFollowsSelectedAgent() {
-        let model = WorktreeTaskSheetModel()
+        let model = WorktreeTaskSheetModel(argumentMemory: nil)
         #expect(model.acceptsPrompt)
         model.agent = .hermes
         #expect(!model.acceptsPrompt)
         model.agent = .codex
         #expect(model.acceptsPrompt)
+    }
+
+    // MARK: - Sheet model arguments
+
+    @MainActor private func readyModel(memory: WorktreeTaskArgumentMemory) -> WorktreeTaskSheetModel {
+        let model = WorktreeTaskSheetModel(argumentMemory: memory)
+        model.apply(WorktreeTaskRepositoryDescription(
+            location: GitRepositoryLocation(workTree: "/r", gitDirectory: "/r/.git", gitCommonDirectory: "/r/.git"),
+            displayName: "r", localBranches: ["main"], headBranch: "main"
+        ))
+        model.branch = "task/x"
+        return model
+    }
+
+    @Test @MainActor func test_sheetModel_requestArgumentsParsedFromText() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        #expect(model.request.arguments == [])
+        model.argumentsText = "--model opus --effort 'very high'"
+        #expect(model.argumentsError == nil)
+        #expect(model.canCreate)
+        #expect(model.request.arguments == ["--model", "opus", "--effort", "very high"])
+        #expect(model.request.argumentsText == "--model opus --effort 'very high'")
+    }
+
+    @Test @MainActor func test_sheetModel_invalidArgumentsBlockCreateUntilFixed() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        #expect(model.canCreate)
+        model.argumentsText = "--x 'oops"
+        #expect(model.argumentsError != nil)
+        #expect(model.argumentsError?.isEmpty == false)
+        #expect(!model.canCreate)
+        model.argumentsText = "--x 'oops'"
+        #expect(model.argumentsError == nil)
+        #expect(model.canCreate)
+        #expect(model.request.arguments == ["--x", "oops"])
+    }
+
+    @Test @MainActor func test_sheetModel_danglingEscapeSetsError_escapedBackslashDoesNot() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        model.argumentsText = "--x tail\\"          // text: --x tail\   (dangling)
+        #expect(model.argumentsError != nil)
+        #expect(!model.canCreate)
+        model.argumentsText = "--x tail\\\\"        // text: --x tail\\  (escaped backslash)
+        #expect(model.argumentsError == nil)
+        #expect(model.request.arguments == ["--x", "tail\\"])
+    }
+
+    @Test @MainActor func test_sheetModel_agentChangeRestoresRememberedArguments() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
+        memory.remember("--model opus", for: .claudeCode)
+        memory.remember("-m o3", for: .codex)
+
+        let model = WorktreeTaskSheetModel(argumentMemory: memory)
+        #expect(model.agent == .claudeCode)
+        #expect(model.argumentsText == "--model opus", "initial agent's text is restored on init")
+        model.agent = .codex
+        #expect(model.argumentsText == "-m o3")
+        model.agent = .grok
+        #expect(model.argumentsText == "")
+        model.agent = .claudeCode
+        #expect(model.argumentsText == "--model opus")
+    }
+
+    @Test @MainActor func test_sheetModel_agentChangeKeepsTypedTextPerAgent() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
+        memory.remember("--model opus", for: .claudeCode)
+        memory.remember("-m o3", for: .codex)
+        let model = WorktreeTaskSheetModel(argumentMemory: memory)
+
+        model.argumentsText = "--typed claude"
+        model.agent = .codex
+        #expect(model.argumentsText == "-m o3", "an agent not switched away from yet gets its remembered text")
+        model.argumentsText = "--typed codex"
+        model.agent = .claudeCode
+        #expect(model.argumentsText == "--typed claude", "typed text survives switching away and back")
+        model.agent = .codex
+        #expect(model.argumentsText == "--typed codex")
+        #expect(memory.arguments(for: .claudeCode) == "--model opus", "the stash is not persisted")
+    }
+
+    @Test @MainActor func test_sheetModel_beginCreate_marksBusyAtOnceSoASecondIsRefused() throws {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+
+        let first = try #require(model.beginCreate())
+        #expect(first.request.branch == "task/x")
+        #expect(model.isLoading)
+        #expect(model.beginCreate() == nil)
+    }
+
+    @Test @MainActor func test_sheetModel_agentChangeRevalidatesRestoredText() {
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let model = readyModel(memory: WorktreeTaskArgumentMemory(defaults: scratch.defaults))
+        model.argumentsText = "'broken"
+        #expect(model.argumentsError != nil)
+        model.agent = .codex
+        #expect(model.argumentsText == "")
+        #expect(model.argumentsError == nil)
+        #expect(model.canCreate)
     }
 
     // MARK: - worktreeHosting

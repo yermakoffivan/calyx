@@ -38,9 +38,11 @@ struct PlainTextView: NSViewRepresentable {
     /// to `NSTextView`.
     var onCancel: (@MainActor () -> Void)? = nil
 
-    /// Turns off every rewrite of typed or pasted text, applies this
-    /// view's font, inset and editability, and sets the accessibility
-    /// identifier on the text view itself, the element XCUITest finds.
+    /// One-time setup, from `makeNSView` only: turns off every rewrite of
+    /// typed or pasted text, applies this view's font and inset, and sets
+    /// the accessibility identifier on the text view itself, the element
+    /// XCUITest finds. Not repeated on updates, so a SwiftUI re-render
+    /// does not reset the text view's state.
     func configure(_ textView: NSTextView) {
         textView.isRichText = false
         textView.allowsUndo = true
@@ -56,9 +58,14 @@ struct PlainTextView: NSViewRepresentable {
         textView.font = font
         textView.textContainerInset = textContainerInset
         textView.textContainer?.lineFragmentPadding = lineFragmentPadding
+        textView.setAccessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    /// Applies `isEditable` (and selectability with it); the one
+    /// configuration that follows SwiftUI updates.
+    func applyEditability(_ textView: NSTextView) {
         textView.isEditable = isEditable
         textView.isSelectable = isEditable
-        textView.setAccessibilityIdentifier(accessibilityIdentifier)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -66,6 +73,7 @@ struct PlainTextView: NSViewRepresentable {
         Self.configureScrollers(scrollView)
         let textView = Self.textView(in: scrollView)
         configure(textView)
+        applyEditability(textView)
         textView.string = text
         textView.delegate = context.coordinator
         return scrollView
@@ -75,7 +83,7 @@ struct PlainTextView: NSViewRepresentable {
         context.coordinator.text = $text
         context.coordinator.onCancel = onCancel
         let textView = Self.textView(in: scrollView)
-        configure(textView)
+        applyEditability(textView)
         if textView.string != text {
             textView.string = text
         }

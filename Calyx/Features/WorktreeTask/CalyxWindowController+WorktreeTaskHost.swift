@@ -43,15 +43,28 @@ extension CalyxWindowController: WorktreeTaskHost {
     /// Presents the New Worktree Task sheet; ignored while one is up.
     func presentTaskSheet(
         cwd: String?,
+        argumentMemory: WorktreeTaskArgumentMemory?,
         onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void
     ) {
         guard let window, worktreeTaskSheetController == nil else { return }
-        let sheet = WorktreeTaskSheetController(cwd: cwd, onCreate: onCreate, onCancel: {})
+        let sheet = WorktreeTaskSheetController(
+            cwd: cwd, argumentMemory: argumentMemory, onCreate: onCreate, onCancel: {}
+        )
         guard let sheetWindow = sheet.window else { return }
         worktreeTaskSheetController = sheet
-        window.beginSheet(sheetWindow) { [weak self] _ in
-            self?.worktreeTaskSheetController = nil
+        window.beginSheet(sheetWindow) { [weak self, weak sheet] _ in
+            guard let sheet else { return }
+            self?.worktreeTaskSheetDidEnd(sheet)
         }
+    }
+
+    /// Forgets `sheet` when it is still the presented one. Its
+    /// `beginSheet` completion runs asynchronously after the sheet ends,
+    /// by which time `dismissTaskSheet` may have cleared it and a newer
+    /// sheet may be up; that newer one must stay.
+    func worktreeTaskSheetDidEnd(_ sheet: WorktreeTaskSheetController) {
+        guard worktreeTaskSheetController === sheet else { return }
+        worktreeTaskSheetController = nil
     }
 
     /// Ends the sheet and forgets it at once, so an error presented

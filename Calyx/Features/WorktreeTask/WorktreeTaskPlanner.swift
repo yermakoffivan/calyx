@@ -17,25 +17,40 @@ enum WorktreeTaskPlanner {
             .appendingPathComponent(repoDisplayName + "/" + leaf)
     }
 
-    /// The argv for `agent` with `prompt` trimmed and passed as one
-    /// argument: positional for claude / codex / grok / pi (preceded by
-    /// `--` when it starts with `-`, so it is not parsed as an option),
-    /// `opencode --prompt <p>`. An empty prompt, or a kind that does not
-    /// `acceptsInitialPrompt` (hermes), gives the bare `baseArgv`.
-    static func launchPlan(agent: WorktreeTaskAgentKind, prompt: String) -> WorktreeTaskLaunchPlan {
+    /// The argv for `agent`: `baseArgv`, then `arguments` verbatim, then
+    /// `prompt` trimmed and passed as one argument: positional for
+    /// claude / codex / grok / pi, `opencode --prompt <p>`.
+    /// For claude, codex and grok the prompt is preceded by `--` when
+    /// `arguments` is non-empty or the prompt starts with `-`: their
+    /// parsers (commander, clap) end option parsing at `--`, so a
+    /// trailing option in `arguments` that takes an optional value
+    /// cannot swallow the prompt, and a dash prompt is not read as an
+    /// option. pi gets `--` only before a prompt starting with `-`: its
+    /// handling of `--` after other options is unverified.
+    /// An empty prompt, or a kind that does not `acceptsInitialPrompt`
+    /// (hermes), gives `baseArgv + arguments`.
+    static func launchPlan(
+        agent: WorktreeTaskAgentKind,
+        arguments: [String] = [],
+        prompt: String
+    ) -> WorktreeTaskLaunchPlan {
+        let head = agent.baseArgv + arguments
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard agent.acceptsInitialPrompt, !trimmed.isEmpty else {
-            return WorktreeTaskLaunchPlan(argv: agent.baseArgv)
+            return WorktreeTaskLaunchPlan(argv: head)
         }
         switch agent {
-        case .claudeCode, .codex, .grok, .pi:
+        case .claudeCode, .codex, .grok:
+            let separator = (!arguments.isEmpty || trimmed.hasPrefix("-")) ? ["--"] : []
+            return WorktreeTaskLaunchPlan(argv: head + separator + [trimmed])
+        case .pi:
             let separator = trimmed.hasPrefix("-") ? ["--"] : []
-            return WorktreeTaskLaunchPlan(argv: agent.baseArgv + separator + [trimmed])
+            return WorktreeTaskLaunchPlan(argv: head + separator + [trimmed])
         case .openCode:
-            return WorktreeTaskLaunchPlan(argv: agent.baseArgv + ["--prompt", trimmed])
+            return WorktreeTaskLaunchPlan(argv: head + ["--prompt", trimmed])
         case .hermes:
             // Not `acceptsInitialPrompt`: handled by the guard above.
-            return WorktreeTaskLaunchPlan(argv: agent.baseArgv)
+            return WorktreeTaskLaunchPlan(argv: head)
         }
     }
 

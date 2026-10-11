@@ -67,4 +67,24 @@ struct MissionMapGitPollerWorktreeTaskTests {
         let badge = MissionMapWorktreeTaskBadge(branch: "task/demo", base: "main", worktreePath: task.path)
         #expect(poller.worktreeTasks == [a.path: badge, b.path: badge])
     }
+
+    /// A task lives in a linked worktree; a marker on the main work
+    /// tree's branch (gitDirectory == gitCommonDirectory) is no task.
+    @Test func test_refresh_mainWorkTreeWithMarker_getsNoTaskBadge() async throws {
+        let scratch = try GitScratch.makeDirectory("MissionMapGitPollerWorktreeTaskTests")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let repo = scratch.appendingPathComponent("repo")
+        try GitScratch.run(["init", "-q", "-b", "main", repo.path], in: scratch)
+        try GitScratch.commit(file: "base.txt", contents: "base\n", message: "base", in: repo)
+        try GitScratch.run(["config", "branch.main.calyxbase", "develop"], in: repo)
+
+        let poller = MissionMapGitPoller()
+        let cwds = [repo.path]
+        poller.start { cwds }
+        defer { poller.stop() }
+        await waitForBadges(poller, count: 1)
+
+        #expect(poller.badges.count == 1, "precondition: the refresh must have published")
+        #expect(poller.worktreeTasks.isEmpty)
+    }
 }

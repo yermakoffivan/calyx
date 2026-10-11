@@ -26,6 +26,7 @@ final class FakeWorktreeTaskHost: WorktreeTaskHost {
     private(set) var calls: [String] = []
     private(set) var presentedSheetCwds: [String?] = []
     private(set) var presentedOnCreate: ((WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void)?
+    private(set) var presentedArgumentMemories: [WorktreeTaskArgumentMemory?] = []
     private(set) var busyStates: [Bool] = []
     private(set) var openedPanes: [(cwd: String, spawnArgv: [String])] = []
     private(set) var closedPanes: [(surfaceIDs: [UUID], replacementCwd: String)] = []
@@ -43,9 +44,14 @@ final class FakeWorktreeTaskHost: WorktreeTaskHost {
         self.sessionRoot = sessionRoot
     }
 
-    func presentTaskSheet(cwd: String?, onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void) {
+    func presentTaskSheet(
+        cwd: String?,
+        argumentMemory: WorktreeTaskArgumentMemory?,
+        onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void
+    ) {
         calls.append("presentTaskSheet")
         presentedSheetCwds.append(cwd)
+        presentedArgumentMemories.append(argumentMemory)
         presentedOnCreate = onCreate
     }
 
@@ -263,6 +269,115 @@ struct WorktreeTaskCoordinatorTests {
         )
 
         #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "exec '/bin/sleep' '60'"])
+    }
+
+    @Test func test_create_argumentsGoBetweenProgramAndPrompt() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.scratch) }
+
+        await fixture.coordinator.create(
+            request: WorktreeTaskRequest(
+                branch: "t5", base: "main", agent: .claudeCode, prompt: "hi",
+                arguments: ["--model", "opus"], argumentsText: "--model opus"
+            ),
+            repository: fixture.description
+        )
+
+        #expect(fixture.host.errors.isEmpty, "unexpected errors: \(fixture.host.errors)")
+        #expect(fixture.host.openedPanes.first?.spawnArgv
+            == ["/bin/zsh", "-i", "-l", "-c", "exec 'claude' '--model' 'opus' '--' 'hi'"])
+    }
+
+    @Test func test_create_success_remembersArgumentsTextForAgent() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.scratch) }
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
+        memory.remember("--old", for: .claudeCode)
+        let coordinator = WorktreeTaskCoordinator(
+            host: fixture.host, ledger: WorktreeTaskOperationLedger(), argumentMemory: memory
+        )
+
+        await coordinator.create(
+            request: WorktreeTaskRequest(
+                branch: "t6", base: "main", agent: .codex, prompt: "",
+                arguments: ["--model", "o3"], argumentsText: "--model 'o3'"
+            ),
+            repository: fixture.description
+        )
+
+        #expect(memory.arguments(for: .codex) == "--model 'o3'")
+        #expect(memory.arguments(for: .claudeCode) == "--old", "other kinds are untouched")
+    }
+
+    @Test func test_create_serviceError_doesNotRememberArguments() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.scratch) }
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let memory = WorktreeTaskArgumentMemory(defaults: scratch.defaults)
+        let coordinator = WorktreeTaskCoordinator(
+            host: fixture.host, ledger: WorktreeTaskOperationLedger(), argumentMemory: memory
+        )
+
+        await coordinator.create(
+            request: WorktreeTaskRequest(
+                branch: "bad..name", base: "main", agent: .codex, prompt: "",
+                arguments: ["--x"], argumentsText: "--x"
+            ),
+            repository: fixture.description
+        )
+
+        #expect(fixture.host.errors.count == 1)
+        #expect(memory.arguments(for: .codex) == "")
+    }
+
+    /// The sheet's model and the coordinator share one memory: what a
+    /// created task remembered is what the next sheet reads.
+    @Test func test_presentSheet_passesTheCoordinatorsMemoryToTheSheet() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.scratch) }
+        let scratch = ScratchDefaults()
+        defer { scratch.cleanup() }
+        let coordinator = WorktreeTaskCoordinator(
+            host: fixture.host, ledger: WorktreeTaskOperationLedger(),
+            argumentMemory: WorktreeTaskArgumentMemory(defaults: scratch.defaults)
+        )
+        await coordinator.create(
+            request: WorktreeTaskRequest(
+                branch: "t7", base: "main", agent: .codex, prompt: "",
+                arguments: ["--model", "o3"], argumentsText: "--model o3"
+            ),
+            repository: fixture.description
+        )
+
+        coordinator.presentSheet()
+
+        let memory = try #require(fixture.host.presentedArgumentMemories.last ?? nil)
+        let model = WorktreeTaskSheetModel(argumentMemory: memory)
+        model.agent = .codex
+        #expect(model.argumentsText == "--model o3")
+    }
+
+    /// Two creates in quick succession (a double submit) run the service
+    /// once: the second would otherwise fail on the existing branch and
+    /// present an error.
+    @Test func test_create_secondCreateWhileOneIsRunning_isIgnored() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.scratch) }
+        let request = WorktreeTaskRequest(branch: "t8", base: "main", agent: .claudeCode, prompt: "")
+        let coordinator = fixture.coordinator
+        let description = fixture.description
+
+        let first = Task { await coordinator.create(request: request, repository: description) }
+        let second = Task { await coordinator.create(request: request, repository: description) }
+        await first.value
+        await second.value
+
+        #expect(fixture.host.errors.isEmpty, "unexpected errors: \(fixture.host.errors)")
+        #expect(fixture.host.openedPanes.count == 1)
+        #expect(fixture.host.effectCalls == ["dismissTaskSheet", "openTaskPane", "refreshGitSidebar"])
     }
 
     @Test func test_create_hermesPrompt_isNotPassed() async throws {

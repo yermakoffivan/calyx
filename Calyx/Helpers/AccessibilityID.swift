@@ -124,6 +124,7 @@ enum AccessibilityID {
         static let basePicker = "calyx.worktreeTask.basePicker"
         static let agentPicker = "calyx.worktreeTask.agentPicker"
         static let promptField = "calyx.worktreeTask.promptField"
+        static let argumentsField = "calyx.worktreeTask.argumentsField"
         static let createButton = "calyx.worktreeTask.createButton"
         static let cancelButton = "calyx.worktreeTask.cancelButton"
         static let errorLabel = "calyx.worktreeTask.errorLabel"

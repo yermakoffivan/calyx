@@ -108,6 +108,23 @@ struct GitServiceMutatingTests {
         #expect(try GitScratch.run(["config", "branch.task/demo.calyxbase"], in: repo) == "main")
     }
 
+    /// git resolves an ambiguous short name as `refs/tags/<name>` before
+    /// `refs/heads/<name>`; the base is a branch, so the tag must lose.
+    @Test func test_worktreeAdd_tagNamedLikeBase_startsFromTheBranch() async throws {
+        let (scratch, repo) = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try GitScratch.run(["tag", "main"], in: repo)
+        try GitScratch.commit(file: "newer.txt", contents: "newer\n", message: "newer", in: repo)
+        let branchHead = try GitScratch.run(["rev-parse", "refs/heads/main"], in: repo)
+        let tagCommit = try GitScratch.run(["rev-parse", "refs/tags/main^{commit}"], in: repo)
+        #expect(branchHead != tagCommit, "precondition: tag and branch differ")
+        let worktree = scratch.appendingPathComponent("wt/task-tag")
+
+        try await GitService.worktreeAdd(path: worktree.path, newBranch: "task/tag", base: "main", workDir: repo.path)
+
+        #expect(try GitScratch.run(["rev-parse", "HEAD"], in: worktree) == branchHead)
+    }
+
     @Test func test_worktreeTaskBaseConfigKey() {
         #expect(GitService.worktreeTaskBaseConfigKey == "calyxbase")
     }
@@ -155,6 +172,22 @@ struct GitServiceMutatingTests {
 
         try await GitService.branchDelete(branch: "feature", force: false, workDir: repo.path)
         #expect(try GitScratch.run(["branch", "--list", "feature"], in: repo).isEmpty)
+    }
+
+    @Test func test_merge_tagNamedLikeBranch_mergesTheBranch() async throws {
+        let (scratch, repo) = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try GitScratch.run(["checkout", "-q", "-b", "feature"], in: repo)
+        try GitScratch.run(["tag", "feature"], in: repo)
+        let featureHead = try GitScratch.commit(file: "f.txt", contents: "f\n", message: "feature", in: repo)
+        try GitScratch.run(["checkout", "-q", "main"], in: repo)
+
+        try await GitService.merge(branch: "feature", workDir: repo.path)
+
+        let parents = try GitScratch.run(["rev-list", "--parents", "-n", "1", "HEAD"], in: repo)
+            .split(separator: " ").map(String.init)
+        #expect(parents.last == featureHead)
+        #expect(FileManager.default.fileExists(atPath: repo.appendingPathComponent("f.txt").path))
     }
 
     @Test func test_merge_conflictThrowsWithStderr_andMergeAbortRestoresCleanTree() async throws {

@@ -614,9 +614,11 @@ enum GitService {
         ) != nil
     }
 
-    /// `git worktree add -b <newBranch> <path> <base>`.
+    /// `git worktree add -b <newBranch> <path> refs/heads/<base>`. `base`
+    /// is a local branch name; the full ref keeps a tag of the same name
+    /// (which git's revision lookup prefers) from being the start point.
     static func worktreeAdd(path: String, newBranch: String, base: String, workDir: String) async throws {
-        _ = try await runMutating(args: ["worktree", "add", "-b", newBranch, path, base], workDir: workDir)
+        _ = try await runMutating(args: ["worktree", "add", "-b", newBranch, path, "refs/heads/" + base], workDir: workDir)
     }
 
     /// `git config branch.<branch>.<key> <value>`.
@@ -636,10 +638,12 @@ enum GitService {
         try await gitStatus(workDir: workDir).isEmpty
     }
 
-    /// `git merge --no-ff --no-edit <branch>` into the branch checked out
-    /// at `workDir`.
+    /// `git merge --no-ff --no-edit refs/heads/<branch>` into the branch
+    /// checked out at `workDir`.
     static func merge(branch: String, workDir: String) async throws {
-        _ = try await runMutating(args: ["merge", "--no-ff", "--no-edit", branch], workDir: workDir)
+        // The full ref: a tag named like the branch would otherwise win
+        // git's revision lookup.
+        _ = try await runMutating(args: ["merge", "--no-ff", "--no-edit", "refs/heads/" + branch], workDir: workDir)
     }
 
     /// `git merge --abort`. Best-effort cleanup after a failed merge: when

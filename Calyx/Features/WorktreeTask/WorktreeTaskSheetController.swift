@@ -11,7 +11,7 @@ import SwiftUI
 
 @MainActor
 final class WorktreeTaskSheetController: NSWindowController, NSWindowDelegate {
-    let model = WorktreeTaskSheetModel()
+    let model: WorktreeTaskSheetModel
     private let onCreate: (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void
     private let onCancel: () -> Void
     private var didFinish = false
@@ -21,9 +21,11 @@ final class WorktreeTaskSheetController: NSWindowController, NSWindowDelegate {
 
     init(
         cwd: String?,
+        argumentMemory: WorktreeTaskArgumentMemory?,
         onCreate: @escaping (WorktreeTaskRequest, WorktreeTaskRepositoryDescription) -> Void,
         onCancel: @escaping () -> Void
     ) {
+        self.model = WorktreeTaskSheetModel(argumentMemory: argumentMemory)
         self.onCreate = onCreate
         self.onCancel = onCancel
 
@@ -87,8 +89,8 @@ final class WorktreeTaskSheetController: NSWindowController, NSWindowDelegate {
     // MARK: - Private
 
     private func create() {
-        guard model.canCreate, let repository = model.repository else { return }
-        onCreate(model.request, repository)
+        guard let begun = model.beginCreate() else { return }
+        onCreate(begun.request, begun.repository)
     }
 
     private func cancel() {

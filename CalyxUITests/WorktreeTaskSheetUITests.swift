@@ -30,6 +30,7 @@ final class WorktreeTaskSheetUITests: CalyxUITestCase {
             "calyx.worktreeTask.basePicker",
             "calyx.worktreeTask.agentPicker",
             "calyx.worktreeTask.promptField",
+            "calyx.worktreeTask.argumentsField",
             "calyx.worktreeTask.createButton",
             "calyx.worktreeTask.cancelButton",
         ] {

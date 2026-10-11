@@ -77,6 +77,10 @@ struct WorktreeTaskRequest: Equatable, Sendable {
     let base: String
     let agent: WorktreeTaskAgentKind
     let prompt: String
+    /// Extra CLI arguments, parsed from `argumentsText`.
+    var arguments: [String] = []
+    /// The "Arguments" text as typed, remembered per agent on success.
+    var argumentsText: String = ""
 }
 
 /// The agent CLI's argv for a task: the program the task's pane runs,

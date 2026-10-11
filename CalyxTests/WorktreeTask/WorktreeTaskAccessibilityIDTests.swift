@@ -14,6 +14,7 @@ struct WorktreeTaskAccessibilityIDTests {
         #expect(AccessibilityID.WorktreeTask.basePicker == "calyx.worktreeTask.basePicker")
         #expect(AccessibilityID.WorktreeTask.agentPicker == "calyx.worktreeTask.agentPicker")
         #expect(AccessibilityID.WorktreeTask.promptField == "calyx.worktreeTask.promptField")
+        #expect(AccessibilityID.WorktreeTask.argumentsField == "calyx.worktreeTask.argumentsField")
         #expect(AccessibilityID.WorktreeTask.createButton == "calyx.worktreeTask.createButton")
         #expect(AccessibilityID.WorktreeTask.cancelButton == "calyx.worktreeTask.cancelButton")
         #expect(AccessibilityID.WorktreeTask.errorLabel == "calyx.worktreeTask.errorLabel")
