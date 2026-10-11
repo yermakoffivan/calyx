@@ -32,6 +32,10 @@ struct SidebarContentView: View {
     var onLoadMoreCommits: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
     var onToggleGitRepoSection: ((String) -> Void)?
+    var onNewWorktreeTask: (() -> Void)?
+    /// `repoID` is the task worktree's root path.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     var onRetryGitRepoSection: ((String) -> Void)?
     var onSelectRefFilter: ((String, GitRefSelection) -> Void)?
     var onMoveTab: ((UUID, Int, Int) -> Void)?
@@ -269,6 +273,9 @@ struct SidebarContentView: View {
                     onLoadMore: onLoadMoreCommits,
                     onExpandCommit: onExpandCommit,
                     onToggleRepoSection: onToggleGitRepoSection,
+                    onNewWorktreeTask: onNewWorktreeTask,
+                    onMergeWorktreeTask: onMergeWorktreeTask,
+                    onDiscardWorktreeTask: onDiscardWorktreeTask,
                     onRetryRepoSection: onRetryGitRepoSection,
                     onSelectRefFilter: onSelectRefFilter
                 )

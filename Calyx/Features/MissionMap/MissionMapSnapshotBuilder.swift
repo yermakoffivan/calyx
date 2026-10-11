@@ -86,7 +86,8 @@ enum MissionMapSnapshotBuilder {
             // Only an agent's own session id is looked up: a pane with no
             // agent row has no session, whatever its Calyx session id is.
             // No kind check, since only Claude Code sessions get a row.
-            usage: entry?.sessionID.flatMap { input.usage[$0] }
+            usage: entry?.sessionID.flatMap { input.usage[$0] },
+            worktreeTask: cwd.flatMap { input.worktreeTasks[$0] }
         )
     }
 

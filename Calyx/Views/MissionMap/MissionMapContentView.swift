@@ -72,6 +72,9 @@ struct MissionMapContentView: View {
     var onFocusSurface: ((UUID) -> Void)?
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
+    /// Merge / Discard of a card's worktree task, given its worktree root.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     /// A card's live drag translation, and its final one.
     var onDragChanged: ((UUID, CGSize) -> Void)?
     var onDragEnded: ((UUID, CGSize) -> Void)?
@@ -197,6 +200,8 @@ struct MissionMapContentView: View {
             },
             onAllow: onAllow,
             onOpenApproval: onOpenApproval,
+            onMergeWorktreeTask: onMergeWorktreeTask,
+            onDiscardWorktreeTask: onDiscardWorktreeTask,
             onDragChanged: { onDragChanged?(card.id, $0) },
             onDragEnded: { onDragEnded?(card.id, $0) },
             renderStyle: renderStyle

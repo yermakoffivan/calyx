@@ -214,6 +214,10 @@ struct GitRepoDescriptor: Identifiable, Equatable, Sendable {
     let branch: String?
     let headShortHash: String?
     let location: GitRepositoryLocation
+    /// The base branch recorded in `branch.<branch>.calyxbase` when this
+    /// section is a linked worktree created as a Calyx worktree task, nil
+    /// otherwise. Drives the section's Merge / Discard menu.
+    var taskBase: String? = nil
 
     var id: String { rootPath }
 }

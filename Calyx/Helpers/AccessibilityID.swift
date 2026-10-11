@@ -68,6 +68,10 @@ enum AccessibilityID {
         /// A card's usage line, one element whose label is
         /// `UsageCardLine.accessibilityLabel(for:)`.
         static func cardUsage(_ id: UUID) -> String { "calyx.missionMap.cardUsage.\(id.uuidString)" }
+        /// A worktree-task card's Merge button.
+        static func mergeTaskButton(_ id: UUID) -> String { "calyx.missionMap.mergeTaskButton.\(id.uuidString)" }
+        /// A worktree-task card's Discard button.
+        static func discardTaskButton(_ id: UUID) -> String { "calyx.missionMap.discardTaskButton.\(id.uuidString)" }
     }
     enum Compose {
         static let container = "calyx.compose"
@@ -104,6 +108,25 @@ enum AccessibilityID {
         static func repoSection(_ id: String) -> String { "calyx.git.repoSection.\(id)" }
         /// `id` is the repository's work-tree root path.
         static func refPicker(_ id: String) -> String { "calyx.git.refPicker.\(id)" }
+        /// The Changes header's "New Worktree Task…" button.
+        static let newWorktreeTaskButton = "calyx.git.newWorktreeTaskButton"
+        /// `id` is the task worktree's root path.
+        static func taskMenu(_ id: String) -> String { "calyx.git.taskMenu.\(id)" }
+        /// `id` is the task worktree's root path.
+        static func taskMergeItem(_ id: String) -> String { "calyx.git.taskMergeItem.\(id)" }
+        /// `id` is the task worktree's root path.
+        static func taskDiscardItem(_ id: String) -> String { "calyx.git.taskDiscardItem.\(id)" }
+    }
+    /// The New Worktree Task sheet (Calyx/Features/WorktreeTask).
+    enum WorktreeTask {
+        static let sheet = "calyx.worktreeTask.sheet"
+        static let branchField = "calyx.worktreeTask.branchField"
+        static let basePicker = "calyx.worktreeTask.basePicker"
+        static let agentPicker = "calyx.worktreeTask.agentPicker"
+        static let promptField = "calyx.worktreeTask.promptField"
+        static let createButton = "calyx.worktreeTask.createButton"
+        static let cancelButton = "calyx.worktreeTask.cancelButton"
+        static let errorLabel = "calyx.worktreeTask.errorLabel"
     }
     /// Settings window (Calyx/Features/Settings/SettingsWindowController.
     /// swift). Applied to each pane's toggle NSSwitch controls, plus the

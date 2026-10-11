@@ -21,6 +21,10 @@ final class MissionMapGitPoller {
     /// in a repository. A failed cwd has no badge; the reason stays here
     /// so it is inspectable rather than lost.
     private(set) var failures: [String: String] = [:]
+    /// Worktree-task badges keyed by pane cwd, like `badges`: present for
+    /// a cwd whose work tree's branch carries a
+    /// `branch.<b>.calyxbase` marker.
+    private(set) var worktreeTasks: [String: MissionMapWorktreeTaskBadge] = [:]
 
     /// cwd -> repository work tree, or `nil` for a cwd known to be
     /// outside any repository. Resolved once per open rather than every
@@ -81,11 +85,16 @@ final class MissionMapGitPoller {
         var nextBadges: [String: MissionMapGitBadge] = [:]
         var nextFailures: [String: String] = [:]
         var badgesByRoot: [String: MissionMapGitBadge] = [:]
+        var nextWorktreeTasks: [String: MissionMapWorktreeTaskBadge] = [:]
+        var worktreeTasksByRoot: [String: MissionMapWorktreeTaskBadge?] = [:]
         for cwd in Set(cwds) {
             do {
                 guard let root = try await repositoryRoot(for: cwd, generation: generation) else { continue }
                 if let badge = badgesByRoot[root] {
                     nextBadges[cwd] = badge
+                    if let task = worktreeTasksByRoot[root] ?? nil {
+                        nextWorktreeTasks[cwd] = task
+                    }
                     continue
                 }
                 async let head = GitService.headSummary(workDir: root)
@@ -96,7 +105,15 @@ final class MissionMapGitPoller {
                     changedFileCount: Set(status.map(\.path)).count
                 )
                 badgesByRoot[root] = badge
+                // Read once per root, outside the head/status failure path:
+                // a failed marker read yields no task badge but keeps the
+                // git badge.
+                let task = await worktreeTaskBadge(branch: badge.branch, root: root)
+                worktreeTasksByRoot[root] = .some(task)
                 nextBadges[cwd] = badge
+                if let task {
+                    nextWorktreeTasks[cwd] = task
+                }
             } catch {
                 nextFailures[cwd] = error.localizedDescription
             }
@@ -104,6 +121,19 @@ final class MissionMapGitPoller {
         guard generation == self.generation else { return }
         badges = nextBadges
         failures = nextFailures
+        worktreeTasks = nextWorktreeTasks
+    }
+
+    /// The task badge for the work tree at `root` on `branch`, or nil when
+    /// HEAD is detached, the branch carries no task marker, or the marker
+    /// cannot be read (the task badge is optional decoration; a read
+    /// failure must not cost the pane its git badge).
+    private func worktreeTaskBadge(branch: String?, root: String) async -> MissionMapWorktreeTaskBadge? {
+        guard let branch else { return nil }
+        guard let base = try? await GitService.getBranchConfig(
+            branch: branch, key: GitService.worktreeTaskBaseConfigKey, workDir: root
+        ) else { return nil }
+        return MissionMapWorktreeTaskBadge(branch: branch, base: base, worktreePath: root)
     }
 
     /// The work tree containing `cwd`, or `nil` when `cwd` is outside

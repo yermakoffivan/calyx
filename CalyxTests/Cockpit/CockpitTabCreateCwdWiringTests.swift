@@ -496,4 +496,22 @@ final class CockpitTabCreateCwdWiringTests: XCTestCase {
                        ".passthrough would have used via libghostty's inheritance -- not the tab's possibly-stale " +
                        "pwd field")
     }
+
+    // MARK: - Return value (Worktree Tasks)
+
+    /// `performCreateNewTab` returns the new tab's leaf surface ID so a
+    /// caller (Worktree Tasks) can type into exactly that pane.
+    func test_performCreateNewTab_returnsNewTabsFirstLeafID() throws {
+        SessionSettings.persistentSessionsEnabled = false
+        let (controller, originalTab) = makeController()
+        let newSurfaceID = UUID()
+        controller._createManagedSurfaceHookForTesting = { newSurfaceID }
+
+        let returned = controller.performCreateNewTab(app: dummyApp, spawnCwd: "/tmp")
+
+        let newTab = try XCTUnwrap(controller.windowSession.activeGroup?.activeTab)
+        XCTAssertNotEqual(newTab.id, originalTab.id, "precondition: a new tab must be active")
+        XCTAssertEqual(newTab.splitTree.allLeafIDs().first, newSurfaceID, "precondition: the hook's ID is the leaf")
+        XCTAssertEqual(returned, newSurfaceID)
+    }
 }

@@ -478,14 +478,29 @@ enum GitRepoDiscovery {
                         )
                     }
                     let standardized = location.standardized
+                    let worktreeKind = kind(of: standardized)
+                    // Only a linked worktree on a local branch can be a
+                    // worktree task. The marker is decoration: a failed
+                    // config read shows the section without the task menu
+                    // rather than dropping the section.
+                    var taskBase: String?
+                    if worktreeKind == .worktree,
+                       let ref = info.branchRef, ref.hasPrefix("refs/heads/") {
+                        taskBase = try? await GitService.getBranchConfig(
+                            branch: String(ref.dropFirst("refs/heads/".count)),
+                            key: GitService.worktreeTaskBaseConfigKey,
+                            workDir: standardized.workTree
+                        )
+                    }
                     return .described(
                         GitRepoDescriptor(
                             rootPath: standardized.workTree,
                             displayName: (standardized.workTree as NSString).lastPathComponent,
-                            kind: kind(of: standardized),
+                            kind: worktreeKind,
                             branch: info.branchRef.map(branchName(fromRef:)),
                             headShortHash: info.headOID.map { String($0.prefix(shortHashLength)) },
-                            location: standardized
+                            location: standardized,
+                            taskBase: taskBase
                         )
                     )
                 }

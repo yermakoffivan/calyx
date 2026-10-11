@@ -507,4 +507,26 @@ final class CalyxWindowControllerKeyWindowMenuValidationTests: XCTestCase {
         controller._isKeyWindowOverrideForTesting = true
         XCTAssertTrue(controller.validateMenuItem(item), "New Group must stay enabled while key")
     }
+
+    // MARK: - New Worktree Task (key-window gated)
+
+    /// Unlike newTab:, creating a worktree task reads the key window's
+    /// focused pane cwd, so it is gated on this window being key.
+    func test_validateMenuItem_newWorktreeTask_disabledWhenNotKeyWindow() {
+        let controller = makeFixture(tabCount: 1)
+        controller._isKeyWindowOverrideForTesting = false
+
+        let result = controller.validateMenuItem(menuItem(action: #selector(CalyxWindowController.newWorktreeTask(_:))))
+
+        XCTAssertFalse(result, "New Worktree Task must be disabled while this window is not the key window")
+    }
+
+    func test_validateMenuItem_newWorktreeTask_enabledWhenKeyWindow() {
+        let controller = makeFixture(tabCount: 1)
+        controller._isKeyWindowOverrideForTesting = true
+
+        let result = controller.validateMenuItem(menuItem(action: #selector(CalyxWindowController.newWorktreeTask(_:))))
+
+        XCTAssertTrue(result, "New Worktree Task must be enabled while key")
+    }
 }

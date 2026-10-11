@@ -14,6 +14,10 @@ struct GitChangesView: View {
     var onLoadMore: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
     var onToggleRepoSection: ((String) -> Void)?
+    var onNewWorktreeTask: (() -> Void)?
+    /// `repoID` is the task worktree's root path.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     var onRetryRepoSection: ((String) -> Void)?
     var onSelectRefFilter: ((String, GitRefSelection) -> Void)?
 
@@ -29,6 +33,14 @@ struct GitChangesView: View {
                         .foregroundStyle(.secondary)
                         .help(staleRefreshMessage)
                 }
+                Button(action: { onNewWorktreeTask?() }) {
+                    Image(systemName: "plus")
+                        .font(.body)
+                }
+                .buttonStyle(.plain)
+                .help("New Worktree Task\u{2026}")
+                .accessibilityLabel("New Worktree Task\u{2026}")
+                .accessibilityIdentifier(AccessibilityID.Git.newWorktreeTaskButton)
                 if state.isRefreshing {
                     ProgressView()
                         .controlSize(.small)
@@ -115,6 +127,8 @@ struct GitChangesView: View {
                         commitFiles: state.commitFiles,
                         onToggle: { onToggleRepoSection?(section.id) },
                         onRetry: { onRetryRepoSection?(section.id) },
+                        onMergeTask: { onMergeWorktreeTask?(section.id) },
+                        onDiscardTask: { onDiscardWorktreeTask?(section.id) },
                         onWorkingFileSelected: { entry in onWorkingFileSelected?(section.id, entry) },
                         onCommitFileSelected: { file in onCommitFileSelected?(section.id, file) },
                         onLoadMore: { onLoadMore?(section.id) },
@@ -135,6 +149,8 @@ private struct GitRepoSectionView: View {
     let commitFiles: [String: [CommitFileEntry]]
     var onToggle: (() -> Void)?
     var onRetry: (() -> Void)?
+    var onMergeTask: (() -> Void)?
+    var onDiscardTask: (() -> Void)?
     var onWorkingFileSelected: ((GitFileEntry) -> Void)?
     var onCommitFileSelected: ((CommitFileEntry) -> Void)?
     var onLoadMore: (() -> Void)?
@@ -199,6 +215,10 @@ private struct GitRepoSectionView: View {
                     }
             }
 
+            if let taskBase = data.descriptor.taskBase {
+                taskMenu(base: taskBase)
+            }
+
             refPickerMenu
         }
         .padding(.horizontal, 10)
@@ -210,6 +230,25 @@ private struct GitRepoSectionView: View {
                     .padding(.horizontal, 4)
             }
         }
+    }
+
+    /// Merge / Discard for a section that is a worktree task.
+    private func taskMenu(base: String) -> some View {
+        Menu {
+            Button("Merge into \(base)") { onMergeTask?() }
+                .accessibilityIdentifier(AccessibilityID.Git.taskMergeItem(data.descriptor.id))
+            Button("Discard", role: .destructive) { onDiscardTask?() }
+                .accessibilityIdentifier(AccessibilityID.Git.taskDiscardItem(data.descriptor.id))
+        } label: {
+            Image(systemName: "checklist")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Worktree Task \u{2192} \(base)")
+        .accessibilityIdentifier(AccessibilityID.Git.taskMenu(data.descriptor.id))
     }
 
     /// Which refs this section's `git log` covers. Auto/All replace the

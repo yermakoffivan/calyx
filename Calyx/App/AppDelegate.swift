@@ -2527,6 +2527,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
 
         fileMenu.addItem(withTitle: "New Window", action: #selector(createNewWindow), keyEquivalent: "n")
         fileMenu.addItem(withTitle: "New Tab", action: #selector(CalyxWindowController.newTab(_:)), keyEquivalent: "t")
+        let newWorktreeTaskItem = NSMenuItem(
+            title: "New Worktree Task\u{2026}",
+            action: #selector(CalyxWindowController.newWorktreeTask(_:)),
+            keyEquivalent: "t"
+        )
+        newWorktreeTaskItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(newWorktreeTaskItem)
         fileMenu.addItem(withTitle: "New Browser Tab", action: #selector(CalyxWindowController.newBrowserTab(_:)), keyEquivalent: "")
         fileMenu.addItem(.separator())
 

@@ -154,6 +154,27 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         XCTAssertNil(keyedByPane.cards.first?.git)
     }
 
+    // MARK: - Worktree task badge
+
+    /// `input.worktreeTasks` is keyed by pane cwd like `git`; the card
+    /// carries the badge for its cwd and nil when there is none.
+    func test_build_worktreeTaskBadge_keyedByCwd_nilWhenAbsent() {
+        let taskPane = pane(cwd: "/Users/dev/.calyx/worktrees/repo/task-demo")
+        let otherPane = pane(cwd: "/Users/dev/project")
+        let badge = MissionMapWorktreeTaskBadge(
+            branch: "task/demo", base: "main", worktreePath: "/Users/dev/.calyx/worktrees/repo/task-demo"
+        )
+        var built = input(panes: [taskPane, otherPane])
+        built.worktreeTasks = ["/Users/dev/.calyx/worktrees/repo/task-demo": badge]
+
+        let result = MissionMapSnapshotBuilder.build(input: built)
+        let byID = Dictionary(uniqueKeysWithValues: result.cards.map { ($0.id, $0) })
+
+        XCTAssertEqual(byID[taskPane.surfaceID]?.worktreeTask, badge)
+        XCTAssertNotNil(byID[otherPane.surfaceID], "precondition: one card per pane")
+        XCTAssertNil(byID[otherPane.surfaceID]?.worktreeTask)
+    }
+
     // MARK: - Cards
 
     func test_build_createsOneCardPerPane() {

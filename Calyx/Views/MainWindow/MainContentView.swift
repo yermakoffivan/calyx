@@ -44,6 +44,10 @@ struct MainContentView: View {
     var onLoadMoreCommits: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
     var onToggleGitRepoSection: ((String) -> Void)?
+    var onNewWorktreeTask: (() -> Void)?
+    /// `repoID` is the task worktree's root path.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     var onRetryGitRepoSection: ((String) -> Void)?
     var onSelectRefFilter: ((String, GitRefSelection) -> Void)?
     var onSidebarWidthChanged: ((CGFloat) -> Void)?
@@ -84,6 +88,10 @@ struct MainContentView: View {
     var onMissionMapSelectableIDsChange: ((MissionMapSelectableIDs) -> Void)?
     var onMissionMapAllow: ((UUID) -> Void)?
     var onMissionMapOpenApproval: ((UUID) -> Void)?
+    /// Merge / Discard of a Mission Map card's worktree task, given its
+    /// worktree root.
+    var onMissionMapMergeWorktreeTask: ((String) -> Void)?
+    var onMissionMapDiscardWorktreeTask: ((String) -> Void)?
     var onMissionMapKeyCatcherReady: ((NSView) -> Void)?
     var onMissionMapPopoverPlacementChange: ((MissionMapPopoverPlacementInfo?) -> Void)?
     var onMissionMapCardOffsetChange: ((UUID, CGSize) -> Void)?
@@ -181,6 +189,9 @@ struct MainContentView: View {
                             onLoadMoreCommits: onLoadMoreCommits,
                             onExpandCommit: onExpandCommit,
                             onToggleGitRepoSection: onToggleGitRepoSection,
+                            onNewWorktreeTask: onNewWorktreeTask,
+                            onMergeWorktreeTask: onMergeWorktreeTask,
+                            onDiscardWorktreeTask: onDiscardWorktreeTask,
                             onRetryGitRepoSection: onRetryGitRepoSection,
                             onSelectRefFilter: onSelectRefFilter,
                             onMoveTab: onMoveTab,
@@ -377,6 +388,8 @@ extension MainContentView {
                 onSelectableIDsChange: onMissionMapSelectableIDsChange,
                 onAllow: onMissionMapAllow,
                 onOpenApproval: onMissionMapOpenApproval,
+                onMergeWorktreeTask: onMissionMapMergeWorktreeTask,
+                onDiscardWorktreeTask: onMissionMapDiscardWorktreeTask,
                 onKeyCatcherReady: onMissionMapKeyCatcherReady,
                 onPopoverPlacementChange: onMissionMapPopoverPlacementChange,
                 fixtureOverride: missionMapFixtureOverride

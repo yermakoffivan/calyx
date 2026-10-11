@@ -576,12 +576,102 @@ enum GitService {
         return result
     }
 
+    // MARK: - Worktree Tasks
+
+    /// The `branch.<name>.<key>` config key that marks a branch as a
+    /// Calyx worktree task and records the branch it merges back into.
+    static let worktreeTaskBaseConfigKey = "calyxbase"
+
+    /// Whether `branch` is a valid new branch name:
+    /// `git check-ref-format refs/heads/<branch>` (not `--branch`, which
+    /// expands `@{-1}`). Empty names and names starting with `-` (which
+    /// `check-ref-format` accepts as a path component but `git branch`
+    /// / `worktree add -b` reject) are refused before calling git. A
+    /// rejected name is a value here, not a failure.
+    static func checkRefFormat(branch: String, workDir: String) async -> Bool {
+        guard !branch.isEmpty, !branch.hasPrefix("-") else { return false }
+        do {
+            _ = try await run(args: ["check-ref-format", "refs/heads/" + branch], workDir: workDir)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Whether `refs/heads/<branch>` exists
+    /// (`git rev-parse -q --verify`, which exits 1 when it does not).
+    static func localBranchExists(_ branch: String, workDir: String) async throws -> Bool {
+        try await runReportingNoAnswerAsNil(
+            args: ["rev-parse", "-q", "--verify", "refs/heads/" + branch], workDir: workDir
+        ) != nil
+    }
+
+    /// Whether a merge is in progress in the worktree at `workDir`
+    /// (`git rev-parse -q --verify MERGE_HEAD`, exit 1 when absent).
+    static func hasMergeInProgress(workDir: String) async throws -> Bool {
+        try await runReportingNoAnswerAsNil(
+            args: ["rev-parse", "-q", "--verify", "MERGE_HEAD"], workDir: workDir
+        ) != nil
+    }
+
+    /// `git worktree add -b <newBranch> <path> <base>`.
+    static func worktreeAdd(path: String, newBranch: String, base: String, workDir: String) async throws {
+        _ = try await runMutating(args: ["worktree", "add", "-b", newBranch, path, base], workDir: workDir)
+    }
+
+    /// `git config branch.<branch>.<key> <value>`.
+    static func setBranchConfig(branch: String, key: String, value: String, workDir: String) async throws {
+        _ = try await runMutating(args: ["config", "branch.\(branch).\(key)", value], workDir: workDir)
+    }
+
+    /// `git config --get branch.<branch>.<key>`, or nil when unset
+    /// (`config --get` exits 1 for a missing key).
+    static func getBranchConfig(branch: String, key: String, workDir: String) async throws -> String? {
+        try await runReportingNoAnswerAsNil(args: ["config", "--get", "branch.\(branch).\(key)"], workDir: workDir)
+    }
+
+    /// Whether `git status` reports nothing. Untracked files count as
+    /// dirty: `worktree remove` refuses them too.
+    static func isWorkingTreeClean(workDir: String) async throws -> Bool {
+        try await gitStatus(workDir: workDir).isEmpty
+    }
+
+    /// `git merge --no-ff --no-edit <branch>` into the branch checked out
+    /// at `workDir`.
+    static func merge(branch: String, workDir: String) async throws {
+        _ = try await runMutating(args: ["merge", "--no-ff", "--no-edit", branch], workDir: workDir)
+    }
+
+    /// `git merge --abort`. Best-effort cleanup after a failed merge: when
+    /// no merge is in progress git exits non-zero, which is the expected
+    /// no-op, so errors are ignored by design.
+    static func mergeAbort(workDir: String) async {
+        _ = try? await runMutating(args: ["merge", "--abort"], workDir: workDir)
+    }
+
+    /// `git worktree remove [--force] <path>`.
+    static func worktreeRemove(path: String, force: Bool, workDir: String) async throws {
+        let args = ["worktree", "remove"] + (force ? ["--force"] : []) + [path]
+        _ = try await runMutating(args: args, workDir: workDir)
+    }
+
+    /// `git branch -d|-D <branch>`.
+    static func branchDelete(branch: String, force: Bool, workDir: String) async throws {
+        _ = try await runMutating(args: ["branch", force ? "-D" : "-d", branch], workDir: workDir)
+    }
+
     // MARK: - Process Execution
 
-    /// Every public entry point above (`repoRoot`, `gitStatus`,
+    /// PATH for spawned git processes. Includes `/opt/homebrew/bin` so
+    /// Homebrew-installed helpers (git-lfs, hook tools) resolve on Apple
+    /// Silicon.
+    static let gitProcessPATH = "/usr/bin:/usr/local/bin:/opt/homebrew/bin"
+
+    /// Every read-only entry point above (`repoRoot`, `gitStatus`,
     /// `commitLog`, `commitFiles`, `fileDiff`) drives this with a
     /// read-only git subcommand (`status`, `log`, `diff-tree`, `diff`,
-    /// `show`, `rev-parse`) -- there is no write path through here, so
+    /// `show`, `rev-parse`). Write operations go through `runMutating`
+    /// instead, never through here, so
     /// propagating cancellation straight to the subprocess (rather than
     /// the structural-shield treatment `SessionDaemonClient.kill(id:)`
     /// needs for its WRITE op) is safe.
@@ -609,7 +699,7 @@ enum GitService {
                         "GIT_PAGER": "cat",
                         "GIT_TERMINAL_PROMPT": "0",
                         "GIT_OPTIONAL_LOCKS": "0",
-                        "PATH": "/usr/bin:/usr/local/bin",
+                        "PATH": gitProcessPATH,
                         "HOME": NSHomeDirectory(),
                     ]
 
@@ -696,6 +786,116 @@ enum GitService {
             }
         } onCancel: {
             cancellationBridge.cancel()
+        }
+    }
+
+    /// The write path: runs a git subcommand that changes the repository
+    /// (`worktree add`, `merge`, `branch -d`, `config`, ...). Same
+    /// environment, pipes and exit-code mapping as `run`, but with two
+    /// deliberate differences:
+    ///
+    /// - Task cancellation is NOT propagated to the subprocess. SIGTERM
+    ///   in the middle of a merge or a worktree removal would leave the
+    ///   repository half-written (a stray MERGE_HEAD, a worktree directory
+    ///   without its admin entry), which is worse than letting the
+    ///   command finish. A cancelled caller simply receives the result.
+    /// - The watchdog is `timeoutSeconds` (60 s by default) rather than
+    ///   10 s: checking out a large worktree legitimately takes longer
+    ///   than any read query. The watchdog still terminates a hung git
+    ///   so the caller is not blocked forever.
+    static func runMutating(
+        args: [String],
+        workDir: String,
+        timeoutSeconds: Int = 60
+    ) async throws -> String {
+        guard FileManager.default.fileExists(atPath: gitPath) else {
+            throw GitError.gitNotFound
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global().async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: gitPath)
+                process.arguments = args
+                process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+                process.environment = [
+                    "LC_ALL": "C",
+                    "GIT_PAGER": "cat",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "PATH": gitProcessPATH,
+                    "HOME": NSHomeDirectory(),
+                ]
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                let didTimeout = OSAllocatedUnfairLock(initialState: false)
+                let timeoutItem = DispatchWorkItem {
+                    didTimeout.withLock { $0 = true }
+                    process.terminate()
+                }
+                DispatchQueue.global().asyncAfter(
+                    deadline: .now() + .seconds(timeoutSeconds), execute: timeoutItem
+                )
+
+                let stdoutBox = OSAllocatedUnfairLock(initialState: Data())
+                let stderrBox = OSAllocatedUnfairLock(initialState: Data())
+                let readGroup = DispatchGroup()
+                readGroup.enter()
+                DispatchQueue.global().async {
+                    let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    stdoutBox.withLock { $0 = data }
+                    readGroup.leave()
+                }
+                readGroup.enter()
+                DispatchQueue.global().async {
+                    let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    stderrBox.withLock { $0 = data }
+                    readGroup.leave()
+                }
+                readGroup.wait()
+                let stdoutData = stdoutBox.withLock { $0 }
+                let stderrData = stderrBox.withLock { $0 }
+
+                process.waitUntilExit()
+                timeoutItem.cancel()
+
+                stdoutPipe.fileHandleForReading.closeFile()
+                stderrPipe.fileHandleForReading.closeFile()
+
+                let cmd = args.first ?? "unknown"
+                if didTimeout.withLock({ $0 }) {
+                    continuation.resume(throwing: GitError.timeout(command: cmd))
+                    return
+                }
+
+                let exitCode = process.terminationStatus
+                if exitCode != 0 {
+                    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+                    if stderr.contains("not a git repository") {
+                        continuation.resume(throwing: GitError.notARepository)
+                        return
+                    }
+                    if stderr.contains("Permission denied") {
+                        continuation.resume(throwing: GitError.permissionDenied(path: workDir))
+                        return
+                    }
+                    continuation.resume(throwing: GitError.commandFailed(exitCode: exitCode, stderr: stderr, command: cmd))
+                    return
+                }
+
+                continuation.resume(returning: String(data: stdoutData, encoding: .utf8) ?? "")
+            }
         }
     }
 
