@@ -6,6 +6,7 @@
 // work, ordering, in-flight tracking) is the coordinator's.
 
 import AppKit
+import GhosttyKit
 
 extension CalyxWindowController: WorktreeTaskHost {
 
@@ -79,7 +80,24 @@ extension CalyxWindowController: WorktreeTaskHost {
 
     @discardableResult
     func openTaskPane(cwd: String, spawnArgv: [String]) -> UUID? {
-        createNewTab(spawnCwd: cwd, spawnArgv: spawnArgv)
+        guard let app = GhosttyAppController.shared.app else { return nil }
+        return performOpenTaskPane(app: app, cwd: cwd, spawnArgv: spawnArgv)
+    }
+
+    /// `openTaskPane`'s body, taking `app` directly so a unit test can
+    /// drive it (`performCreateNewTab`'s precedent). A pane created on
+    /// the passthrough path (no `SessionSurfaceMap` entry) carries its
+    /// argv as a surface `command`, for which ghostty forces
+    /// `wait-after-command`; it is recorded in `CommandHostedSurfaces`
+    /// so `processChildExited` closes it when the shell exits. A
+    /// persistent-session pane is left to `SessionReconnectCoordinator`.
+    @discardableResult
+    func performOpenTaskPane(app: ghostty_app_t, cwd: String, spawnArgv: [String]) -> UUID? {
+        guard let surfaceID = performCreateNewTab(app: app, spawnCwd: cwd, spawnArgv: spawnArgv) else { return nil }
+        if SessionSurfaceMap.shared.sessionID(for: surfaceID) == nil {
+            CommandHostedSurfaces.shared.register(surfaceID)
+        }
+        return surfaceID
     }
 
     func listPanes() -> [CockpitPaneInfo] {

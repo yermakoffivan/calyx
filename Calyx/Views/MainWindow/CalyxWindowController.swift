@@ -3239,6 +3239,27 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
+        // Command-hosted auto-close: a passthrough worktree-task pane
+        // (`CommandHostedSurfaces`, registered by `openTaskPane`) was
+        // created with a surface `command`, and ghostty forces
+        // `wait-after-command` on for every such surface
+        // (ghostty/src/apprt/embedded.zig), so ghostty never closes it
+        // itself and shows its "[Process exited]" banner instead. It has
+        // no `SessionSurfaceMap` entry, so `sessionReconnectCoordinator
+        // .childExited` below would no-op too. Closed here synchronously,
+        // before the `childExitedTasks` insert, exactly like the herdr
+        // block above: no daemon round-trip is needed, and the default
+        // `killSessions: true` is safe because there is no session for
+        // `SessionCloseKillPolicy.shouldKill` to act on. The registry
+        // entry is pruned by `.calyxSurfaceDestroyed` when the close
+        // destroys the surface.
+        if CommandHostedSurfaces.shared.contains(surfaceID) {
+            if let (commandTab, commandGroup) = findTabAndGroup(surfaceID: surfaceID) {
+                closeSurfaceAndCleanUp(tab: commandTab, group: commandGroup, surfaceID: surfaceID)
+            }
+            return
+        }
+
         // Remote sessions: a remote SessionRef's host means the
         // LOCAL daemon has no record of this session at all, so
         // `sessionReconnectCoordinator.childExited` must skip its local

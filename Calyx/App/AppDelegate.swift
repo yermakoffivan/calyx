@@ -1124,6 +1124,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         installGlobalEventTap()
         SurfacePropertyStore.shared.startObserving()
         HerdrHostedSurfaces.shared.startObserving()
+        CommandHostedSurfaces.shared.startObserving()
         // Started unconditionally here (not deferred to herdrTabCoordinator's
         // own lazy construction, HerdrTabCoordinator.init's own idempotent
         // startObserving() call): a restore-time bridge-command surface
