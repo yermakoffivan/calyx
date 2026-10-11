@@ -211,29 +211,90 @@ struct WorktreeTaskPlannerTests {
             launchArgv: ["claude", "fix Bob's bug\nthen test"],
             loginShell: "/bin/zsh"
         )
-        #expect(argv == ["/bin/zsh", "-i", "-l", "-c", "exec 'claude' 'fix Bob'\\''s bug\nthen test'"])
+        #expect(argv == ["/bin/zsh", "-i", "-l", "-c", "'claude' 'fix Bob'\\''s bug\nthen test'; exec '/bin/zsh' -i -l"])
     }
 
     @Test func test_spawnArgv_bareArgvAndOtherShell() {
         let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: ["hermes", "chat"], loginShell: "/opt/homebrew/bin/bash")
-        #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "exec 'hermes' 'chat'"])
+        #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "'hermes' 'chat'; exec '/opt/homebrew/bin/bash' -i -l"])
     }
 
-    /// The `-c` string, run by a real `/bin/sh`, must hand the agent
-    /// exactly the original argv (quote and newline intact).
-    @Test func test_spawnArgv_commandStringRoundTripsThroughRealShell() throws {
-        let launch = ["/usr/bin/printf", "%s|", "it's", "a\nb", "--x"]
-        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: "/bin/sh")
-        #expect(argv.dropLast() == ["/bin/sh", "-i", "-l", "-c"])
+    /// Writes a stub agent named `claude` (prints its argv NUL-separated,
+    /// then exits with `$STUB_AGENT_EXIT`, default 0) and a stub login
+    /// shell into a fresh temp dir. The stub shell, given `-i -l` alone
+    /// (the trailing `exec <shell> -i -l`), prints `SHELL-STARTED`;
+    /// otherwise it runs its `-c` string in interactive zsh (history
+    /// expansion on, rc files off via -f).
+    private func makeStubs() throws -> (dir: URL, shell: String) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-loginshell-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let agent = dir.appendingPathComponent("claude")
+        try """
+        #!/bin/sh
+        printf '%s\\0' "$(basename "$0")" "$@"
+        exit "${STUB_AGENT_EXIT:-0}"
+
+        """.write(to: agent, atomically: true, encoding: .utf8)
+        let shell = dir.appendingPathComponent("fake-login-shell")
+        try """
+        #!/bin/sh
+        if [ "$#" -eq 2 ] && [ "$1" = "-i" ] && [ "$2" = "-l" ]; then printf 'SHELL-STARTED'; exit 0; fi
+        for last; do :; done
+        exec /bin/zsh -f -i -l -c "$last"
+
+        """.write(to: shell, atomically: true, encoding: .utf8)
+        for file in [agent, shell] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        return (dir, shell.path)
+    }
+
+    /// Runs `spawnArgv` through ghostty's layer-1 wrapper
+    /// (`/bin/bash --noprofile --norc -c "exec -l <command>"`, see
+    /// ghostty/src/termio/Exec.zig) and returns stdout.
+    private func runThroughGhosttyLayer(_ argv: [String], stubDir: URL, agentExit: Int32 = 0) throws -> String {
+        let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", try #require(argv.last)]
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
+        process.environment = [
+            "PATH": stubDir.path + ":/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8",
+            "STUB_AGENT_EXIT": String(agentExit),
+        ]
+        process.standardInput = FileHandle.nullDevice
         let out = Pipe()
         process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
         try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        #expect(text == "it's|a\nb|--x|")
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Splits stub output into the agent's argv and asserts the login
+    /// shell marker follows it (the shell starts after the agent exits).
+    private func agentArgvThenShell(_ text: String, _ comment: Comment) -> [String] {
+        let marker = "SHELL-STARTED"
+        #expect(text.hasSuffix(marker), comment)
+        var tokens = String(text.dropLast(text.hasSuffix(marker) ? marker.count : 0)).components(separatedBy: "\0")
+        if tokens.last == "" { tokens.removeLast() }
+        return tokens
+    }
+
+    /// The `-c` string must hand the agent exactly the original argv
+    /// (quote and newline intact), then start the login shell whether
+    /// the agent exited zero or non-zero.
+    @Test func test_spawnArgv_runsAgentThenInteractiveLoginShellRegardlessOfExitStatus() throws {
+        let stubs = try makeStubs()
+        defer { try? FileManager.default.removeItem(at: stubs.dir) }
+        let launch = ["claude", "%s|", "it's", "a\nb", "--x"]
+        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: stubs.shell)
+        #expect(argv.dropLast() == [stubs.shell, "-i", "-l", "-c"])
+        for status: Int32 in [0, 1, 127] {
+            let text = try runThroughGhosttyLayer(argv, stubDir: stubs.dir, agentExit: status)
+            #expect(agentArgvThenShell(text, "exit \(status)") == launch, "exit \(status)")
+        }
     }
 
     /// Regression guard for shell injection through the prompt. Emulates
@@ -241,70 +302,30 @@ struct WorktreeTaskPlannerTests {
     /// - Layer 1 (ghostty on macOS, ghostty/src/termio/Exec.zig, `.shell`
     ///   case): `/bin/bash --noprofile --norc -c "exec -l <command>"` where
     ///   `<command>` is built exactly like `CalyxWindowController.createManagedSurface`.
-    /// - Layer 2: the login shell `[shell, "-i", "-l", "-c", "exec '<tok>' ..."]`
-    ///   from `spawnArgv`, emulated by interactive zsh (history expansion on,
-    ///   rc files off via -f) with `exec` redefined as a NUL-separated argv dumper.
+    /// - Layer 2: the login shell `[shell, "-i", "-l", "-c", "'<tok>' ...; exec '<shell>' -i -l"]`
+    ///   from `spawnArgv`, emulated by interactive zsh with a stub `claude`
+    ///   on PATH that dumps its argv.
     @Test func test_spawnArgv_hostilePrompts_surviveGhosttyAndLoginShellLayersWithoutExecution() throws {
         let pwned = "/tmp/CALYX_PWNED"
         defer { try? FileManager.default.removeItem(atPath: pwned) }
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("calyx-loginshell-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let script = dir.appendingPathComponent("fake-login-shell")
-        let body = """
-        #!/bin/sh
-        for last; do :; done
-        exec /bin/zsh -f -i -l -c 'exec() { printf "%s\\0" "$@"; }; eval "$1"' zsh "$last"
-
-        """
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let stubs = try makeStubs()
+        defer { try? FileManager.default.removeItem(at: stubs.dir) }
 
         let corpus = [
             "fix Bob's bug\nthen test", "$(touch /tmp/CALYX_PWNED) `id`", "!! !$ ^foo^bar",
             "say \"hi\" ; rm -rf x", "--help me", "a\\b\\\\c", "日本語 'quoted'", "$HOME ${HOME} ~",
             "*.swift ?", "#comment", "&& echo x | cat > /dev/null", "", "   ",
         ]
-        for prompt in corpus {
-            let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, prompt: prompt).argv
-            let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: script.path)
-            let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
-            process.environment = ["PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8"]
-            process.standardInput = FileHandle.nullDevice
-            let out = Pipe()
-            process.standardOutput = out
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            var tokens = String(decoding: data, as: UTF8.self).components(separatedBy: "\0")
-            if tokens.last == "" { tokens.removeLast() }
-            #expect(tokens == expected, "prompt: \(prompt.debugDescription)")
-        }
         let arguments = ["--model", "opus", "--effort", "it's high"]
         for prompt in corpus {
-            let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: arguments, prompt: prompt).argv
-            #expect(Array(expected.prefix(5)) == ["claude"] + arguments)
-            let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: script.path)
-            let command = argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["--noprofile", "--norc", "-c", "exec -l " + command]
-            process.environment = ["PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "LANG": "en_US.UTF-8"]
-            process.standardInput = FileHandle.nullDevice
-            let out = Pipe()
-            process.standardOutput = out
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            var tokens = String(decoding: data, as: UTF8.self).components(separatedBy: "\0")
-            if tokens.last == "" { tokens.removeLast() }
-            #expect(tokens == expected, "with arguments, prompt: \(prompt.debugDescription)")
+            for args in [[], arguments] {
+                let expected = WorktreeTaskPlanner.launchPlan(agent: .claudeCode, arguments: args, prompt: prompt).argv
+                #expect(Array(expected.prefix(args.count + 1)) == ["claude"] + args)
+                let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: expected, loginShell: stubs.shell)
+                let text = try runThroughGhosttyLayer(argv, stubDir: stubs.dir)
+                let comment: Comment = "arguments \(args), prompt: \(prompt.debugDescription)"
+                #expect(agentArgvThenShell(text, comment) == expected, comment)
+            }
         }
         #expect(!FileManager.default.fileExists(atPath: pwned))
     }

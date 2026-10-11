@@ -54,9 +54,9 @@ enum WorktreeTaskPlanner {
         }
     }
 
-    /// The argv the task's pane is spawned with: `launchArgv` exec'd by
-    /// the user's shell as an interactive login shell,
-    /// `[loginShell, "-i", "-l", "-c", "exec <tokens>"]`, every token
+    /// The argv the task's pane is spawned with: `launchArgv` run by the
+    /// user's shell as an interactive login shell,
+    /// `[loginShell, "-i", "-l", "-c", "<tokens>; exec <loginShell> -i -l"]`, every token
     /// single-quoted. `-i` makes zsh/bash source the rc files (`~/.zshrc`,
     /// `~/.bashrc`), where nvm and `~/.local/bin` PATH setup usually
     /// live; `-l` sources the profile files. On `.passthrough` ghostty
@@ -66,16 +66,20 @@ enum WorktreeTaskPlanner {
     /// login shell anyway, but not an interactive one; on `.persistent`
     /// the session daemon execs this argv directly, so `-l` is needed.
     ///
-    /// A failing agent (e.g. "command not found") stays visible on
-    /// `.passthrough`: setting a surface `command` makes ghostty force
+    /// The `-c` string is `<agent argv>; exec <shell> -i -l`: once the
+    /// agent exits (any status, e.g. Claude Code's `/exit` or "command
+    /// not found"), the pane continues as an interactive login shell in
+    /// the same worktree directory instead of leaving a dead pane.
+    /// Setting a surface `command` makes ghostty force
     /// `wait-after-command` on (ghostty/src/apprt/embedded.zig,
-    /// `Surface.init`; see `SurfaceRegistry.createSurface(app:config:pwd:command:)`),
-    /// so the pane is kept open after the exec'd process exits. On
-    /// `.persistent` the session's process ends instead and the pane
-    /// follows `SessionReconnectCoordinator`'s handling of an ended
-    /// session.
+    /// `Surface.init`; see `SurfaceRegistry.createSurface(app:config:pwd:command:)`);
+    /// on `.passthrough` that now only applies when this final shell
+    /// exits. On `.persistent` the session ends when the final shell
+    /// exits and the pane follows `SessionReconnectCoordinator`'s
+    /// handling of an ended session.
     static func spawnArgv(launchArgv: [String], loginShell: String) -> [String] {
-        let command = "exec " + launchArgv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+        let agent = launchArgv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+        let command = agent + "; exec " + SessionCommandSynthesizer.shSafeToken(loginShell) + " -i -l"
         return [loginShell, "-i", "-l", "-c", command]
     }
 

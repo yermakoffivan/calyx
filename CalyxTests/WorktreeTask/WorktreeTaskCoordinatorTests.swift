@@ -212,7 +212,7 @@ struct WorktreeTaskCoordinatorTests {
         #expect(fixture.host.effectCalls == ["dismissTaskSheet", "openTaskPane", "refreshGitSidebar"])
         #expect(fixture.host.openedPanes.count == 1)
         #expect(fixture.host.openedPanes.first?.cwd == path)
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "exec 'claude' 'hi there'"])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'claude' 'hi there'; exec '/bin/zsh' -i -l"])
         #expect(fixture.host.busyStates.first != false, "if the sheet is marked busy, it is marked busy first")
     }
 
@@ -230,7 +230,7 @@ struct WorktreeTaskCoordinatorTests {
         )
 
         #expect(fixture.host.openedPanes.first?.cwd == fixture.taskPath("t2"))
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "exec 'hermes' 'chat'"])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "'hermes' 'chat'; exec '/opt/homebrew/bin/bash' -i -l"])
     }
 
     @Test func test_create_paneNotOpened_presentsPaneErrorKeepsWorktreeAndRefreshes() async throws {
@@ -265,7 +265,7 @@ struct WorktreeTaskCoordinatorTests {
             repository: fixture.description
         )
 
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "exec '/bin/sleep' '60'"])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'/bin/sleep' '60'; exec '/bin/zsh' -i -l"])
     }
 
     @Test func test_create_argumentsGoBetweenProgramAndPrompt() async throws {
@@ -282,7 +282,7 @@ struct WorktreeTaskCoordinatorTests {
 
         #expect(fixture.host.errors.isEmpty, "unexpected errors: \(fixture.host.errors)")
         #expect(fixture.host.openedPanes.first?.spawnArgv
-            == ["/bin/zsh", "-i", "-l", "-c", "exec 'claude' '--model' 'opus' '--' 'hi'"])
+            == ["/bin/zsh", "-i", "-l", "-c", "'claude' '--model' 'opus' '--' 'hi'; exec '/bin/zsh' -i -l"])
     }
 
     /// Two creates in quick succession (a double submit) run the service
@@ -314,7 +314,7 @@ struct WorktreeTaskCoordinatorTests {
             repository: fixture.description
         )
 
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "exec 'hermes' 'chat'"])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'hermes' 'chat'; exec '/bin/zsh' -i -l"])
     }
 
     // MARK: - UI-test argv override resolution

@@ -21,7 +21,9 @@
 //   honoured only under `--uitesting`, replaces the agent CLI argv so no
 //   real agent runs. The process reports its cwd via OSC 7 before
 //   sleeping, so the task pane has a known cwd inside the worktree and
-//   merge can find and close it (a bare `sleep` would never report one).
+//   merge can find and close it. The stub then exits at once; production
+//   spawns `<agent>; exec <shell> -i -l`, so the pane must continue as an
+//   interactive login shell in the worktree, which the test drives.
 
 import XCTest
 
@@ -35,7 +37,7 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
     private static let fieldSeparator = "\u{1F}"
     private static let taskArgv = [
         "/bin/sh", "-c",
-        "printf '\\033]7;file://localhost%s\\007' \"$PWD\"; sleep 600",
+        "printf '\\033]7;file://localhost%s\\007' \"$PWD\"; exit 0",
     ]
 
     override var additionalLaunchEnvironment: [String: String] {
@@ -122,22 +124,29 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
         createButton.click()
 
         XCTAssertTrue(waitForTabCount(originalTabCount + 1, timeout: 15), "creating a task must open one new tab")
-        // The new task tab (running the sleeping stub) takes focus;
-        // paneExec types into the focused pane, so return to the original
-        // tab, whose shell is still idle in the repo.
+        // The new task tab takes focus. Its stub agent has already exited,
+        // so the pane must now be a live login shell in the worktree:
+        // drive it directly, without switching tabs.
+        Thread.sleep(forTimeInterval: 2)
+        var taskPwd = ""
+        XCTAssertTrue(waitUntil(timeout: 30) {
+            taskPwd = self.shell("pwd")
+            return taskPwd == self.worktreePath
+        }, "after the agent exits the task pane must be a shell in the worktree; pwd: \(taskPwd)")
+        let worktreeList = shell("git -C '\(repoDir)' worktree list")
+        XCTAssertTrue(worktreeList.contains(worktreePath), "git worktree list must contain the task: \(worktreeList)")
+
+        // Work in the task, through the task pane's own shell.
+        let commitOut = shell("echo task > '\(worktreePath)/task.txt' && git -C '\(worktreePath)' add task.txt && git -C '\(worktreePath)' commit -q -m 'task work' && echo committed")
+        XCTAssertEqual(commitOut, "committed", "commit in worktree failed: \(commitOut)")
+
+        // Return to the original tab (shell in the repo) for the merge,
+        // since merge closes the task tab.
         if let originalTabID = originalTabIDs.first {
             element(originalTabID).click()
             Thread.sleep(forTimeInterval: 1)
             pane.click()
         }
-        XCTAssertTrue(waitUntil(timeout: 10) { self.shell("test -d '\(self.worktreePath)' && echo yes || echo no") == "yes" },
-                      "the task worktree must exist under the overridden session root: \(worktreePath)")
-        let worktreeList = shell("git -C '\(repoDir)' worktree list")
-        XCTAssertTrue(worktreeList.contains(worktreePath), "git worktree list must contain the task: \(worktreeList)")
-
-        // Work in the task (from the original tab's shell).
-        let commitOut = shell("echo task > '\(worktreePath)/task.txt' && git -C '\(worktreePath)' add task.txt && git -C '\(worktreePath)' commit -q -m 'task work' && echo committed")
-        XCTAssertEqual(commitOut, "committed", "commit in worktree failed: \(commitOut)")
 
         // Merge from the Changes sidebar.
         openCommandPaletteViaMenu()
