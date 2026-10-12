@@ -71,6 +71,9 @@ struct MissionMapCard: Identifiable, Sendable, Equatable {
     /// ledger has published no totals for it. Defaulted to nil so cards
     /// built without usage need not pass it.
     var usage: UsageTokenTotals? = nil
+    /// Set when the pane's cwd is inside a worktree task; the card then
+    /// offers Merge / Discard. Defaulted to nil like `usage`.
+    var worktreeTask: MissionMapWorktreeTaskBadge? = nil
 }
 
 /// One subagent row inside its parent's card.
@@ -108,6 +111,16 @@ struct MissionMapGitBadge: Sendable, Equatable {
     /// Distinct paths `git status` reports, counted the same way
     /// `GitRepoChanges.changedFileCount` does.
     let changedFileCount: Int
+}
+
+/// A pane's worktree task, keyed by the pane's cwd in
+/// `MissionMapGitPoller.worktreeTasks`.
+struct MissionMapWorktreeTaskBadge: Sendable, Equatable {
+    let branch: String
+    /// The branch the task merges back into.
+    let base: String
+    /// The task worktree's root, which Merge / Discard act on.
+    let worktreePath: String
 }
 
 // MARK: - Edge
@@ -181,6 +194,8 @@ struct MissionMapInput: Sendable {
     /// Each session's totals, keyed by agent session id
     /// (`UsageLiveSummaries.bySession`).
     var usage: [String: UsageTokenTotals] = [:]
+    /// Keyed by pane cwd, like `git`.
+    var worktreeTasks: [String: MissionMapWorktreeTaskBadge] = [:]
 }
 
 // MARK: - Stable IDs

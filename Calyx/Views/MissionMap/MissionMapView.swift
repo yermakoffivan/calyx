@@ -40,6 +40,9 @@ struct MissionMapView: View {
     var onSelectableIDsChange: ((MissionMapSelectableIDs) -> Void)?
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
+    /// Merge / Discard of a card's worktree task, given its worktree root.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     var onKeyCatcherReady: ((NSView) -> Void)?
     /// Where the selected line's popover goes, in this view's `.global`
     /// coordinates (the window's main hosting view), each time that
@@ -199,6 +202,7 @@ struct MissionMapView: View {
         // Read here, inside `body`'s snapshot path, so the map redraws
         // when a session's summary changes.
         input.usage = UsageLiveSummaries.shared.bySession
+        input.worktreeTasks = gitPoller.worktreeTasks
         return MissionMapSnapshotBuilder.build(input: input)
     }
 
@@ -246,6 +250,8 @@ struct MissionMapView: View {
             onFocusSurface: onFocusSurface,
             onAllow: onAllow,
             onOpenApproval: onOpenApproval,
+            onMergeWorktreeTask: onMergeWorktreeTask,
+            onDiscardWorktreeTask: onDiscardWorktreeTask,
             onDragChanged: { cardID, translation in
                 activeDrag = ActiveDrag(cardID: cardID, translation: translation)
             },

@@ -69,7 +69,7 @@ struct MCPServerImportSheet: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            MCPServerImportTextView(text: $text)
+            MCPServerImportTextView(text: $text, onCancel: close)
                 .frame(minHeight: 140)
                 .border(Color.secondary.opacity(0.4))
                 .onChange(of: text) { _, newText in

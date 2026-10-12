@@ -67,6 +67,16 @@ enum GitScratch {
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Sets a repository-local identity and disables commit signing.
+    /// Production write paths (`GitService.runMutating`) inherit the
+    /// developer's HOME, so without this a global `user.*` or
+    /// `commit.gpgsign` setting would leak into merge commits they make.
+    static func configureIdentity(in repository: URL) throws {
+        try run(["config", "user.name", "Calyx Tests"], in: repository)
+        try run(["config", "user.email", "calyx-tests@example.invalid"], in: repository)
+        try run(["config", "commit.gpgsign", "false"], in: repository)
+    }
+
     /// Writes `contents`, commits it, and returns the resulting full SHA.
     @discardableResult
     static func commit(

@@ -61,6 +61,18 @@ enum GlassTheme {
         Color.white.opacity(0.24)
     }
 
+    /// Whether window chrome takes its inactive-window treatment (the
+    /// `GlassInactiveTintModifier` tint and the 0.5 opacity dims) in
+    /// `state`. Only `.inactive` does: a window that is main but not key
+    /// reports `.active` -- e.g. one whose own sheet (New Worktree Task,
+    /// clipboard confirmation) is key -- and is still the active window,
+    /// so it keeps its active chrome. The tint exists to offset macOS 26
+    /// washing out an inactive window's glass (#44); applied to an
+    /// `.active` window it darkens glass that was never washed out.
+    static func isInactiveWindowChrome(_ state: ControlActiveState) -> Bool {
+        state == .inactive
+    }
+
     /// Derive the inactive-window tint overlay color: theme color hue/saturation/brightness
     /// preserved as-is, full opacity.
     static func inactiveOverlayColor(for themeColor: NSColor) -> NSColor {
@@ -101,10 +113,10 @@ struct TabChromeModifier: ViewModifier {
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                             .fill(Color.white.opacity(0.10))
                     )
-                    .opacity(controlActiveState == .key ? 1.0 : 0.5)
+                    .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
             } else {
                 content
-                    .opacity(controlActiveState == .key ? 1.0 : 0.5)
+                    .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? 0.5 : 1.0)
             }
         }
     }
@@ -162,7 +174,8 @@ struct GlassAtmosphereBackground: ViewModifier {
 }
 
 /// Overlays a theme-derived tint (hue, saturation, and brightness carried
-/// through unchanged) when the window is not key, matching Ghostty's
+/// through unchanged) when the window is inactive (neither key nor main;
+/// see `GlassTheme.isInactiveWindowChrome`), matching Ghostty's
 /// inactive-window dimming (ported from TerminalViewContainer.swift).
 /// The tint renders into the modified view's own `.background`: it covers exactly
 /// the host view's frame (coverage is set by what you attach it to, not by options
@@ -176,7 +189,7 @@ struct GlassInactiveTintModifier: ViewModifier {
     func body(content: Content) -> some View {
         content.background(
             Color(nsColor: GlassTheme.inactiveOverlayColor(for: themeColor))
-                .opacity(controlActiveState == .key ? 0 : GlassTheme.inactiveOverlayOpacity(for: glassOpacity))
+                .opacity(GlassTheme.isInactiveWindowChrome(controlActiveState) ? GlassTheme.inactiveOverlayOpacity(for: glassOpacity) : 0)
                 .allowsHitTesting(false)
         )
     }

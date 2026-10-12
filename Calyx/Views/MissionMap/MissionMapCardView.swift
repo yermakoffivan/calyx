@@ -19,6 +19,10 @@ struct MissionMapCardView: View {
     let onOpen: () -> Void
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
+    /// Merge / Discard of the card's worktree task, given its worktree
+    /// root.
+    var onMergeWorktreeTask: ((String) -> Void)?
+    var onDiscardWorktreeTask: ((String) -> Void)?
     /// Live drag translation, in global coordinates.
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: ((CGSize) -> Void)?
@@ -49,6 +53,9 @@ struct MissionMapCardView: View {
             }
             if let usage = card.usage {
                 usageLine(usage)
+            }
+            if let task = card.worktreeTask {
+                worktreeTaskRow(task)
             }
             if let toolLine = card.toolLine {
                 Text(toolLine)
@@ -166,6 +173,28 @@ struct MissionMapCardView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(UsageCardLine.accessibilityLabel(for: usage))
         .accessibilityIdentifier(AccessibilityID.MissionMap.cardUsage(card.id))
+    }
+
+    /// "Task → <base>" with the task's Merge and Discard buttons.
+    private func worktreeTaskRow(_ task: MissionMapWorktreeTaskBadge) -> some View {
+        HStack(spacing: 6) {
+            Text("Task \u{2192} \(task.base)")
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Button("Merge") { onMergeWorktreeTask?(task.worktreePath) }
+                .controlSize(.small)
+                .buttonStyle(.glass)
+                .help("Merge \(task.branch) into \(task.base)")
+                .accessibilityIdentifier(AccessibilityID.MissionMap.mergeTaskButton(card.id))
+            Button("Discard", role: .destructive) { onDiscardWorktreeTask?(task.worktreePath) }
+                .controlSize(.small)
+                .buttonStyle(.glass)
+                .help("Discard \(task.branch)")
+                .accessibilityIdentifier(AccessibilityID.MissionMap.discardTaskButton(card.id))
+        }
+        .frame(height: MissionMapLayout.worktreeTaskRowHeight - 4, alignment: .leading)
     }
 
     private func childRow(_ child: MissionMapChildCard) -> some View {

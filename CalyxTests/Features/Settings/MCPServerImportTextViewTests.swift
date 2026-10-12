@@ -58,4 +58,11 @@ final class MCPServerImportTextViewTests: XCTestCase {
         MCPServerImportTextView.configure(textView)
         XCTAssertEqual(textView.accessibilityIdentifier(), AccessibilityID.MCPServersSettings.importTextView)
     }
+
+    func test_configure_keepsAppKitDefaultLineFragmentPadding() {
+        let textView = makeSubstitutingTextView()
+        textView.textContainer?.lineFragmentPadding = 0
+        MCPServerImportTextView.configure(textView)
+        XCTAssertEqual(textView.textContainer?.lineFragmentPadding, 5)
+    }
 }

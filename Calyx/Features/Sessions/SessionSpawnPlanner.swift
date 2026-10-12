@@ -52,17 +52,22 @@ struct SessionSpawnContext: Sendable, Equatable {
     let host: String?
     let origin: SessionSpawnOrigin
     let initialGridSize: SessionInitialGridSize?
+    /// The program the session runs instead of the user's shell (as
+    /// `attach --argv` flags, local and remote); nil runs the shell.
+    let argv: [String]?
 
     init(
         cwd: String? = nil,
         host: String? = nil,
         origin: SessionSpawnOrigin = .tab,
-        initialGridSize: SessionInitialGridSize? = nil
+        initialGridSize: SessionInitialGridSize? = nil,
+        argv: [String]? = nil
     ) {
         self.cwd = cwd
         self.host = host
         self.origin = origin
         self.initialGridSize = initialGridSize
+        self.argv = argv
     }
 }
 
@@ -122,7 +127,8 @@ enum SessionSpawnPlanner {
                 host: host,
                 sessionID: sessionID,
                 cwd: effectiveCwd,
-                initialGridSize: context.initialGridSize
+                initialGridSize: context.initialGridSize,
+                argv: context.argv
             )
             return .persistent(sessionID: sessionID, command: command, host: host)
         }
@@ -134,7 +140,8 @@ enum SessionSpawnPlanner {
             binaryPath: binaryPath,
             sessionID: sessionID,
             cwd: effectiveCwd,
-            initialGridSize: context.initialGridSize
+            initialGridSize: context.initialGridSize,
+            argv: context.argv
         )
         return .persistent(sessionID: sessionID, command: command, host: nil)
     }

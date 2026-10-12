@@ -19,14 +19,20 @@ enum MissionMapLayout {
     /// Extra card height for the usage line, so a card that shows one
     /// grows instead of squeezing its other rows.
     static let usageRowHeight: CGFloat = 16
+    /// Extra card height for a worktree task's Merge / Discard row.
+    static let worktreeTaskRowHeight: CGFloat = 24
     /// The width of the obstacle each band's header text occupies, so
     /// routed lines do not run through the group's name.
     static let bandHeaderObstacleWidth: CGFloat = 200
 
     /// A card's height: `baseHeight` plus one `childRowHeight` per child,
-    /// plus `usageRowHeight` when the card has a usage line.
+    /// plus `usageRowHeight` when the card has a usage line, plus
+    /// `worktreeTaskRowHeight` when it has a worktree task row.
     static func cardHeight(for card: MissionMapCard, baseHeight: CGFloat) -> CGFloat {
-        baseHeight + CGFloat(card.children.count) * childRowHeight + (card.usage == nil ? 0 : usageRowHeight)
+        baseHeight
+            + CGFloat(card.children.count) * childRowHeight
+            + (card.usage == nil ? 0 : usageRowHeight)
+            + (card.worktreeTask == nil ? 0 : worktreeTaskRowHeight)
     }
 
     /// The top-left of each band's header, keyed by group ID -- where the

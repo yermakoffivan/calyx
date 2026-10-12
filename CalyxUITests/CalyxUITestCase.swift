@@ -41,6 +41,11 @@ class CalyxUITestCase: XCTestCase {
     /// Override in subclasses to add extra launch arguments (e.g. UserDefaults overrides).
     var additionalLaunchArguments: [String] { [] }
 
+    /// Override in subclasses to add extra launch environment variables.
+    /// Applied after the base class's own entries, so a subclass can also
+    /// override `HOME` (which decides `SessionRootResolver`'s root).
+    var additionalLaunchEnvironment: [String: String] { [:] }
+
     /// Bundle identifier of the DebugUITesting build of Calyx launched by
     /// these tests (`PRODUCT_BUNDLE_IDENTIFIER` set on the `DebugUITesting`
     /// config in `project.yml`), distinct from the production
@@ -107,6 +112,9 @@ class CalyxUITestCase: XCTestCase {
         let suiteName = "com.calyx.tests.e2e.CalyxUITestCase-\(UUID().uuidString)"
         defaultsSuiteName = suiteName
         app.launchEnvironment["CALYX_UITEST_DEFAULTS_SUITE"] = suiteName
+        for (key, value) in additionalLaunchEnvironment {
+            app.launchEnvironment[key] = value
+        }
 
         app.launch()
     }

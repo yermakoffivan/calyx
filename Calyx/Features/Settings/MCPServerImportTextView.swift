@@ -2,83 +2,41 @@
 //  MCPServerImportTextView.swift
 //  Calyx
 //
-//  The JSON text area of the MCP server import sheet. SwiftUI's
-//  `TextEditor` follows the system text settings, so smart quotes turn
-//  `"` into `“ ”` (the JSON no longer parses) and smart dashes turn
-//  `--flag` into `—flag` (the JSON parses with a wrong argument).
-//  SwiftUI has no modifier for either on macOS, so this wraps an
-//  `NSTextView` with every automatic rewrite of the typed text turned off.
+//  The JSON text area of the MCP server import sheet: a `PlainTextView`
+//  (no smart quotes or dashes, which would break or silently alter the
+//  JSON) in a monospaced font. Escape in it runs `onCancel`, the
+//  sheet's Cancel action.
 //
 
 import AppKit
 import SwiftUI
 
-struct MCPServerImportTextView: NSViewRepresentable {
+struct MCPServerImportTextView: View {
     @Binding var text: String
+    var onCancel: (@MainActor () -> Void)? = nil
 
-    /// Turns off every rewrite of typed or pasted text and sets the
-    /// accessibility identifier on the text view itself, the element
-    /// XCUITest finds as a text view.
-    static func configure(_ textView: NSTextView) {
-        textView.isRichText = false
-        textView.allowsUndo = true
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.isAutomaticSpellingCorrectionEnabled = false
-        textView.isAutomaticTextCompletionEnabled = false
-        textView.isAutomaticLinkDetectionEnabled = false
-        textView.isAutomaticDataDetectionEnabled = false
-        textView.isContinuousSpellCheckingEnabled = false
-        textView.smartInsertDeleteEnabled = false
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.setAccessibilityIdentifier(AccessibilityID.MCPServersSettings.importTextView)
+    private static func plainTextView(
+        text: Binding<String>,
+        onCancel: (@MainActor () -> Void)? = nil
+    ) -> PlainTextView {
+        PlainTextView(
+            text: text,
+            font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+            textContainerInset: .zero,
+            accessibilityIdentifier: AccessibilityID.MCPServersSettings.importTextView,
+            // AppKit's default padding, which this view has always used.
+            lineFragmentPadding: 5,
+            onCancel: onCancel
+        )
     }
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        let textView = Self.textView(in: scrollView)
-        Self.configure(textView)
-        textView.string = text
-        textView.delegate = context.coordinator
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.text = $text
-        let textView = Self.textView(in: scrollView)
-        if textView.string != text {
-            textView.string = text
-        }
-    }
-
-    /// `NSTextView.scrollableTextView()` documents its document view as
-    /// an `NSTextView`; anything else is an AppKit contract violation.
-    private static func textView(in scrollView: NSScrollView) -> NSTextView {
-        guard let textView = scrollView.documentView as? NSTextView else {
-            preconditionFailure("NSTextView.scrollableTextView() returned a scroll view without an NSTextView document view")
-        }
-        return textView
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
-    }
-
+    /// Applies the import sheet's text view configuration.
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        var text: Binding<String>
+    static func configure(_ textView: NSTextView) {
+        plainTextView(text: .constant("")).configure(textView)
+    }
 
-        init(text: Binding<String>) {
-            self.text = text
-        }
-
-        func textDidChange(_ notification: Notification) {
-            // NSText posts its delegate notifications with itself as the object.
-            guard let textView = notification.object as? NSTextView else {
-                preconditionFailure("textDidChange arrived without an NSTextView object")
-            }
-            text.wrappedValue = textView.string
-        }
+    var body: some View {
+        Self.plainTextView(text: $text, onCancel: onCancel)
     }
 }

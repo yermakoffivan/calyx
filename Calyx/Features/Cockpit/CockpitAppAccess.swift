@@ -219,13 +219,8 @@ final class LiveCockpitAppAccess: CockpitAppAccessing {
         }
         windowSession.activeGroupID = group.id
 
-        let tabCountBefore = group.tabs.count
-        controller.createNewTab(spawnCwd: cwd)
-
-        guard group.tabs.count > tabCountBefore, let newTab = group.tabs.last else {
-            throw CockpitAccessError.tabCreationFailed
-        }
-        guard let newSurfaceID = newTab.splitTree.allLeafIDs().first else {
+        guard let newSurfaceID = controller.createNewTab(spawnCwd: cwd),
+              let newTab = group.tabs.first(where: { $0.splitTree.allLeafIDs().contains(newSurfaceID) }) else {
             throw CockpitAccessError.tabCreationFailed
         }
 

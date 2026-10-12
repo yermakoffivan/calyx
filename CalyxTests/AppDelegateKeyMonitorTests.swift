@@ -367,6 +367,24 @@ final class AppDelegateKeyMonitorTests: XCTestCase {
 
     // ==================== Negative tests (no match -> nil) ====================
 
+    /// Cmd+Shift+N (New Worktree Task) must NOT be claimed by the key
+    /// monitor -- it must resolve to nil so it reaches the File menu.
+    func test_matchKeyEvent_cmdShiftN_returnsNil() {
+        guard let event = makeKeyEvent(
+            modifiers: [.command, .shift],
+            keyCode: 45, // kVK_ANSI_N
+            characters: "N",
+            charactersIgnoringModifiers: "N"
+        ) else {
+            XCTFail("Failed to create synthetic NSEvent for Cmd+Shift+N")
+            return
+        }
+
+        let result = AppDelegate.matchKeyEvent(event, isUITesting: false)
+
+        XCTAssertNil(result, "Cmd+Shift+N (New Worktree Task) must not be claimed by the key monitor")
+    }
+
     /// A bare "]" with no modifiers must not be intercepted — it should
     /// flow through to the first responder (e.g. SurfaceView or text field).
     func test_matchKeyEvent_plainRightBracket_returnsNil() {

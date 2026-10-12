@@ -257,6 +257,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var reconnectEstablishGraceTasks = KeyedTaskRegistry<UUID>()
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
+    /// The New Worktree Task sheet while it is presented. Internal, not
+    /// `private`, for the `WorktreeTaskHost` extension in
+    /// CalyxWindowController+WorktreeTaskHost.swift.
+    var worktreeTaskSheetController: WorktreeTaskSheetController?
+    /// Worktree Task orchestration; this controller is its host.
+    lazy var worktreeTaskCoordinator = WorktreeTaskCoordinator(
+        host: self,
+        launchArgvOverride: Self.worktreeTaskUITestLaunchArgvOverride(
+            arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment
+        )
+    )
     private var composeOverlayTargetSurfaceID: UUID?
     /// Git badges for Mission Map's cards. Polls only while the map is
     /// shown: started by `showMissionMap()`, stopped by
@@ -377,6 +389,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// to churn. `nil` (the default) leaves production behavior
     /// unchanged. DO NOT use from production code.
     var _createManagedSurfacePwdObserverForTesting: ((String?) -> Void)?
+
+    /// Test seam (Worktree Tasks): when non-nil, called with the
+    /// `spawnArgv` `createManagedSurface` received, at the same point and
+    /// in both branches like `_createManagedSurfacePwdObserverForTesting`.
+    /// DO NOT use from production code.
+    var _createManagedSurfaceSpawnArgvObserverForTesting: (([String]?) -> Void)?
+
+    /// Test seam (Worktree Tasks): when non-nil, called with the
+    /// `command:` that reaches `SurfaceRegistry.createSurface` (nil on
+    /// `.passthrough` without a spawn argv), at the same point and in
+    /// both branches like `_createManagedSurfacePwdObserverForTesting`.
+    /// DO NOT use from production code.
+    var _createManagedSurfaceCommandObserverForTesting: ((String?) -> Void)?
 
     /// Test seam, remote sessions: when non-nil,
     /// called with `(sessionID, host)` immediately before
@@ -800,6 +825,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         commandRegistry.register(PaletteCommand(id: "git.refresh", title: "Refresh Git Changes", category: "Git") { [weak self] in
             self?.refreshGitSidebar(trigger: .manualRefresh)
         })
+        commandRegistry.register(PaletteCommand(
+            id: "git.newWorktreeTask", title: "New Worktree Task\u{2026}", shortcut: "Cmd+Shift+N", category: "Git"
+        ) { [weak self] in
+            self?.worktreeTaskCoordinator.presentSheet()
+        })
         commandRegistry.register(PaletteCommand(id: "cli.install", title: "Install CLI to PATH", category: "System") {
             let appPath = Bundle.main.bundlePath
             let cliSource = "\(appPath)/Contents/Resources/bin/calyx"
@@ -1033,6 +1063,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// to the owning tab's last-known `pwd` when that pane hasn't reported
     /// one yet (e.g. a snapshot-restored pane before its first OSC 7, or any
     /// surface created before `SurfacePropertyStore.startObserving()`).
+    /// The focused pane's live cwd (`WorktreeTaskHost` requirement;
+    /// declared here because `activeTab`/`livePaneCwd` are private).
+    var focusedPaneCwd: String? {
+        livePaneCwd(of: activeTab?.splitTree.focusedLeafID, in: activeTab)
+    }
+
     private func livePaneCwd(of surfaceID: UUID?, in tab: Tab?) -> String? {
         surfaceID.flatMap { SurfacePropertyStore.shared.cwd(for: $0) } ?? tab?.pwd
     }
@@ -1129,27 +1165,43 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         sessionFallbackCwd: String?,
         origin: SessionSpawnOrigin,
         host: String? = nil,
-        initialGridSize: SessionInitialGridSize? = nil
+        initialGridSize: SessionInitialGridSize? = nil,
+        spawnArgv: [String]? = nil
     ) -> UUID? {
         let sessionCwd = explicitCwd ?? sessionFallbackCwd ?? NSHomeDirectory()
         let context = SessionSpawnContext(
             cwd: sessionCwd,
             host: host,
             origin: origin,
-            initialGridSize: initialGridSize
+            initialGridSize: initialGridSize,
+            argv: spawnArgv
         )
         switch SessionSpawnPlanner.plan(for: context) {
         case .passthrough:
+            // `spawnArgv` becomes the surface's `command`. On macOS ghostty
+            // runs a surface `command` as
+            // `/bin/bash --noprofile --norc -c "exec -l <command>"`
+            // (ghostty/src/termio/Exec.zig, the `.shell` case; see the
+            // SessionCommandSynthesizer header), so each token is
+            // single-quoted and the string re-tokenizes to exactly
+            // `spawnArgv`.
+            let command = spawnArgv.flatMap { argv in
+                argv.isEmpty ? nil : argv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
+            }
             #if DEBUG
             _createManagedSurfacePwdObserverForTesting?(explicitCwd)
+            _createManagedSurfaceSpawnArgvObserverForTesting?(spawnArgv)
+            _createManagedSurfaceCommandObserverForTesting?(command)
             if let hook = _createManagedSurfaceHookForTesting {
                 return hook()
             }
             #endif
-            return tab.registry.createSurface(app: app, config: config, pwd: explicitCwd)
+            return tab.registry.createSurface(app: app, config: config, pwd: explicitCwd, command: command)
         case .persistent(let sessionID, let command, let planHost):
             #if DEBUG
             _createManagedSurfacePwdObserverForTesting?(sessionCwd)
+            _createManagedSurfaceSpawnArgvObserverForTesting?(spawnArgv)
+            _createManagedSurfaceCommandObserverForTesting?(command)
             if let hook = _createManagedSurfaceHookForTesting {
                 guard let surfaceID = hook() else { return nil }
                 tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID, host: planHost)
@@ -1432,6 +1484,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self?.expandCommit(repoID: repoID, hash: hash)
             },
             onToggleGitRepoSection: { [weak self] repoID in self?.toggleGitRepoSection(repoID: repoID) },
+            onNewWorktreeTask: { [weak self] in self?.worktreeTaskCoordinator.presentSheet() },
+            onMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(worktreeRoot: root) },
+            onDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(worktreeRoot: root) },
             onRetryGitRepoSection: { [weak self] repoID in self?.retryGitRepoSection(repoID: repoID) },
             onSelectRefFilter: { [weak self] repoID, selection in
                 self?.setGitRefSelection(repoID: repoID, selection: selection)
@@ -1491,6 +1546,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onMissionMapSelectableIDsChange: { [weak self] ids in self?.missionMapSelectableIDsChanged(ids) },
             onMissionMapAllow: { [weak self] requestID in self?.allowApprovalFromMissionMap(requestID) },
             onMissionMapOpenApproval: { [weak self] requestID in self?.openApprovalFromMissionMap(requestID) },
+            onMissionMapMergeWorktreeTask: { [weak self] root in self?.mergeWorktreeTask(worktreeRoot: root) },
+            onMissionMapDiscardWorktreeTask: { [weak self] root in self?.discardWorktreeTask(worktreeRoot: root) },
             onMissionMapKeyCatcherReady: { [weak self] view in self?.missionMapKeyCatcherReady(view) },
             onMissionMapPopoverPlacementChange: { [weak self] placement in
                 self?.missionMapPopoverPlacementChanged(placement)
@@ -1667,6 +1724,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// so libghostty performs its own live-OSC-7-based inheritance
     /// exactly as before this parameter existed.
     ///
+    /// `spawnArgv` (Worktree Tasks): the program the new pane runs
+    /// instead of the user's shell -- the surface `command` on
+    /// `.passthrough`, `attach --argv` flags on `.persistent` (see
+    /// `createManagedSurface`). `nil` launches the shell as before.
+    ///
     /// Thin wrapper resolving `GhosttyAppController.shared.app` and
     /// delegating everything else to `performCreateNewTab` -- same split,
     /// same reason, as `handleNewSplitNotification`/`performSplit`: that
@@ -1674,9 +1736,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// that resolves `app` internally could never be driven end-to-end by
     /// a test. See `performCreateNewTab`'s doc comment for the actual
     /// tab-creation body and its two load-bearing orderings.
-    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil) {
-        guard let app = GhosttyAppController.shared.app else { return }
-        performCreateNewTab(app: app, inheritedConfig: inheritedConfig, host: host, spawnCwd: spawnCwd)
+    ///
+    /// Returns the new tab's leaf surface ID, or nil when no tab was
+    /// created.
+    @discardableResult
+    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil, spawnArgv: [String]? = nil) -> UUID? {
+        guard let app = GhosttyAppController.shared.app else { return nil }
+        return performCreateNewTab(app: app, inheritedConfig: inheritedConfig, host: host, spawnCwd: spawnCwd, spawnArgv: spawnArgv)
     }
 
     /// `createNewTab`'s body, taking `app` directly instead of resolving
@@ -1713,8 +1779,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// keeping the resolution in here, rather than requiring it as a
     /// parameter from the caller, is what makes this method drivable by
     /// a test in the first place.
-    func performCreateNewTab(app: ghostty_app_t, inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil) {
-        guard let window = self.window, let group = windowSession.activeGroup else { return }
+    @discardableResult
+    func performCreateNewTab(app: ghostty_app_t, inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil, spawnArgv: [String]? = nil) -> UUID? {
+        guard let window = self.window, let group = windowSession.activeGroup else { return nil }
 
         let tab = Tab()
         let initialGridSize = focusedTerminalGridSize()
@@ -1731,10 +1798,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             tab: tab, app: app, config: config,
             explicitCwd: Self.normalizedCwdOverride(spawnCwd),
             sessionFallbackCwd: livePaneCwd(of: activeTab?.splitTree.focusedLeafID, in: activeTab),
-            origin: .tab, host: host, initialGridSize: initialGridSize
+            origin: .tab, host: host, initialGridSize: initialGridSize,
+            spawnArgv: spawnArgv
         ) else {
             logger.error("Failed to create surface for new tab")
-            return
+            return nil
         }
 
         tab.splitTree = SplitTree(leafID: surfaceID)
@@ -1752,6 +1820,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         restoreFocus()
         retargetComposeOverlayIfNeeded()
         requestSave()
+        return surfaceID
     }
 
     // MARK: - Cockpit Seams
@@ -3166,6 +3235,27 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             #endif
             if let (herdrTab, herdrGroup) = findTabAndGroup(surfaceID: surfaceID) {
                 closeSurfaceAndCleanUp(tab: herdrTab, group: herdrGroup, surfaceID: surfaceID)
+            }
+            return
+        }
+
+        // Command-hosted auto-close: a passthrough worktree-task pane
+        // (`CommandHostedSurfaces`, registered by `openTaskPane`) was
+        // created with a surface `command`, and ghostty forces
+        // `wait-after-command` on for every such surface
+        // (ghostty/src/apprt/embedded.zig), so ghostty never closes it
+        // itself and shows its "[Process exited]" banner instead. It has
+        // no `SessionSurfaceMap` entry, so `sessionReconnectCoordinator
+        // .childExited` below would no-op too. Closed here synchronously,
+        // before the `childExitedTasks` insert, exactly like the herdr
+        // block above: no daemon round-trip is needed, and the default
+        // `killSessions: true` is safe because there is no session for
+        // `SessionCloseKillPolicy.shouldKill` to act on. The registry
+        // entry is pruned by `.calyxSurfaceDestroyed` when the close
+        // destroys the surface.
+        if CommandHostedSurfaces.shared.contains(surfaceID) {
+            if let (commandTab, commandGroup) = findTabAndGroup(surfaceID: surfaceID) {
+                closeSurfaceAndCleanUp(tab: commandTab, group: commandGroup, surfaceID: surfaceID)
             }
             return
         }
@@ -4900,6 +4990,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         #selector(toggleMissionMap),
         #selector(findNext(_:)),
         #selector(findPrevious(_:)),
+        // Reads the key window's focused pane cwd.
+        #selector(newWorktreeTask(_:)),
     ]
 
     /// "Is THIS window's own `NSWindow` actually the key window" for
@@ -4990,6 +5082,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func newTab(_ sender: Any?) {
         createNewTab()
+    }
+
+    @objc func newWorktreeTask(_ sender: Any?) {
+        worktreeTaskCoordinator.presentSheet()
     }
 
     @objc func closeTab(_ sender: Any?) {
@@ -5171,6 +5267,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     func closeHerdrTrackedSurface(_ surfaceID: UUID) {
         guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
         closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID)
+    }
+
+    /// Closes `surfaceID` if a tab in THIS window owns it, killing its
+    /// persistent session (Worktree Tasks remove the worktree the pane's
+    /// process runs in, so no orphaned daemon session may outlive it). A
+    /// no-op otherwise, so a caller can try every window controller.
+    func closeSurfaceIfOwned(_ surfaceID: UUID) {
+        guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
+        closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID, killSessions: true)
     }
 
     /// Applies a herdr layout-sync ratio mutation to the split identified
@@ -5441,7 +5546,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// The single entry point for every Changes-sidebar refresh. Each
     /// trigger pays only for what its event can have changed; see
     /// `GitSidebarRefreshTrigger`.
-    private func refreshGitSidebar(trigger: GitSidebarRefreshTrigger) {
+    ///
+    /// Internal, not `private`: used by the `WorktreeTaskHost` extension
+    /// (CalyxWindowController+WorktreeTaskHost.swift).
+    func refreshGitSidebar(trigger: GitSidebarRefreshTrigger) {
         switch trigger {
         case .sidebarShown:
             runGitDiscovery(scope: .everySection, isUserInitiated: false)
