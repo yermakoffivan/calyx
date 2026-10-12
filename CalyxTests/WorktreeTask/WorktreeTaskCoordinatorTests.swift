@@ -171,6 +171,9 @@ struct WorktreeTaskCoordinatorTests {
             + " 2>/dev/null || cd; fi; exec '\(shell)' -i -l"
     }
 
+    /// The OSC 7 cwd report `spawnArgv` puts before the agent.
+    private let reportCwd = "printf '\\033]7;kitty-shell-cwd://localhost%s\\007' \"$PWD\"; "
+
     private func pane(_ id: UUID, cwd: String?) -> CockpitPaneInfo {
         CockpitPaneInfo(
             surfaceID: id, windowID: UUID(), groupName: "Default", tabID: UUID(),
@@ -220,7 +223,7 @@ struct WorktreeTaskCoordinatorTests {
         #expect(fixture.host.effectCalls == ["dismissTaskSheet", "openTaskPane", "refreshGitSidebar"])
         #expect(fixture.host.openedPanes.count == 1)
         #expect(fixture.host.openedPanes.first?.cwd == path)
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'claude' 'hi there'" + fallbackTail(fixture, shell: "/bin/zsh")])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", reportCwd + "'claude' 'hi there'" + fallbackTail(fixture, shell: "/bin/zsh")])
         #expect(fixture.host.openedPanes.first?.spawnArgv.last?
             .contains("then cd " + SessionCommandSynthesizer.shSafeToken(fixture.description.location.workTree) + " 2>/dev/null") == true,
             "the fallback is the repository the task was created from")
@@ -242,7 +245,7 @@ struct WorktreeTaskCoordinatorTests {
         )
 
         #expect(fixture.host.openedPanes.first?.cwd == fixture.taskPath("t2"))
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", "'hermes' 'chat'" + fallbackTail(fixture, shell: "/opt/homebrew/bin/bash")])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c", reportCwd + "'hermes' 'chat'" + fallbackTail(fixture, shell: "/opt/homebrew/bin/bash")])
     }
 
     @Test func test_create_paneNotOpened_presentsPaneErrorKeepsWorktreeAndRefreshes() async throws {
@@ -277,7 +280,7 @@ struct WorktreeTaskCoordinatorTests {
             repository: fixture.description
         )
 
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'/bin/sleep' '60'" + fallbackTail(fixture, shell: "/bin/zsh")])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", reportCwd + "'/bin/sleep' '60'" + fallbackTail(fixture, shell: "/bin/zsh")])
     }
 
     @Test func test_create_argumentsGoBetweenProgramAndPrompt() async throws {
@@ -294,7 +297,7 @@ struct WorktreeTaskCoordinatorTests {
 
         #expect(fixture.host.errors.isEmpty, "unexpected errors: \(fixture.host.errors)")
         #expect(fixture.host.openedPanes.first?.spawnArgv
-            == ["/bin/zsh", "-i", "-l", "-c", "'claude' '--model' 'opus' '--' 'hi'" + fallbackTail(fixture, shell: "/bin/zsh")])
+            == ["/bin/zsh", "-i", "-l", "-c", reportCwd + "'claude' '--model' 'opus' '--' 'hi'" + fallbackTail(fixture, shell: "/bin/zsh")])
     }
 
     /// Two creates in quick succession (a double submit) run the service
@@ -326,7 +329,7 @@ struct WorktreeTaskCoordinatorTests {
             repository: fixture.description
         )
 
-        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", "'hermes' 'chat'" + fallbackTail(fixture, shell: "/bin/zsh")])
+        #expect(fixture.host.openedPanes.first?.spawnArgv == ["/bin/zsh", "-i", "-l", "-c", reportCwd + "'hermes' 'chat'" + fallbackTail(fixture, shell: "/bin/zsh")])
     }
 
     // MARK: - UI-test argv override resolution

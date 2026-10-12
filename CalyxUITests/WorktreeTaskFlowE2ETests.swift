@@ -19,11 +19,11 @@
 //   match.
 // - `CALYX_UITEST_WORKTREE_TASK_ARGV` (fields separated by U+001F),
 //   honoured only under `--uitesting`, replaces the agent CLI argv so no
-//   real agent runs. The process reports its cwd via OSC 7 before
-//   sleeping, so the task pane has a known cwd inside the worktree and
-//   merge can find and close it. The stub then exits at once; production
-//   spawns `<agent>; exec <shell> -i -l`, so the pane must continue as an
-//   interactive login shell in the worktree, which the test drives.
+//   real agent runs. The stub only exits; it does not report its cwd.
+//   Production spawns `<OSC 7 cwd report>; <agent>; …; exec <shell> -i -l`,
+//   so the pane's cwd (Mission Map task row, merge closing the pane) must
+//   come from that report, and the pane continues as an interactive login
+//   shell in the worktree, which the test drives.
 
 import XCTest
 
@@ -38,10 +38,7 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
     private var originalTabID: String?
 
     private static let fieldSeparator = "\u{1F}"
-    private static let taskArgv = [
-        "/bin/sh", "-c",
-        "printf '\\033]7;file://localhost%s\\007' \"$PWD\"; exit 0",
-    ]
+    private static let taskArgv = ["/bin/sh", "-c", "exit 0"]
 
     override var additionalLaunchEnvironment: [String: String] {
         [
@@ -171,6 +168,18 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
         let commitOut = shell("echo task > '\(worktreePath)/task.txt' && git -C '\(worktreePath)' add task.txt && git -C '\(worktreePath)' commit -q -m 'task work' && echo committed")
         XCTAssertEqual(commitOut, "committed", "commit in worktree failed: \(commitOut)")
 
+        // The Mission Map card of the task pane must show the task row
+        // (Merge/Discard), which needs the pane cwd reported via OSC 7 by
+        // the production spawn string (the stub agent reports nothing).
+        app.typeKey("m", modifierFlags: [.command, .shift])
+        let mergeTaskButton = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "calyx.missionMap.mergeTaskButton."))
+            .firstMatch
+        XCTAssertTrue(waitFor(mergeTaskButton, timeout: 15),
+                      "the Mission Map must offer Merge on the task pane's card")
+        app.typeKey(.escape, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 1)
+
         // Return to the original tab (shell in the repo) for the merge,
         // since merge closes the task tab.
         if let originalTabID = originalTabIDs.first {
@@ -209,5 +218,67 @@ final class WorktreeTaskFlowE2ETests: CalyxUITestCase {
         XCTAssertTrue(waitForTabCount(originalTabCount, timeout: 15), "the task's tab must close after merge")
         XCTAssertTrue(app.windows.firstMatch.exists, "the window must survive the merge")
         XCTAssertNotEqual(app.state, .notRunning, "the app must still be running")
+
+        // Second task: discard it from the Mission Map.
+        let worktreePath2 = homeDir + "/.calyx/worktrees/" + repoName + "/task-e2e2"
+        if let originalTabID = originalTabIDs.first {
+            element(originalTabID).click()
+            Thread.sleep(forTimeInterval: 1)
+        }
+        pane.click()
+        app.typeKey("n", modifierFlags: [.command, .shift])
+        XCTAssertTrue(waitFor(sheet, timeout: 10), "New Worktree Task sheet should reappear for the second task")
+        XCTAssertTrue(waitFor(branchField))
+        branchField.click()
+        branchField.typeText("task/e2e2")
+        XCTAssertTrue(waitUntil(timeout: 10) { createButton.exists && createButton.isEnabled },
+                      "Create should enable for the second task")
+        createButton.click()
+        XCTAssertTrue(waitForTabCount(originalTabCount + 1, timeout: 15), "the second task must open one new tab")
+        Thread.sleep(forTimeInterval: 2)
+        var taskPwd2 = ""
+        XCTAssertTrue(waitUntil(timeout: 30) {
+            taskPwd2 = self.shell("pwd")
+            return taskPwd2 == worktreePath2
+        }, "the second task pane must be a shell in its worktree; pwd: \(taskPwd2)")
+
+        if let originalTabID = originalTabIDs.first {
+            element(originalTabID).click()
+            Thread.sleep(forTimeInterval: 1)
+            pane.click()
+        }
+        app.typeKey("m", modifierFlags: [.command, .shift])
+        let discardTaskButton = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "calyx.missionMap.discardTaskButton."))
+            .firstMatch
+        XCTAssertTrue(waitFor(discardTaskButton, timeout: 15),
+                      "the Mission Map must offer Discard on the second task's card")
+        discardTaskButton.click()
+
+        var confirmButton: XCUIElement?
+        _ = waitUntil(timeout: 10) {
+            for container in [self.app.sheets.firstMatch, self.app.dialogs.firstMatch] where container.exists {
+                let button = container.buttons["Discard"]
+                if button.exists { confirmButton = button; return true }
+            }
+            return false
+        }
+        XCTAssertNotNil(confirmButton, "a Discard confirmation alert must appear")
+        confirmButton?.click()
+        Thread.sleep(forTimeInterval: 1)
+
+        let mapStillOpen = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "calyx.missionMap."))
+            .firstMatch
+        if mapStillOpen.exists {
+            app.typeKey(.escape, modifierFlags: [])
+            Thread.sleep(forTimeInterval: 1)
+        }
+        pane.click()
+        XCTAssertTrue(waitUntil(timeout: 15) { self.shell("test -d '\(worktreePath2)' || echo gone") == "gone" },
+                      "discard must remove the second task worktree")
+        XCTAssertEqual(shell("git -C '\(repoDir)' branch --list task/e2e2; echo end"), "end",
+                       "discard must delete task/e2e2")
+        XCTAssertTrue(waitForTabCount(originalTabCount, timeout: 15), "the second task's tab must close after discard")
     }
 }

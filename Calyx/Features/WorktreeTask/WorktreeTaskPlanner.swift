@@ -66,7 +66,7 @@ enum WorktreeTaskPlanner {
     /// login shell anyway, but not an interactive one; on `.persistent`
     /// the session daemon execs this argv directly, so `-l` is needed.
     ///
-    /// The `-c` string is `<agent argv>; <cwd fallback>; exec <shell> -i -l`: once the
+    /// The `-c` string is `<OSC 7 cwd report>; <agent argv>; <cwd fallback>; exec <shell> -i -l`: once the
     /// agent exits (any status, e.g. Claude Code's `/exit` or "command
     /// not found"), the pane continues as an interactive login shell in
     /// the same worktree directory instead of leaving a dead pane.
@@ -85,9 +85,24 @@ enum WorktreeTaskPlanner {
     /// remove` on its cwd); otherwise the follow-up shell would start in
     /// a deleted directory and zsh prints `getcwd` errors. If the
     /// fallback is gone too, `cd` goes to `$HOME`.
+    ///
+    /// Before the agent, `printf '\033]7;kitty-shell-cwd://localhost%s\007' "$PWD"`
+    /// reports the start directory with OSC 7. Calyx learns a pane's cwd
+    /// only from OSC 7 (ghostty's `pwd` action), which shell integration
+    /// emits at each prompt; no prompt is shown before the agent starts,
+    /// so without this the pane has no cwd until the agent exits. The
+    /// form copies ghostty's own bash/zsh integration
+    /// (ghostty/src/shell-integration/bash/ghostty.bash,
+    /// zsh/ghostty-integration): the `kitty-shell-cwd` scheme makes
+    /// ghostty take the path raw, unencoded (`raw_path` in
+    /// ghostty/src/termio/stream_handler.zig, `reportPwd`), so paths
+    /// with `%`, `?`, `#` or spaces need no percent-encoding, which a
+    /// `file://` URL would. The host is `localhost`, which
+    /// `internal_os.hostname.isLocal` always accepts.
     static func spawnArgv(launchArgv: [String], loginShell: String, fallbackDirectory: String) -> [String] {
         let agent = launchArgv.map(SessionCommandSynthesizer.shSafeToken).joined(separator: " ")
-        let command = agent
+        let reportCwd = "printf '\\033]7;kitty-shell-cwd://localhost%s\\007' \"$PWD\"; "
+        let command = reportCwd + agent
             + "; if ! [ -d \"$PWD\" ]; then cd " + SessionCommandSynthesizer.shSafeToken(fallbackDirectory)
             + " 2>/dev/null || cd; fi; exec " + SessionCommandSynthesizer.shSafeToken(loginShell) + " -i -l"
         return [loginShell, "-i", "-l", "-c", command]

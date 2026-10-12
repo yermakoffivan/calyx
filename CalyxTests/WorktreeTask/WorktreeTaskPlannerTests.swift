@@ -206,6 +206,16 @@ struct WorktreeTaskPlannerTests {
 
     // MARK: - spawnArgv
 
+    /// The OSC 7 report `spawnArgv` puts before the agent, in the form
+    /// ghostty's own bash/zsh integration emits (`kitty-shell-cwd://`,
+    /// raw unencoded path), with `localhost` as the host.
+    private static let reportCwd = "printf '\\033]7;kitty-shell-cwd://localhost%s\\007' \"$PWD\"; "
+
+    /// The bytes `reportCwd` writes for a shell whose `$PWD` is `path`.
+    private static func osc7(_ path: String) -> String {
+        "\u{1B}]7;kitty-shell-cwd://localhost" + path + "\u{07}"
+    }
+
     @Test func test_spawnArgv_wrapsInInteractiveLoginShellExecWithEveryTokenQuoted() {
         let argv = WorktreeTaskPlanner.spawnArgv(
             launchArgv: ["claude", "fix Bob's bug\nthen test"],
@@ -213,7 +223,7 @@ struct WorktreeTaskPlannerTests {
             fallbackDirectory: "/Users/me/repo"
         )
         #expect(argv == ["/bin/zsh", "-i", "-l", "-c",
-                         "'claude' 'fix Bob'\\''s bug\nthen test'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l"])
+                         Self.reportCwd + "'claude' 'fix Bob'\\''s bug\nthen test'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l"])
     }
 
     @Test func test_spawnArgv_bareArgvAndOtherShell() {
@@ -221,14 +231,14 @@ struct WorktreeTaskPlannerTests {
             launchArgv: ["hermes", "chat"], loginShell: "/opt/homebrew/bin/bash", fallbackDirectory: "/r"
         )
         #expect(argv == ["/opt/homebrew/bin/bash", "-i", "-l", "-c",
-                         "'hermes' 'chat'; if ! [ -d \"$PWD\" ]; then cd '/r' 2>/dev/null || cd; fi; exec '/opt/homebrew/bin/bash' -i -l"])
+                         Self.reportCwd + "'hermes' 'chat'; if ! [ -d \"$PWD\" ]; then cd '/r' 2>/dev/null || cd; fi; exec '/opt/homebrew/bin/bash' -i -l"])
     }
 
     @Test func test_spawnArgv_fallbackDirectoryWithQuoteAndSpaceIsQuoted() {
         let argv = WorktreeTaskPlanner.spawnArgv(
             launchArgv: ["claude"], loginShell: "/bin/zsh", fallbackDirectory: "/Users/me/Bob's repo"
         )
-        #expect(argv.last == "'claude'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/Bob'\\''s repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l")
+        #expect(argv.last == Self.reportCwd + "'claude'; if ! [ -d \"$PWD\" ]; then cd '/Users/me/Bob'\\''s repo' 2>/dev/null || cd; fi; exec '/bin/zsh' -i -l")
     }
 
     /// Writes a stub agent named `claude` (prints its argv NUL-separated,
@@ -305,6 +315,13 @@ struct WorktreeTaskPlannerTests {
     /// Splits stub output into the agent's argv and asserts the login
     /// shell marker follows it (the shell starts after the agent exits).
     private func agentArgvThenShell(_ text: String, _ comment: Comment) -> [String] {
+        // Drop the leading OSC 7 cwd report (asserted separately).
+        var text = text
+        let oscPrefix = "\u{1B}]7;kitty-shell-cwd://localhost"
+        #expect(text.hasPrefix(oscPrefix), comment)
+        if text.hasPrefix(oscPrefix), let bell = text.firstIndex(of: "\u{07}") {
+            text = String(text[text.index(after: bell)...])
+        }
         let marker = "SHELL-STARTED"
         #expect(text.hasSuffix(marker), comment)
         var tokens = String(text.dropLast(text.hasSuffix(marker) ? marker.count : 0)).components(separatedBy: "\0")
@@ -324,6 +341,33 @@ struct WorktreeTaskPlannerTests {
         for status: Int32 in [0, 1, 127] {
             let text = try runThroughGhosttyLayer(argv, stubDir: stubs.dir, agentExit: status)
             #expect(agentArgvThenShell(text, "exit \(status)") == launch, "exit \(status)")
+        }
+    }
+
+    /// Before the agent runs, the `-c` string reports the start directory
+    /// with OSC 7, so Calyx learns the pane cwd without waiting for a
+    /// prompt (none is shown until the agent exits).
+    @Test func test_spawnArgv_reportsStartDirectoryViaOSC7BeforeAgentRuns() throws {
+        let stubs = try makeStubs()
+        defer { try? FileManager.default.removeItem(at: stubs.dir) }
+        let worktree = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-osc7-\(UUID().uuidString)")
+            .appendingPathComponent("Bob's tree")
+        try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: worktree.deletingLastPathComponent()) }
+        let launch = ["claude", "hi"]
+        let argv = WorktreeTaskPlanner.spawnArgv(launchArgv: launch, loginShell: stubs.shell, fallbackDirectory: "/")
+
+        let result = try runThroughGhosttyLayerCapturing(argv, stubDir: stubs.dir, cwd: worktree)
+
+        let report = Self.osc7(realpathString(worktree.path))
+        let agentDump = launch.map { $0 + "\0" }.joined()
+        let reportRange = result.stdout.range(of: report)
+        let agentRange = result.stdout.range(of: agentDump)
+        #expect(reportRange != nil, "stdout: \(result.stdout.debugDescription)")
+        #expect(agentRange != nil, "stdout: \(result.stdout.debugDescription)")
+        if let reportRange, let agentRange {
+            #expect(reportRange.upperBound <= agentRange.lowerBound, "stdout: \(result.stdout.debugDescription)")
         }
     }
 
