@@ -1,13 +1,14 @@
 // AgentHookScriptPrologue.swift
 // Calyx
 //
-// The opening section both Calyx hook scripts start with:
-// `calyx-agent-hook` (AgentHookScript.swift) and `calyx-approval-hook`
-// (ApprovalHookScript.swift). Any future Calyx hook script must start
+// The opening section all three Calyx hook scripts start with:
+// `calyx-agent-hook` (AgentHookScript.swift), `calyx-approval-hook`
+// (ApprovalHookScript.swift) and `calyx-ipc-wake-hook`
+// (IPCWakeHookScript.swift). Any future Calyx hook script must start
 // with it too. It decides whether this hook invocation belongs to a
-// Calyx pane at all, and if so resolves which local IPC endpoint to
-// talk to. Written once here and interpolated into each script's body,
-// so the guards cannot drift apart between scripts.
+// Calyx pane at all, and if so resolves which local IPC endpoint to talk
+// to. Written once here and interpolated into each script's body, so the
+// guards cannot drift apart between scripts.
 //
 // Properties each script relies on:
 // - Every path out of the prologue is `exit 0`: a hook that has

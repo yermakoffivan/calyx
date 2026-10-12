@@ -25,8 +25,10 @@ import Foundation
 
 struct IPCWakeResponse: Sendable, Equatable {
 
-    /// What every note starts with: a fixed literal, so the client
-    /// long-polling `/ipc-wake` can recognise a note by its first bytes.
+    /// What every note starts with: a fixed literal, so
+    /// `calyx-ipc-wake-hook` (`IPCWakeHookScript`), the client
+    /// long-polling `/ipc-wake`, can recognise a note by its first
+    /// bytes.
     static let notePrefix = "Calyx IPC: "
 
     let note: String

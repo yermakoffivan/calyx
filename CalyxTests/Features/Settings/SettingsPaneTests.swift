@@ -42,6 +42,9 @@
 //  USAGE TRACKING: a `usageTracking` row follows `agentHookApproval` on
 //  the Agents pane; it toggles UsageTrackingSettings.enabled.
 //
+//  IPC WAKE: an `ipcWake` row follows `agentIPC` on the Agents pane, in
+//  that row's "AI Agent IPC" group; it toggles IPCWakeSettings.enabled.
+//
 //  MCP APPS HOST: a new MCP Servers pane follows Agents (plan section 11,
 //  contract v2 section 13), holding a single `mcpServers` row that hosts
 //  the whole pane.
@@ -97,6 +100,7 @@ final class SettingsPaneTests: XCTestCase {
         ("persistentSessions", .sessions),
         ("historyPersistence", .sessions),
         ("agentIPC", .agents),
+        ("ipcWake", .agents),
         ("agentResume", .agents),
         ("agentResumeAutoExecute", .agents),
         ("cockpitAutoApprove", .agents),

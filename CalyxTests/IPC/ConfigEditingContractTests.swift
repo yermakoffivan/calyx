@@ -368,6 +368,7 @@ final class ConfigEditingContractTests: XCTestCase {
                 try ClaudeHooksConfigManager.installHooks(
                     scriptPath: "/opt/calyx/bin/calyx-agent-hook",
                     approvalScriptPath: "/opt/calyx/bin/calyx-approval-hook",
+                    wakeScriptPath: "/opt/calyx/bin/calyx-ipc-wake-hook",
                     configPath: root + "/settings.json"
                 )
             },
@@ -603,6 +604,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try ClaudeHooksConfigManager.installHooks(
                         scriptPath: "/opt/calyx/bin/calyx-agent-hook",
                         approvalScriptPath: "/opt/calyx/bin/calyx-approval-hook",
+                        wakeScriptPath: "/opt/calyx/bin/calyx-ipc-wake-hook",
                         configPath: root + "/settings.json"
                     )
                 },
@@ -627,6 +629,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try ClaudeHooksConfigManager.installHooks(
                         scriptPath: "/opt/calyx/bin/calyx-agent-hook",
                         approvalScriptPath: "/opt/calyx/bin/calyx-approval-hook",
+                        wakeScriptPath: "/opt/calyx/bin/calyx-ipc-wake-hook",
                         configPath: root + "/settings.json"
                     )
                 },
@@ -675,6 +678,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try ClaudeHooksConfigManager.installHooks(
                         scriptPath: "/opt/calyx/bin/calyx-agent-hook",
                         approvalScriptPath: "/opt/calyx/bin/calyx-approval-hook",
+                        wakeScriptPath: "/opt/calyx/bin/calyx-ipc-wake-hook",
                         configPath: root + "/settings.json"
                     )
                 },
@@ -1282,6 +1286,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try ClaudeHooksConfigManager.installHooks(
                         scriptPath: "/opt/calyx/bin/calyx-agent-hook",
                         approvalScriptPath: "/opt/calyx/bin/calyx-approval-hook",
+                        wakeScriptPath: "/opt/calyx/bin/calyx-ipc-wake-hook",
                         configPath: root + "/settings.json"
                     )
                 },

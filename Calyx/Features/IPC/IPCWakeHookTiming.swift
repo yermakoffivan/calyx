@@ -2,12 +2,12 @@
 // Calyx
 //
 // Single source of truth for the timing constants that must nest
-// strictly inside one another for one `/ipc-wake` long-poll: Calyx's
-// own `POST /ipc-wake` long-poll timeout must resolve before the curl
-// `-m` deadline of the client long-polling `/ipc-wake` gives up on it,
-// which itself must fire before the CLI's own hook-entry timeout kills
-// that client outright. Same shape, and the same reasoning, as
-// `ApprovalHookTiming`:
+// strictly inside one another for one `/ipc-wake` long-poll: Calyx's own
+// `POST /ipc-wake` long-poll timeout must resolve before the curl `-m`
+// deadline of `calyx-ipc-wake-hook` (`IPCWakeHookScript`), the client
+// long-polling `/ipc-wake`, gives up on it, which itself must fire
+// before the CLI's own hook-entry timeout kills that client outright.
+// Same shape, and the same reasoning, as `ApprovalHookTiming`:
 //
 // - If curl's timeout were <= the server's, curl would give up while
 //   Calyx is still legitimately holding the poll open, and the client
@@ -23,12 +23,13 @@
 // So the invariant this file exists to enforce is:
 //     serverTimeoutMs < curlTimeoutSeconds * 1000 < hookEntryTimeoutSeconds * 1000
 //
-// A pane is wakeable only while a client is long-polling `/ipc-wake`
-// for it, and one poll lasts at most `holdSeconds` (about ten minutes):
-// once the hook entry's timeout has passed, nothing is left to receive
-// a wake until another poll starts. `IPCStore.peerTTL` is also
-// 600s, so lengthening the hold alone would not help: a peer nobody has
-// heard from for that long is no longer alive in the store either.
+// A pane is wakeable only while a `calyx-ipc-wake-hook` process is
+// long-polling `/ipc-wake` for it, and one poll lasts at most
+// `holdSeconds` (about ten minutes): once the hook entry's timeout has
+// passed, nothing is left to receive a wake until another poll starts.
+// `IPCStore.peerTTL` has the same length, and a peer nobody has heard
+// from for that long expires unless a message to or from it is still
+// undelivered (see `IPCStore`'s liveness rule).
 //
 // See IPCWakeHookTimingTests.test_nestingInvariant_serverBeforeCurlBeforeHookEntry
 // for the specced ordering assertions.
@@ -49,16 +50,19 @@ enum IPCWakeHookTiming {
     /// before curl's own deadline below would otherwise give up on it.
     static let serverTimeoutMs = holdSeconds * 1000 - 30_000
 
-    /// The curl `-m` deadline of the client long-polling `/ipc-wake`,
-    /// in seconds. 15s of margin under `holdSeconds` so curl gives up
-    /// on its own strictly after the server has already answered, and
-    /// strictly before the CLI's own hook-entry timeout below would
-    /// instead kill the client outright, uncontrolled.
+    /// The curl `-m` deadline of `calyx-ipc-wake-hook`
+    /// (`IPCWakeHookScript.scriptBody` interpolates it), in seconds. 15s
+    /// of margin under `holdSeconds` so curl gives up on its own
+    /// strictly after the server has already answered, and strictly
+    /// before the CLI's own hook-entry timeout below would instead kill
+    /// the client outright, uncontrolled.
     static let curlTimeoutSeconds = holdSeconds - 15
 
-    /// The CLI's own hook-entry timeout that kills the polling client
-    /// if it hasn't exited by then -- restated here (equal to
-    /// `holdSeconds`) purely so every link of the nesting invariant has
-    /// its own named constant to compare against.
+    /// The CLI's own hook-entry timeout that kills the polling client if
+    /// it hasn't exited by then: the `timeout` of the wake entry
+    /// `ClaudeHooksConfigManager` writes for `Stop` and `SessionStart`.
+    /// Restated here (equal to `holdSeconds`) purely so every link of
+    /// the nesting invariant has its own named constant to compare
+    /// against.
     static let hookEntryTimeoutSeconds = holdSeconds
 }

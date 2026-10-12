@@ -151,6 +151,7 @@ enum AccessibilityID {
         static let agentIPCSwitch = "calyx.settings.agents.agentIPCSwitch"
         static let agentIPCRefreshButton = "calyx.settings.agents.agentIPCRefreshButton"
         static let agentIPCStatusLabel = "calyx.settings.agents.agentIPCStatusLabel"
+        static let ipcWakeSwitch = "calyx.settings.agents.ipcWakeSwitch"
         static let usageTrackingSwitch = "calyx.settings.agents.usageTrackingSwitch"
         static let usageTrackingStatusLabel = "calyx.settings.agents.usageTrackingStatusLabel"
     }

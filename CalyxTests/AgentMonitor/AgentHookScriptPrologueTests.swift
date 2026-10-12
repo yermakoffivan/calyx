@@ -3,10 +3,12 @@
 //  CalyxTests
 //
 //  Covers AgentHookScriptPrologue: the opening section shared by the
-//  generated `calyx-agent-hook` and `calyx-approval-hook` /bin/sh scripts
-//  (see AgentHookScriptTests.swift and ApprovalHookScriptTests.swift).
-//  That section used to be written out twice, once per script; it is one
-//  constant now, and both scripts interpolate it. These tests check that
+//  three generated /bin/sh hook scripts, `calyx-agent-hook`,
+//  `calyx-approval-hook` and `calyx-ipc-wake-hook` (see
+//  AgentHookScriptTests.swift, ApprovalHookScriptTests.swift and
+//  IPCWakeHookScriptTests.swift). That section used to be written out
+//  once per script; it is one constant now, and all three scripts
+//  interpolate it. These tests check that
 //  each script's text contains the prologue's text verbatim exactly once,
 //  that the prologue's executable lines are the pinned ones in order, and
 //  where the prologue sits relative to the shebang and the first curl
@@ -18,10 +20,11 @@
 //    indentation ignored) are exactly the surface/session guard, the
 //    herdr guard, the kind default, the Grok guard, the endpoint-file
 //    read, and the port/token extraction with its empty check, in order
-//  - AgentHookScript.scriptBody and ApprovalHookScript.scriptBody each
-//    contain the prologue verbatim, exactly once
-//  - in both scripts the prologue sits after the shebang line and ends
-//    before the first curl invocation line
+//  - AgentHookScript.scriptBody, ApprovalHookScript.scriptBody and
+//    IPCWakeHookScript.scriptBody each contain the prologue verbatim,
+//    exactly once
+//  - in all three scripts the prologue sits after the shebang line and
+//    ends before the first curl invocation line
 //  - the prologue itself runs no curl, sets no trap, and creates no temp
 //    file: it is only guards and endpoint resolution
 //
@@ -122,7 +125,7 @@ final class AgentHookScriptPrologueTests: XCTestCase {
 
         XCTAssertEqual(
             executableLines(of: AgentHookScriptPrologue.body), expected,
-            "The shared prologue must execute exactly the lines both hook scripts opened with " +
+            "The shared prologue must execute exactly the lines the hook scripts opened with " +
             "before it was extracted, in the same order"
         )
     }
@@ -140,7 +143,7 @@ final class AgentHookScriptPrologueTests: XCTestCase {
         }
     }
 
-    // MARK: - Both scripts interpolate the prologue
+    // MARK: - Every script interpolates the prologue
 
     func test_agentHookScriptBody_containsThePrologueVerbatimExactlyOnce() {
         XCTAssertEqual(
@@ -156,6 +159,13 @@ final class AgentHookScriptPrologueTests: XCTestCase {
         )
     }
 
+    func test_ipcWakeHookScriptBody_containsThePrologueVerbatimExactlyOnce() {
+        XCTAssertEqual(
+            occurrences(of: AgentHookScriptPrologue.body, in: IPCWakeHookScript.scriptBody), 1,
+            "calyx-ipc-wake-hook must contain the shared prologue verbatim, exactly once"
+        )
+    }
+
     // MARK: - Prologue position inside each script
 
     func test_agentHookScriptBody_placesThePrologueAfterTheShebangAndBeforeTheFirstCurl() {
@@ -167,6 +177,12 @@ final class AgentHookScriptPrologueTests: XCTestCase {
     func test_approvalHookScriptBody_placesThePrologueAfterTheShebangAndBeforeTheFirstCurl() {
         assertPrologueSitsBetweenShebangAndFirstCurl(
             in: ApprovalHookScript.scriptBody, scriptName: "calyx-approval-hook"
+        )
+    }
+
+    func test_ipcWakeHookScriptBody_placesThePrologueAfterTheShebangAndBeforeTheFirstCurl() {
+        assertPrologueSitsBetweenShebangAndFirstCurl(
+            in: IPCWakeHookScript.scriptBody, scriptName: "calyx-ipc-wake-hook"
         )
     }
 }

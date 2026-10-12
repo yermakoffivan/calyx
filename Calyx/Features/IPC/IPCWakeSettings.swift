@@ -36,8 +36,12 @@ struct IPCWakeSettings: Sendable {
     /// registering a waiter while this is `false`, and
     /// `IPCWakeCoordinator`'s default `isEnabled` reads it at the start
     /// of every check, which does nothing while it is `false`. Nothing
-    /// observes a change of this value: a waiter registered before it
-    /// turned `false` stays until it times out or is released.
+    /// observes a change of this value, so assigning it triggers
+    /// nothing by itself: a waiter registered before it turned `false`
+    /// stays until it times out or is released. The Settings switch
+    /// does that release itself: when it turns the setting off,
+    /// `SettingsWindowController.ipcWakeDidChange` writes this value and
+    /// then releases every waiter.
     /// Documented default: `false` when the key has never been written.
     static var enabled: Bool {
         get {

@@ -124,13 +124,14 @@ enum AgentHookScript {
 
     /// Shared installer body: writes `body` to `fileName` inside
     /// `directory` (creating it if needed) and marks it executable
-    /// (0755), returning the script's absolute path. Used by both
-    /// `AgentHookScript.install(toDirectory:)` above and
-    /// `ApprovalHookScript.install(toDirectory:)`, so the actual
-    /// write logic exists in exactly one place. Routes through
+    /// (0755), returning the script's absolute path. Used by
+    /// `AgentHookScript.install(toDirectory:)` above,
+    /// `ApprovalHookScript.install(toDirectory:)` and
+    /// `IPCWakeHookScript.install(toDirectory:)`, so the actual write
+    /// logic exists in exactly one place. Routes through
     /// `ConfigFileUtils.withExclusiveConfig`, which resolves the
-    /// script's path, takes its exclusive lock, and writes atomically
-    /// at 0755 -- the mode an agent CLI executes -- applied to the temp
+    /// script's path, takes its exclusive lock, and writes atomically at
+    /// 0755 -- the mode an agent CLI executes -- applied to the temp
     /// file before the rename inside the lock, so no other process can
     /// observe or race an intermediate permission state.
     static func installScript(body: String, fileName: String, toDirectory directory: String) throws -> String {

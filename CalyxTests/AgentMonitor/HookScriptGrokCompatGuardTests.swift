@@ -2,16 +2,19 @@
 //  HookScriptGrokCompatGuardTests.swift
 //  CalyxTests
 //
-//  Coverage for the Grok compatibility guard both hook scripts carry.
+//  Coverage for the Grok compatibility guard every Calyx hook script
+//  carries: calyx-agent-hook, calyx-approval-hook and calyx-ipc-wake-hook.
 //
 //  Grok scans `~/.claude/settings.json` for hooks by default
 //  (`[compat.claude] hooks = true`), so Calyx's Claude Code entries --
 //  which invoke the scripts with no kind argument and therefore resolve
 //  to claude-code -- also fire inside a Grok session. Left alone, a Grok
-//  pane would post state events attributed to Claude Code, and its
+//  pane would post state events attributed to Claude Code, its
 //  approval hook would print a Claude-shaped
 //  `hookSpecificOutput.decision` body that Grok's own decision vocabulary
-//  (`{"decision":"allow"}`) does not recognize.
+//  (`{"decision":"allow"}`) does not recognize, and its wake hook would
+//  hold a `/ipc-wake` long-poll open for a pane that is not running
+//  Claude Code.
 //
 //  The guard uses `GROK_HOOK_EVENT`, a reserved variable Grok's hook
 //  runner injects into every hook process and strips from any
@@ -25,8 +28,11 @@
 //  Every assertion here is about curl's invocation count, driven through
 //  the shared FakeCurlScriptFixture harness (a real /bin/sh child
 //  process with a fake curl ahead of the real one on PATH), following
-//  AgentHookScriptHerdrGuardTests' precedent: curl runs in the script's
-//  own foreground, so waitUntilExit already settles whether it ran.
+//  AgentHookScriptHerdrGuardTests' precedent: each script either runs
+//  curl in its own foreground or backgrounds it and `wait`s for it, so
+//  waitUntilExit already settles whether it ran. The fake curl prints
+//  nothing, which calyx-ipc-wake-hook reads as "no wake": it exits 0
+//  after its one curl run, like the other two.
 //
 
 import XCTest
@@ -59,6 +65,9 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
     private let agentHook = HookScript(name: "calyx-agent-hook", install: AgentHookScript.install(toDirectory:))
     private let approvalHook = HookScript(
         name: "calyx-approval-hook", install: ApprovalHookScript.install(toDirectory:)
+    )
+    private let wakeHook = HookScript(
+        name: "calyx-ipc-wake-hook", install: IPCWakeHookScript.install(toDirectory:)
     )
 
     /// Installs `script` into a fresh fixture, runs it once with
@@ -117,8 +126,18 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
                        "Grok understands")
     }
 
-    func test_bothScripts_explicitClaudeCodeKind_insideGrokSession_doNotPost() throws {
-        for script in [agentHook, approvalHook] {
+    func test_wakeHook_claudeCodeDefaultKind_insideGrokSession_exitsZeroWithoutPosting() throws {
+        let result = try run(wakeHook, kindArgument: nil, extraEnv: ["GROK_HOOK_EVENT": grokHookEventValue])
+
+        XCTAssertEqual(result.exitCode, 0, "The guard must exit cleanly, never break the user's hook chain")
+        XCTAssertEqual(result.curlInvocations, 0,
+                       "The wake hook must not start a /ipc-wake long-poll from inside a Grok session: " +
+                       "the pane it would be polling for is not running Claude Code, and the script's " +
+                       "exit code 2 with a note on stderr is shaped for Claude Code alone")
+    }
+
+    func test_everyScript_explicitClaudeCodeKind_insideGrokSession_doNotPost() throws {
+        for script in [agentHook, approvalHook, wakeHook] {
             let result = try run(
                 script, kindArgument: AgentEntry.claudeCodeKind,
                 extraEnv: ["GROK_HOOK_EVENT": grokHookEventValue]
@@ -133,8 +152,8 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
 
     // MARK: - Counter-pins: everything else still posts
 
-    func test_bothScripts_grokKind_insideGrokSession_stillPost() throws {
-        for script in [agentHook, approvalHook] {
+    func test_everyScript_grokKind_insideGrokSession_stillPost() throws {
+        for script in [agentHook, approvalHook, wakeHook] {
             let result = try run(
                 script, kindArgument: AgentEntry.grokKind,
                 extraEnv: ["GROK_HOOK_EVENT": grokHookEventValue]
@@ -148,8 +167,8 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
         }
     }
 
-    func test_bothScripts_claudeCodeOutsideGrok_stillPost() throws {
-        for script in [agentHook, approvalHook] {
+    func test_everyScript_claudeCodeOutsideGrok_stillPost() throws {
+        for script in [agentHook, approvalHook, wakeHook] {
             let result = try run(script, kindArgument: nil, extraEnv: [:])
 
             XCTAssertEqual(result.exitCode, 0, "[\(script.name)]")
@@ -160,8 +179,8 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
         }
     }
 
-    func test_bothScripts_claudeCodeWithEmptyGrokHookEvent_stillPost() throws {
-        for script in [agentHook, approvalHook] {
+    func test_everyScript_claudeCodeWithEmptyGrokHookEvent_stillPost() throws {
+        for script in [agentHook, approvalHook, wakeHook] {
             let result = try run(script, kindArgument: nil, extraEnv: ["GROK_HOOK_EVENT": ""])
 
             XCTAssertEqual(result.exitCode, 0, "[\(script.name)]")
@@ -172,8 +191,8 @@ final class HookScriptGrokCompatGuardTests: XCTestCase {
         }
     }
 
-    func test_bothScripts_otherKindsInsideGrokSession_stillPost() throws {
-        for script in [agentHook, approvalHook] {
+    func test_everyScript_otherKindsInsideGrokSession_stillPost() throws {
+        for script in [agentHook, approvalHook, wakeHook] {
             let result = try run(
                 script, kindArgument: AgentEntry.codexKind,
                 extraEnv: ["GROK_HOOK_EVENT": grokHookEventValue]

@@ -10,7 +10,15 @@
 //
 //  Coverage:
 //  - installHooks on an empty/new file writes all 10 target events, each
-//    with a command entry (type=command, timeout, async=true)
+//    with a monitor command entry (type=command, timeout, async=true)
+//  - Stop and SessionStart alone carry a second entry after the monitor
+//    entry: the wake entry for calyx-ipc-wake-hook (timeout 600,
+//    async=true, asyncRewake=true); no other event carries one
+//  - a config written before the wake entry existed is upgraded by
+//    installHooks: afterwards one Calyx group per event, [monitor, wake]
+//    on Stop and SessionStart, no duplicated monitor entry, the user's
+//    own group still present and unchanged, and the other eight events'
+//    groups as they were
 //  - PreToolUse / PostToolUse / PermissionRequest use matcher
 //    "*"; Notification uses matcher "permission_prompt"
 //  - installHooks preserves the user's own existing hook entries and
@@ -19,8 +27,13 @@
 //    no-op reinstall -- content already matches -- never rewrites
 //    settings.json, since withExclusiveConfig writes nothing when the
 //    transformed bytes equal what was read)
+//  - a reinstall leaves the file's bytes identical with the wake
+//    entries in place, also when the user has their own group on Stop
+//    and on SessionStart
 //  - removeHooks removes only Calyx's own entries, identified by command
-//    path, leaving co-located user hooks untouched
+//    path (calyx-agent-hook, calyx-approval-hook, calyx-ipc-wake-hook),
+//    leaving co-located user hooks untouched
+//  - areHooksInstalled recognizes a wake entry alone
 //  - symlink config path is rejected
 //  - no backup file of the pre-install content is ever created
 //
@@ -36,6 +49,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     private var configPath: String!
     private var scriptPath: String!
     private var approvalScriptPath: String!
+    private var wakeScriptPath: String!
 
     // PermissionRequest fires in sync with the permission dialog
     // appearing, unlike Notification(permission_prompt) which can lag
@@ -72,6 +86,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         configPath = tempDir + "/settings.json"
         scriptPath = tempDir + "/bin/calyx-agent-hook"
         approvalScriptPath = tempDir + "/bin/calyx-approval-hook"
+        wakeScriptPath = tempDir + "/bin/calyx-ipc-wake-hook"
     }
 
     override func tearDown() {
@@ -109,16 +124,76 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         groups.flatMap { ($0["hooks"] as? [[String: Any]]) ?? [] }
     }
 
+    // The two events whose Calyx group carries the wake entry after the
+    // monitor entry.
+    private static let wakeEvents = ["Stop", "SessionStart"]
+
+    // The three script file names by which a command entry is Calyx's
+    // own, written out literally so that these tests do not follow a
+    // renamed constant.
+    private static let calyxScriptFileNames: Set<String> = [
+        "calyx-agent-hook", "calyx-approval-hook", "calyx-ipc-wake-hook",
+    ]
+
+    // How many Calyx command entries one event carries: monitor + wake
+    // for Stop and SessionStart, monitor + approval for
+    // PermissionRequest, the monitor entry alone for the other seven.
+    private func expectedCalyxEntryCount(for eventName: String) -> Int {
+        Self.wakeEvents.contains(eventName) || eventName == "PermissionRequest" ? 2 : 1
+    }
+
+    private var monitorCommand: String { "\"\(scriptPath!)\"" }
+    private var approvalCommand: String { "\"\(approvalScriptPath!)\"" }
+    private var wakeCommand: String { "\"\(wakeScriptPath!)\"" }
+
+    private var monitorEntry: [String: Any] {
+        ["type": "command", "command": monitorCommand, "timeout": 5, "async": true]
+    }
+
+    private var approvalEntry: [String: Any] {
+        ["type": "command", "command": approvalCommand, "timeout": 600]
+    }
+
+    private var wakeEntry: [String: Any] {
+        ["type": "command", "command": wakeCommand, "timeout": 600, "async": true, "asyncRewake": true]
+    }
+
+    // Whether a command entry names one of Calyx's three scripts: the
+    // last path component of its command, with one pair of surrounding
+    // double quotes taken off.
+    private func isCalyxEntry(_ entry: [String: Any]) -> Bool {
+        guard var command = entry["command"] as? String else { return false }
+        if command.hasPrefix("\""), command.hasSuffix("\""), command.count >= 2 {
+            command = String(command.dropFirst().dropLast())
+        }
+        return Self.calyxScriptFileNames.contains((command as NSString).lastPathComponent)
+    }
+
+    // The groups of one event holding at least one Calyx entry.
+    private func calyxGroups(_ groups: [[String: Any]]) -> [[String: Any]] {
+        groups.filter { group in
+            ((group["hooks"] as? [[String: Any]]) ?? []).contains { isCalyxEntry($0) }
+        }
+    }
+
+    // Whether a decoded JSON value is the boolean `true` itself, not a
+    // number that merely compares equal to it.
+    private func isJSONTrue(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID() && number.boolValue
+    }
+
     // MARK: - installHooks: fresh file
 
     // PreToolUse's Calyx-owned group carries only the async monitor
     // entry. PermissionRequest's carries both that same monitor entry
     // and a second, synchronous approval entry (calyx-approval-hook)
     // that blocks the tool call until Calyx's own /approval-request
-    // long-poll resolves -- every other event still gets exactly one
-    // command entry.
+    // long-poll resolves. Stop's and SessionStart's carry the monitor
+    // entry and the wake entry (calyx-ipc-wake-hook). The other seven
+    // events get exactly one command entry.
     func test_installHooks_newFile_writesAllTenEventsWithCommandEntry() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
 
@@ -133,18 +208,18 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
 
             let commands = commandEntries(groups)
 
-            if eventName == "PermissionRequest" {
-                XCTAssertEqual(commands.count, 2,
-                               "PermissionRequest must contain both the async monitor entry and the " +
-                               "sync approval entry")
-                continue
-            }
+            let expectedCount = expectedCalyxEntryCount(for: eventName)
+            XCTAssertEqual(commands.count, expectedCount,
+                           "\(eventName) must contain exactly \(expectedCount) command entry(ies): the " +
+                           "monitor entry, plus the wake entry for Stop and SessionStart and the " +
+                           "approval entry for PermissionRequest")
 
-            XCTAssertEqual(commands.count, 1, "\(eventName) must contain exactly one command entry")
-            let entry = commands.first ?? [:]
+            let monitorEntries = commands.filter { ($0["command"] as? String) == monitorCommand }
+            XCTAssertEqual(monitorEntries.count, 1, "\(eventName) must contain exactly one monitor entry")
+            let entry = monitorEntries.first ?? [:]
             XCTAssertEqual(entry["type"] as? String, "command")
-            XCTAssertNotNil(entry["timeout"], "\(eventName) command entry must specify a timeout")
-            XCTAssertEqual(entry["async"] as? Bool, true, "\(eventName) command entry must be async")
+            XCTAssertNotNil(entry["timeout"], "\(eventName) monitor entry must specify a timeout")
+            XCTAssertEqual(entry["async"] as? Bool, true, "\(eventName) monitor entry must be async")
         }
     }
 
@@ -155,7 +230,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     // approval), unified with PreToolUse/PostToolUse's "*" matcher
     // rather than left without one.
     func test_installHooks_permissionRequest_hasWildcardMatcherAndTwoCommandEntries() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let groups = hookGroups(dict, event: "PermissionRequest")
@@ -185,7 +260,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let preToolUseGroups = hookGroups(dict, event: "PreToolUse")
@@ -204,16 +279,16 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     // MARK: - installHooks: idempotency
 
     func test_installHooks_reinstall_isIdempotent() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
         let beforeModificationDate = try FileManager.default.attributesOfItem(atPath: configPath)[.modificationDate] as? Date
         Thread.sleep(forTimeInterval: 0.2)
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
 
         for eventName in Self.expectedEvents {
             let commands = commandEntries(hookGroups(dict, event: eventName))
-            let expectedCount = eventName == "PermissionRequest" ? 2 : 1
+            let expectedCount = expectedCalyxEntryCount(for: eventName)
             XCTAssertEqual(commands.count, expectedCount,
                            "\(eventName) must contain exactly \(expectedCount) Calyx hook entry(ies) " +
                            "after reinstalling twice")
@@ -240,7 +315,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     // fires for every tool call regardless of whether it needs approval)
     // avoids a synchronous POST on every single tool call.
     func test_installHooks_permissionRequest_writesMonitorAndApprovalEntriesWithCorrectShapes() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let commands = commandEntries(hookGroups(dict, event: "PermissionRequest"))
@@ -264,7 +339,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     }
 
     func test_installHooks_permissionRequestApprovalEntry_hasNoAsyncKeyAndCorrectTimeout() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let commands = commandEntries(hookGroups(dict, event: "PermissionRequest"))
@@ -281,7 +356,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     // MARK: - PreToolUse carries only the monitor entry
 
     func test_installHooks_preToolUse_hasOnlyMonitorEntry_noApprovalEntry() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let commands = commandEntries(hookGroups(dict, event: "PreToolUse"))
@@ -308,7 +383,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let groups = hookGroups(dict, event: "PreToolUse")
@@ -352,7 +427,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
 
@@ -412,7 +487,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
         try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
 
         let dict = try readConfigDict()
@@ -495,7 +570,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let afterInstall = try readConfigDict()
         let installedCommands = commandEntries(hookGroups(afterInstall, event: "PermissionRequest"))
@@ -518,7 +593,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         // The 10 events installHooks writes only ever contain Calyx's own
         // entry in a fresh install, so removing them should leave neither
         // a dangling "EventName": [] nor an empty "hooks": {} behind.
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
 
@@ -566,7 +641,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(originalConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
         try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
 
         let dict = try readConfigDict()
@@ -597,7 +672,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let realFileData = try Data(contentsOf: URL(fileURLWithPath: realFile))
         let realFileDict = (try JSONSerialization.jsonObject(with: realFileData) as? [String: Any]) ?? [:]
@@ -627,7 +702,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     func test_installHooks_neverCreatesABackupFile() throws {
         writeConfig("{ \"hooks\": {} }")
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let bakPath = configPath + ".bak"
         XCTAssertFalse(FileManager.default.fileExists(atPath: bakPath),
@@ -635,7 +710,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     }
 
     func test_removeHooks_neverCreatesABackupFile() throws {
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
 
@@ -673,7 +748,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         try writeConfigDict(existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
         let hooks = dict["hooks"] as? [String: Any]
@@ -688,7 +763,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         XCTAssertFalse(ClaudeHooksConfigManager.areHooksInstalled(configPath: configPath),
                        "No config file yet -> hooks must not be reported as installed")
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         XCTAssertTrue(ClaudeHooksConfigManager.areHooksInstalled(configPath: configPath),
                       "After installHooks, hooks must be reported as installed")
@@ -733,7 +808,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         let (dotfilesSettingsPath, homeSettingsPath) = try makeDotfilesFixture(existingConfig: existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: homeSettingsPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: homeSettingsPath)
 
         // The real dotfiles-managed file received Calyx's 10 events...
         let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
@@ -774,7 +849,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         ]
         let (dotfilesSettingsPath, homeSettingsPath) = try makeDotfilesFixture(existingConfig: existingConfig)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: homeSettingsPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: homeSettingsPath)
         try ClaudeHooksConfigManager.removeHooks(configPath: homeSettingsPath)
 
         let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
@@ -803,7 +878,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dotfilesSettingsPath),
                        "Precondition: the symlink's target must not exist yet (dangling)")
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: homeSettingsPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: homeSettingsPath)
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: dotfilesSettingsPath),
                       "installHooks must create the file at the dangling symlink's target path")
@@ -831,7 +906,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: finalTarget),
                       "installHooks must create the file at the multi-hop dangling chain's final destination")
@@ -866,7 +941,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         try FileManager.default.createSymbolicLink(atPath: homeClaudeDir, withDestinationPath: dotfilesClaudeDir)
         let homeSettingsPath = homeClaudeDir + "/settings.json"
 
-        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: homeSettingsPath)
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: homeSettingsPath)
 
         let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
         let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
@@ -878,5 +953,303 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         let parentAttrs = try FileManager.default.attributesOfItem(atPath: homeClaudeDir)
         XCTAssertEqual(parentAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
                        "The symlinked .claude directory itself must remain a symlink")
+    }
+
+    // MARK: - Wake entry (Stop / SessionStart)
+
+    // Stop and SessionStart are the two events whose Calyx group holds a
+    // second entry, the wake entry, after the monitor entry. Claude Code
+    // runs a hook entry marked asyncRewake in the background and wakes
+    // an idle session when it exits 2, so the entry's exact keys matter:
+    // without "async" or "asyncRewake" it would block the turn or never
+    // wake anything.
+    func test_installHooks_stopAndSessionStart_groupIsMonitorThenWakeEntryWithExactShapes() throws {
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let dict = try readConfigDict()
+
+        for eventName in Self.wakeEvents {
+            let groups = hookGroups(dict, event: eventName)
+            XCTAssertEqual(groups.count, 1, "\(eventName) must hold exactly one group on a fresh install")
+            let group = groups.first ?? [:]
+            XCTAssertNil(group["matcher"], "\(eventName)'s group must have no \"matcher\" key")
+            XCTAssertEqual(Set(group.keys), ["hooks"], "\(eventName)'s group must hold the \"hooks\" key only")
+
+            let entries = (group["hooks"] as? [[String: Any]]) ?? []
+            XCTAssertEqual(entries.count, 2,
+                           "\(eventName)'s group must hold exactly two entries: monitor, then wake")
+            guard entries.count == 2 else { continue }
+
+            let monitor = entries[0]
+            XCTAssertEqual(Set(monitor.keys), ["type", "command", "timeout", "async"],
+                           "\(eventName)'s first entry must be the unchanged monitor entry, without an " +
+                           "\"asyncRewake\" key")
+            XCTAssertEqual(monitor["type"] as? String, "command")
+            XCTAssertEqual(monitor["command"] as? String, "\"\(scriptPath!)\"",
+                           "\(eventName)'s first entry must be the monitor entry")
+            XCTAssertEqual(monitor["timeout"] as? Int, 5, "\(eventName)'s monitor entry keeps its 5 second timeout")
+            XCTAssertTrue(isJSONTrue(monitor["async"]), "\(eventName)'s monitor entry must stay async")
+            XCTAssertNil(monitor["asyncRewake"], "\(eventName)'s monitor entry must not be marked asyncRewake")
+
+            let wake = entries[1]
+            XCTAssertEqual(Set(wake.keys), ["type", "command", "timeout", "async", "asyncRewake"],
+                           "\(eventName)'s wake entry must hold exactly these five keys")
+            XCTAssertEqual(wake["type"] as? String, "command")
+            XCTAssertEqual(wake["command"] as? String, "\"\(wakeScriptPath!)\"",
+                           "\(eventName)'s second entry must be the wake entry: the quoted wake script path")
+            XCTAssertEqual(wake["timeout"] as? Int, IPCWakeHookTiming.hookEntryTimeoutSeconds,
+                           "\(eventName)'s wake entry timeout must be IPCWakeHookTiming.hookEntryTimeoutSeconds")
+            XCTAssertEqual(wake["timeout"] as? Int, 600, "\(eventName)'s wake entry timeout must be 600 seconds")
+            XCTAssertTrue(isJSONTrue(wake["async"]),
+                          "\(eventName)'s wake entry must be async (JSON true), so it never blocks the turn")
+            XCTAssertTrue(isJSONTrue(wake["asyncRewake"]),
+                          "\(eventName)'s wake entry must be asyncRewake (JSON true), so exit 2 wakes the session")
+        }
+    }
+
+    func test_installHooks_eventsOtherThanStopAndSessionStart_carryNoWakeEntry() throws {
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let dict = try readConfigDict()
+        let otherEvents = Self.expectedEvents.filter { !Self.wakeEvents.contains($0) }
+        XCTAssertEqual(otherEvents.count, 8, "Eight of the ten events carry no wake entry")
+
+        for eventName in otherEvents {
+            let commands = commandEntries(hookGroups(dict, event: eventName))
+            XCTAssertFalse(commands.isEmpty, "\(eventName) must still carry its monitor entry")
+            XCTAssertFalse(commands.contains { (($0["command"] as? String) ?? "").contains(wakeScriptPath) },
+                           "\(eventName) must not reference the wake script: only Stop and SessionStart do")
+            XCTAssertFalse(commands.contains { $0["asyncRewake"] != nil },
+                           "\(eventName) must hold no entry with an \"asyncRewake\" key")
+        }
+    }
+
+    // A config written before the wake entry existed: one Calyx group
+    // per event holding the monitor entry (PermissionRequest: monitor +
+    // approval), with the matcher each event uses. installHooks is its
+    // own upgrade path, so Stop and SessionStart must end up with one
+    // Calyx group, [monitor, wake], and nothing else may change.
+    func test_installHooks_upgradeFromConfigWithoutWakeEntry_addsWakeEntryWithoutDuplicatingOrTouchingAnythingElse() throws {
+        let userStopGroup: [String: Any] = ["hooks": [
+            ["type": "command", "command": "/usr/local/bin/user-stop-hook", "timeout": 3],
+        ]]
+        var oldHooks: [String: Any] = [:]
+        for eventName in Self.expectedEvents {
+            let entries = eventName == "PermissionRequest" ? [monitorEntry, approvalEntry] : [monitorEntry]
+            var group: [String: Any] = ["hooks": entries]
+            if let matcher = Self.expectedMatcherByEvent[eventName] {
+                group["matcher"] = matcher
+            }
+            oldHooks[eventName] = eventName == "Stop" ? [group, userStopGroup] : [group]
+        }
+        try writeConfigDict(["hooks": oldHooks])
+        let before = try readConfigDict()
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let after = try readConfigDict()
+
+        for eventName in Self.wakeEvents {
+            let groups = hookGroups(after, event: eventName)
+            let ownGroups = calyxGroups(groups)
+            XCTAssertEqual(ownGroups.count, 1,
+                           "\(eventName) must hold exactly one Calyx group after the upgrade, not a second one " +
+                           "next to the old one")
+            let entries = (ownGroups.first?["hooks"] as? [[String: Any]]) ?? []
+            XCTAssertEqual(entries as NSArray, [monitorEntry, wakeEntry] as NSArray,
+                           "\(eventName)'s Calyx group must be exactly [monitor, wake] after the upgrade")
+            XCTAssertNil(ownGroups.first?["matcher"], "\(eventName)'s Calyx group must have no \"matcher\" key")
+            XCTAssertEqual(commandEntries(groups).filter { ($0["command"] as? String) == monitorCommand }.count, 1,
+                           "\(eventName)'s monitor entry must not be duplicated by the upgrade")
+        }
+
+        let stopGroups = hookGroups(after, event: "Stop")
+        XCTAssertEqual(stopGroups.count, 2, "Stop must hold the user's group and Calyx's group, nothing else")
+        let foreignStopGroups = stopGroups.filter { group in
+            !((group["hooks"] as? [[String: Any]]) ?? []).contains { isCalyxEntry($0) }
+        }
+        XCTAssertEqual(foreignStopGroups as NSArray, [userStopGroup] as NSArray,
+                       "The user's own Stop group must survive the upgrade unchanged")
+        XCTAssertEqual(hookGroups(after, event: "SessionStart").count, 1,
+                       "SessionStart must hold Calyx's group only")
+
+        for eventName in Self.expectedEvents where !Self.wakeEvents.contains(eventName) {
+            XCTAssertEqual(hookGroups(after, event: eventName) as NSArray,
+                           hookGroups(before, event: eventName) as NSArray,
+                           "\(eventName) carries no wake entry, so the upgrade must leave its groups as they were")
+        }
+    }
+
+    // withExclusiveConfig writes nothing when the transform returns the
+    // bytes it read. The wake entry's keys must therefore compare equal
+    // to what a previous install wrote, or every launch-time resync
+    // would rewrite a file Claude Code itself writes to.
+    func test_installHooks_reinstallWithWakeEntries_leavesFileBytesIdentical() throws {
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+        let firstBytes = try Data(contentsOf: URL(fileURLWithPath: configPath))
+
+        let first = try readConfigDict()
+        for eventName in Self.wakeEvents {
+            XCTAssertEqual(
+                commandEntries(hookGroups(first, event: eventName)).filter { ($0["command"] as? String) == wakeCommand }.count, 1,
+                "Precondition: the first install must have written \(eventName)'s wake entry, or this test " +
+                "says nothing about a reinstall over wake entries"
+            )
+        }
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let secondBytes = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(secondBytes, firstBytes,
+                       "A second installHooks with the same arguments must leave settings.json byte-identical")
+    }
+
+    // The same reinstall, over a config in which the user has their own
+    // group on Stop and on SessionStart and nothing else. The second
+    // call finds Calyx's groups next to the user's and must still produce
+    // the bytes the first call wrote.
+    func test_installHooks_reinstallNextToUserGroupsOnStopAndSessionStart_leavesFileBytesIdentical() throws {
+        let userStopGroup: [String: Any] = ["hooks": [
+            ["type": "command", "command": "/usr/local/bin/user-stop-hook", "timeout": 3],
+        ]]
+        let userSessionStartGroup: [String: Any] = ["matcher": "startup", "hooks": [
+            ["type": "command", "command": "/usr/local/bin/user-session-start-hook"],
+        ]]
+        try writeConfigDict(["hooks": ["Stop": [userStopGroup], "SessionStart": [userSessionStartGroup]]])
+        let userGroupByEvent = ["Stop": userStopGroup, "SessionStart": userSessionStartGroup]
+
+        // The groups of one event that hold no Calyx entry.
+        func foreignGroups(_ dict: [String: Any], event: String) -> [[String: Any]] {
+            hookGroups(dict, event: event).filter { group in
+                !((group["hooks"] as? [[String: Any]]) ?? []).contains { isCalyxEntry($0) }
+            }
+        }
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+        let firstBytes = try Data(contentsOf: URL(fileURLWithPath: configPath))
+
+        let first = try readConfigDict()
+        for eventName in Self.wakeEvents {
+            let groups = hookGroups(first, event: eventName)
+            XCTAssertEqual(groups.count, 2,
+                           "Precondition: after the first install \(eventName) holds the user's group and " +
+                           "Calyx's group, or this test says nothing about a reinstall next to a user group")
+            XCTAssertEqual(calyxGroups(groups).count, 1,
+                           "Precondition: the first install wrote one Calyx group on \(eventName)")
+            XCTAssertEqual(
+                commandEntries(groups).filter { ($0["command"] as? String) == wakeCommand }.count, 1,
+                "Precondition: the first install wrote \(eventName)'s wake entry")
+            XCTAssertEqual(foreignGroups(first, event: eventName) as NSArray,
+                           [userGroupByEvent[eventName]!] as NSArray,
+                           "The user's own \(eventName) group must be unchanged after the first install")
+        }
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let secondBytes = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(
+            secondBytes, firstBytes,
+            "A second installHooks with the same arguments must leave settings.json byte-identical when " +
+            "the user has their own Stop and SessionStart groups.\nAfter the first call:\n" +
+            "\(String(decoding: firstBytes, as: UTF8.self))\nAfter the second call:\n" +
+            "\(String(decoding: secondBytes, as: UTF8.self))")
+
+        let second = try readConfigDict()
+        for eventName in Self.wakeEvents {
+            XCTAssertEqual(hookGroups(second, event: eventName).count, 2,
+                           "\(eventName) must still hold exactly the user's group and Calyx's group")
+            XCTAssertEqual(foreignGroups(second, event: eventName) as NSArray,
+                           [userGroupByEvent[eventName]!] as NSArray,
+                           "The user's own \(eventName) group must be unchanged after the second install")
+        }
+    }
+
+    // The full install -> remove round trip with a user's own Stop hook
+    // sitting next to Calyx's group: removeHooks must take out all three
+    // kinds of Calyx entry, the wake entry included, and nothing else.
+    func test_installThenRemove_removesWakeEntriesAndPreservesUserHook() throws {
+        let userStopGroup: [String: Any] = ["hooks": [
+            ["type": "command", "command": "/usr/local/bin/user-stop-hook", "timeout": 3],
+        ]]
+        try writeConfigDict(["hooks": ["Stop": [userStopGroup]]])
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath, configPath: configPath)
+
+        let installed = try readConfigDict()
+        for eventName in Self.wakeEvents {
+            XCTAssertEqual(
+                commandEntries(hookGroups(installed, event: eventName)).filter { ($0["command"] as? String) == wakeCommand }.count, 1,
+                "Precondition: installHooks must have written \(eventName)'s wake entry, or this test says " +
+                "nothing about removing one"
+            )
+        }
+
+        try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
+
+        let text = try String(contentsOfFile: configPath, encoding: .utf8)
+        for fileName in Self.calyxScriptFileNames.sorted() {
+            XCTAssertFalse(text.contains(fileName),
+                           "removeHooks must leave no reference to \(fileName) anywhere in settings.json")
+        }
+
+        let removed = try readConfigDict()
+        let hooks = removed["hooks"] as? [String: Any] ?? [:]
+        XCTAssertEqual(Set(hooks.keys), ["Stop"],
+                       "Only Stop, which holds the user's own hook, may remain under \"hooks\"")
+        XCTAssertEqual(hookGroups(removed, event: "Stop") as NSArray, [userStopGroup] as NSArray,
+                       "The user's own Stop group must survive install -> remove unchanged")
+    }
+
+    // A hand-written Stop group holding a user's entry and a wake entry
+    // side by side. removeHooks must recognize the wake entry by its
+    // file name alone and remove only it: the user's entry keeps its
+    // text (key order included) and stays the first entry of the first
+    // group.
+    func test_removeHooks_groupMixingUserEntryAndWakeEntry_keepsUserEntryInPlaceAndRemovesOnlyWakeEntry() throws {
+        let userEntryText =
+            "{\n            \"type\": \"command\",\n            \"command\": \"/usr/local/bin/user-stop-hook\",\n" +
+            "            \"timeout\": 3\n          }"
+        writeConfig(
+            "{\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          " + userEntryText + ",\n" +
+            "          {\n            \"type\": \"command\",\n" +
+            "            \"command\": \"\\\"/opt/calyx/bin/calyx-ipc-wake-hook\\\"\",\n" +
+            "            \"timeout\": 600,\n            \"async\": true,\n            \"asyncRewake\": true\n          }\n" +
+            "        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n" +
+            "            \"command\": \"/usr/local/bin/other-user-hook\"\n          }\n        ]\n      }\n    ]\n  }\n}\n"
+        )
+
+        try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
+
+        let text = try String(contentsOfFile: configPath, encoding: .utf8)
+        XCTAssertFalse(text.contains("calyx-ipc-wake-hook"),
+                       "removeHooks must remove the wake entry: it is Calyx's own by its file name")
+        XCTAssertTrue(text.contains(userEntryText),
+                      "The user's entry must keep its original text, key order included")
+
+        let groups = hookGroups(try readConfigDict(), event: "Stop")
+        let expectedGroups: [[String: Any]] = [
+            ["hooks": [["type": "command", "command": "/usr/local/bin/user-stop-hook", "timeout": 3]]],
+            ["hooks": [["type": "command", "command": "/usr/local/bin/other-user-hook"]]],
+        ]
+        XCTAssertEqual(groups as NSArray, expectedGroups as NSArray,
+                       "Both groups must stay where they were; the first one loses only its wake entry")
+    }
+
+    // Mirrors test_areHooksInstalled_trueWhenOnlyApprovalEntryPresent: a
+    // wake entry alone marks the config as carrying Calyx's hooks, so a
+    // launch-time resync and remove() both act on it.
+    func test_areHooksInstalled_trueWhenOnlyWakeEntryPresent() throws {
+        let existingConfig: [String: Any] = [
+            "hooks": [
+                "Stop": [
+                    ["hooks": [wakeEntry]],
+                ],
+            ],
+        ]
+        try writeConfigDict(existingConfig)
+
+        XCTAssertTrue(ClaudeHooksConfigManager.areHooksInstalled(configPath: configPath),
+                     "areHooksInstalled must recognize the wake entry alone, without the monitor " +
+                     "entry present")
     }
 }

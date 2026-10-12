@@ -117,7 +117,7 @@ final class UsageTrackingSettingsToggleWiringTests: XCTestCase {
         XCTAssertEqual(SettingsRow.usageTracking.pane, .agents)
         XCTAssertEqual(
             SettingsRow.allCases.filter { $0.pane == .agents },
-            [.agentIPC, .agentResume, .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking,
+            [.agentIPC, .ipcWake, .agentResume, .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking,
              .agentHookApproval, .usageTracking])
     }
 

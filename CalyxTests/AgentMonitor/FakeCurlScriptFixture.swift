@@ -3,8 +3,9 @@
 //  CalyxTests
 //
 //  Shared fake-curl PATH-shim + /bin/sh execution harness for driving an
-//  installed hook script (calyx-agent-hook / calyx-approval-hook) as a
-//  real child process, without a real network round trip. Consolidates
+//  installed hook script (calyx-agent-hook / calyx-approval-hook /
+//  calyx-ipc-wake-hook) as a real child process, without a real network
+//  round trip. Consolidates
 //  three independent copies (ApprovalHookScriptTests,
 //  ApprovalHookScriptHerdrGuardTests, AgentHookScriptHerdrGuardTests each
 //  carried their own fake-curl generator and script-runner) that each had
@@ -23,6 +24,18 @@
 //  against a stale harness. Mirrors TwoPaneSessionFixture.swift /
 //  ReconnectFixture.swift's own precedent for extracting a
 //  verbatim-duplicated test shape into one shared file.
+//
+//  calyx-ipc-wake-hook decides its exit code from the bytes curl printed
+//  and reports on its own stderr, which the two older scripts never do.
+//  Two additions serve it: `makeFakeCurl(stdoutBody:)` makes the fake curl
+//  print a chosen response body, and
+//  `runFakeCurlHookScriptCapturingStderr` returns the script's stderr
+//  next to its exit code and stdout. `runFakeCurlHookScript` delegates to
+//  it, so the process-spawning code exists once. A third,
+//  `makeFakeMktemp`, writes a `mktemp` shim that creates its file inside
+//  a directory the test owns (or fails), so a test can watch the temp
+//  file of a script that calls bare `mktemp`: on macOS that call ignores
+//  TMPDIR in favour of the per-user temporary directory.
 //
 //  Each call site still owns its own cleanup (matching
 //  TwoPaneSessionFixture.swift's established discipline): this file only
@@ -77,18 +90,72 @@ func makeFakeCurlScriptFixture(
 /// stdin (whatever it is -- see this file's header comment for why that
 /// differs between calyx-agent-hook and calyx-approval-hook -- so nothing
 /// is ever left unread), optionally appends one "invoked" line to
-/// `recordPath` per call, and exits with `exitCode` (0 by default).
-func makeFakeCurl(atDirectory dir: String, exitCode: Int32 = 0, recordingTo recordPath: String? = nil) throws {
+/// `recordPath` per call, optionally prints `stdoutBody` on its stdout,
+/// and exits with `exitCode` (0 by default).
+///
+/// `stdoutBody`, when non-nil, is printed byte for byte with no newline
+/// added: it is written to `<dir>/curl-stdout-body` and the fake curl
+/// `cat`s that file, so no character of the body is ever interpreted by
+/// the shell. `nil` prints nothing, exactly as before this parameter
+/// existed.
+func makeFakeCurl(
+    atDirectory dir: String,
+    exitCode: Int32 = 0,
+    recordingTo recordPath: String? = nil,
+    stdoutBody: String? = nil
+) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let curlPath = dir + "/curl"
     let recordLine = recordPath.map { "printf 'invoked\\n' >> \"\($0)\"\n" } ?? ""
+    var stdoutLine = ""
+    if let stdoutBody {
+        let stdoutBodyPath = dir + "/curl-stdout-body"
+        try Data(stdoutBody.utf8).write(to: URL(fileURLWithPath: stdoutBodyPath))
+        stdoutLine = "cat \"\(stdoutBodyPath)\"\n"
+    }
     let body = """
     #!/bin/sh
     cat > /dev/null
-    \(recordLine)exit \(exitCode)
+    \(recordLine)\(stdoutLine)exit \(exitCode)
     """
     try body.write(toFile: curlPath, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: curlPath)
+}
+
+/// Writes a `mktemp` shim executable at `<dir>/mktemp`, for a script
+/// that calls `mktemp` with no arguments. Put `dir` ahead of `/usr/bin`
+/// on the script's PATH and the script's temp file lands where the test
+/// can see it.
+///
+/// With `tempFileDir` non-nil the shim creates that directory's file
+/// with the real `/usr/bin/mktemp` (template `response.XXXXXX` inside
+/// `tempFileDir`, which this function creates if needed) and passes its
+/// output and exit status through. With `tempFileDir` nil the shim
+/// creates nothing, prints an error on stderr and exits 1: a failing
+/// `mktemp`. Either way it first appends one "invoked" line to
+/// `recordPath` when that is non-nil. Whatever arguments the shim is
+/// given are ignored.
+func makeFakeMktemp(
+    atDirectory dir: String,
+    creatingFilesIn tempFileDir: String?,
+    recordingTo recordPath: String? = nil
+) throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let recordLine = recordPath.map { "printf 'invoked\\n' >> \"\($0)\"\n" } ?? ""
+    let action: String
+    if let tempFileDir {
+        try FileManager.default.createDirectory(atPath: tempFileDir, withIntermediateDirectories: true)
+        action = "exec /usr/bin/mktemp \"\(tempFileDir)/response.XXXXXX\""
+    } else {
+        action = "printf 'mktemp: simulated failure\\n' >&2\nexit 1"
+    }
+    let body = """
+    #!/bin/sh
+    \(recordLine)\(action)
+    """
+    let mktempPath = dir + "/mktemp"
+    try body.write(toFile: mktempPath, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mktempPath)
 }
 
 /// Runs `fixture.scriptPath` as a real child `/bin/sh` process, with
@@ -98,6 +165,8 @@ func makeFakeCurl(atDirectory dir: String, exitCode: Int32 = 0, recordingTo reco
 /// (e.g. `CALYX_SURFACE_ID` so the script's own early guard doesn't
 /// short-circuit before ever reaching curl, or `HERDR_PANE_ID` to drive
 /// the herdr guard), and `kindArgument` passed as `$1` when non-nil.
+/// Returns the script's exit code and stdout; see
+/// `runFakeCurlHookScriptCapturingStderr` for its stderr as well.
 @discardableResult
 func runFakeCurlHookScript(
     _ fixture: FakeCurlScriptFixture,
@@ -105,6 +174,25 @@ func runFakeCurlHookScript(
     extraEnv: [String: String] = [:],
     kindArgument: String? = nil
 ) throws -> (exitCode: Int32, stdout: String) {
+    let result = try runFakeCurlHookScriptCapturingStderr(
+        fixture, stdinJSON: stdinJSON, extraEnv: extraEnv, kindArgument: kindArgument
+    )
+    return (result.exitCode, result.stdout)
+}
+
+/// `runFakeCurlHookScript` with the script's stderr returned too. The
+/// child's environment is exactly HOME, PATH and `extraEnv`, nothing
+/// inherited. Both pipes are read to EOF before `waitUntilExit()`, stdout
+/// first: every script driven through this harness writes far less than
+/// one pipe buffer to either stream, so the sequential reads cannot
+/// block the child.
+@discardableResult
+func runFakeCurlHookScriptCapturingStderr(
+    _ fixture: FakeCurlScriptFixture,
+    stdinJSON: String,
+    extraEnv: [String: String] = [:],
+    kindArgument: String? = nil
+) throws -> (exitCode: Int32, stdout: String, stderr: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
     process.arguments = kindArgument.map { [fixture.scriptPath, $0] } ?? [fixture.scriptPath]
@@ -115,14 +203,20 @@ func runFakeCurlHookScript(
 
     let stdinPipe = Pipe()
     let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
     process.standardInput = stdinPipe
     process.standardOutput = stdoutPipe
-    process.standardError = Pipe()
+    process.standardError = stderrPipe
 
     try process.run()
     stdinPipe.fileHandleForWriting.write(Data(stdinJSON.utf8))
     stdinPipe.fileHandleForWriting.closeFile()
     let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
-    return (process.terminationStatus, String(data: stdoutData, encoding: .utf8) ?? "")
+    return (
+        process.terminationStatus,
+        String(data: stdoutData, encoding: .utf8) ?? "",
+        String(data: stderrData, encoding: .utf8) ?? ""
+    )
 }

@@ -75,8 +75,8 @@ final class IPCWakeCoordinatorTests: XCTestCase {
 
     // MARK: - Lifecycle
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         let wakeFlag = WakeFlag()
         self.wakeFlag = wakeFlag
         seamCalls = 0
@@ -94,7 +94,7 @@ final class IPCWakeCoordinatorTests: XCTestCase {
         )
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         coordinator._testBeforeOffer = nil
         coordinator.releaseAllWaiters()
         coordinator = nil
@@ -103,7 +103,7 @@ final class IPCWakeCoordinatorTests: XCTestCase {
         wakeFlag = nil
         seamFirstWaiter = nil
         seamSecondWaiter = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Helpers

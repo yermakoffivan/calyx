@@ -43,23 +43,27 @@
 // - One waiter per surface: a new `awaitWake` for a surface makes the
 //   one already waiting return nil.
 // - Timeout, cancellation, surface destruction and `releaseAllWaiters()`
-//   (called by `CalyxMCPServer.stop()`) end the affected waiters with
-//   nil and never touch a message flag: none of them goes through the
-//   store.
+//   (called by `CalyxMCPServer.stop()`, and by
+//   `SettingsWindowController.ipcWakeDidChange` when the Settings switch
+//   is turned off) end the affected waiters with nil and never touch a
+//   message flag: none of them goes through the store. Cancellation is
+//   what a dropped connection produces: the connection-drop watch in
+//   `CalyxMCPServer.dispatchRoute` cancels the Task awaiting `awaitWake`.
 // - While `isEnabled()` is false, a check does nothing: it neither
 //   wakes nor drops a waiter, so a waiter that was already registered
-//   stays until it times out or is released. (`CalyxMCPServer`'s
-//   `/ipc-wake` route answers 204 before registering a waiter at all
-//   while the setting is off.)
+//   stays until it times out or is released. The Settings switch
+//   releases every waiter when it turns the setting off; nothing here
+//   does. (`CalyxMCPServer`'s `/ipc-wake` route answers 204 before
+//   registering a waiter at all while the setting is off.)
 //
 // Boundary of the guarantee: a wake is committed the moment a waiter
-// receives it. A failure after that point (the connection dropped
-// before the response was written, the client long-polling `/ipc-wake`
-// gone before it used the note) is not recovered, and the messages stay
-// nudged --
-// the same boundary as the store's delete-on-read contract, described
-// on `IPCStore.requeue`. The messages themselves are untouched and are
-// still returned by the agent's next `receive_messages` call.
+// receives it. A failure after that point (the connection dropped before
+// the response was written, `calyx-ipc-wake-hook` (`IPCWakeHookScript`),
+// the client long-polling `/ipc-wake`, gone before it used the note) is
+// not recovered, and the messages stay nudged -- the same boundary as
+// the store's delete-on-read contract, described on `IPCStore.requeue`.
+// The messages themselves are untouched and are still returned by the
+// agent's next `receive_messages` call.
 //
 // The binding and the enabled flag are a snapshot taken when a check
 // starts. A binding change, or `isEnabled()` turning false, while the
@@ -231,7 +235,9 @@ final class IPCWakeCoordinator: NSObject {
 
     /// Ends every waiter: each suspended `awaitWake` returns nil and
     /// `waiters` is left empty. Never changes a message flag. Called by
-    /// `CalyxMCPServer.stop()`.
+    /// `CalyxMCPServer.stop()`, and by
+    /// `SettingsWindowController.ipcWakeDidChange` when the Settings
+    /// switch is turned off.
     func releaseAllWaiters() {
         let released = waiters
         waiters.removeAll()

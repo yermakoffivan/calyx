@@ -63,8 +63,8 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
 
     // MARK: - Lifecycle
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         IPCWakeSettings._testUseSuite(named: settingsSuiteName)
         IPCWakeSettings.enabled = true
         agentEndpointDir = FileManager.default.temporaryDirectory
@@ -78,7 +78,7 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         server.ipcWakeTimeoutMs = longTimeoutMs
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         server.stop()
         server = nil
         registry = nil
@@ -87,7 +87,7 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         }
         agentEndpointDir = nil
         IPCWakeSettings._testTeardownSuite(named: settingsSuiteName)
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - Request-building helpers

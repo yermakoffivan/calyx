@@ -601,73 +601,6 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         return RunningHookScript(pid: pid, result: resultTask)
     }
 
-    /// Breadth-first search of `ancestorPID`'s process-tree descendants
-    /// for the first process whose `comm` (bare executable name, no
-    /// arguments) is `processName`, polling up to `timeout` since the
-    /// descendant may not have forked yet the instant this is first
-    /// called. `sh -c 'x=$(curl ...)'` was confirmed empirically (spawn a
-    /// backgrounded `sh -c 'x=$(sleep 5)'` and inspect `ps -o pid,ppid,comm`)
-    /// to fork an intermediate subshell before `curl` itself runs --
-    /// `curl` is a GRANDCHILD of the script's own pid, not a direct
-    /// child -- so a single-level `pgrep -P <sh pid>` alone is not
-    /// enough; this walks the whole descendant tree instead.
-    private nonisolated static func findDescendantProcess(
-        ofAncestor ancestorPID: Int32, commandName processName: String, timeout: TimeInterval = 3.0
-    ) async -> Int32? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let found = descendantMatching(ofAncestor: ancestorPID, commandName: processName) {
-                return found
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return nil
-    }
-
-    private nonisolated static func descendantMatching(ofAncestor ancestorPID: Int32, commandName processName: String) -> Int32? {
-        var frontier = childPIDs(ofParent: ancestorPID)
-        var visited = Set<Int32>()
-        while !frontier.isEmpty {
-            let current = frontier.removeFirst()
-            guard !visited.contains(current) else { continue }
-            visited.insert(current)
-            if processCommandName(ofPID: current) == processName {
-                return current
-            }
-            frontier.append(contentsOf: childPIDs(ofParent: current))
-        }
-        return nil
-    }
-
-    private nonisolated static func childPIDs(ofParent pid: Int32) -> [Int32] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-P", String(pid)]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-        return output.split(separator: "\n").compactMap { Int32($0) }
-    }
-
-    private nonisolated static func processCommandName(ofPID pid: Int32) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-p", String(pid), "-o", "comm="]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : (trimmed as NSString).lastPathComponent
-    }
-
     /// Polls `approvalInbox.pending` for up to `timeout` seconds,
     /// mirroring `waitForPendingRequest`'s polling shape but for the
     /// opposite condition (emptiness rather than presence).
@@ -706,7 +639,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(pendingRequest,
                         "the script's real POST must reach the injected approval inbox before its curl child is killed")
 
-        let curlPID = await Self.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
+        let curlPID = await HookScriptProcessTree.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
         let killPID = try XCTUnwrap(curlPID, "must locate the script's own curl child process to kill it")
 
         XCTAssertEqual(kill(killPID, SIGKILL), 0, "must be able to SIGKILL the located curl child")
@@ -761,7 +694,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                         "the script's real POST must reach the injected approval inbox before the script " +
                         "itself is killed")
 
-        let curlPID = await Self.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
+        let curlPID = await HookScriptProcessTree.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
         let observedCurlPID = try XCTUnwrap(curlPID, "must locate the script's own curl child before killing the script")
 
         XCTAssertEqual(kill(running.pid, SIGTERM), 0, "must be able to SIGTERM the script's own /bin/sh process")
@@ -774,7 +707,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
 
         // Poll rather than a single immediate check: the trap's `kill` and
         // the OS actually reaping the process are not the same instant.
-        let curlGone = await Self.waitUntilProcessGone(pid: observedCurlPID, timeout: 3.0)
+        let curlGone = await HookScriptProcessTree.waitUntilProcessGone(pid: observedCurlPID, timeout: 3.0)
         XCTAssertTrue(curlGone,
                       "the script's own curl child must not survive as an orphan once the script itself is " +
                       "killed -- the trap must kill it explicitly")
@@ -783,17 +716,5 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(exitCode, 0, "the hook script's own trap must still exit 0 on SIGTERM")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so a killed script must never print anything")
-    }
-
-    /// Polls until `pid` no longer identifies a live process (either
-    /// exited or reaped), used to confirm curl doesn't linger as an
-    /// orphan after the fix kills it.
-    private nonisolated static func waitUntilProcessGone(pid: Int32, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if kill(pid, 0) != 0 { return true }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return kill(pid, 0) != 0
     }
 }

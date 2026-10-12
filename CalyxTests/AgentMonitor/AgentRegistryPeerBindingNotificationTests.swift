@@ -36,8 +36,8 @@ final class AgentRegistryPeerBindingNotificationTests: XCTestCase {
     private var observer: NSObjectProtocol?
     private let posts = OSAllocatedUnfairLock<[Post]>(initialState: [])
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         let registry = AgentRegistry()
         self.registry = registry
         let posts = self.posts
@@ -54,13 +54,13 @@ final class AgentRegistryPeerBindingNotificationTests: XCTestCase {
         }
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }
         observer = nil
         registry = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private var recordedPosts: [Post] {

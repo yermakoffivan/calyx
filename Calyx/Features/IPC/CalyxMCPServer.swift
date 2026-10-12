@@ -73,14 +73,19 @@ final class CalyxMCPServer {
         return fmt
     }()
 
-    /// The `/approval-request` route's path, shared by `route(request:)`'s
-    /// own switch case and `dispatchRoute`'s guard so the one path string
-    /// that gates the connection-drop watch exists in exactly one place.
+    /// The `/approval-request` route's path, shared by
+    /// `route(request:)`'s own switch case and
+    /// `connectionDropWatchedPaths` below, so the path string exists in
+    /// exactly one place.
     private static let approvalRequestPath = "/approval-request"
 
     /// The `/ipc-wake` route's path: the long-poll held open on behalf
     /// of a Claude Code pane (see `routeIPCWake`).
     private static let ipcWakePath = "/ipc-wake"
+
+    /// The paths whose `POST` gets `dispatchRoute`'s connection-drop
+    /// watch: the two routes that hold a request open as a long-poll.
+    private static let connectionDropWatchedPaths: Set<String> = [approvalRequestPath, ipcWakePath]
 
     /// Shared request-body size cap (bytes), checked BEFORE decode, by
     /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
@@ -980,20 +985,25 @@ final class CalyxMCPServer {
     /// identity comes from its headers alone.
     ///
     /// Guard order: bearer auth (401) -> `resolveSurfaceID` (400) -> an
-    /// `X-Calyx-Agent-Kind` other than claude-code short-circuits to
-    /// 204 (this route serves Claude Code panes only; `agentKind(from:)`
+    /// `X-Calyx-Agent-Kind` other than claude-code short-circuits to 204
+    /// (this route serves Claude Code panes only; `agentKind(from:)`
     /// reads an absent header as claude-code) ->
     /// `IPCWakeSettings.enabled` being off short-circuits to 204 the
     /// same way -> otherwise long-polls `ipcWakeCoordinator.awaitWake`
     /// for up to `ipcWakeTimeoutMs`: a wake is 200, and nil (timeout,
-    /// this call's own Task being cancelled, a newer poll for the same
-    /// surface, the surface destroyed, `stop()`) is 204.
+    /// this call's own Task being cancelled by the connection-drop watch
+    /// in `dispatchRoute` because the client went away, a newer poll for
+    /// the same surface, the surface destroyed, `stop()`, the Settings
+    /// switch being turned off, where
+    /// `SettingsWindowController.ipcWakeDidChange` calls
+    /// `releaseAllWaiters()`) is 204.
     ///
     /// The setting gate comes BEFORE any waiter is registered: with the
-    /// setting off the client long-polling `/ipc-wake` gets its 204 at
-    /// once instead of holding a connection open for a wake no check
-    /// would hand out (a disabled check does nothing -- see
-    /// `IPCWakeCoordinator`'s header comment).
+    /// setting off `calyx-ipc-wake-hook` (`IPCWakeHookScript`), the
+    /// client long-polling `/ipc-wake`, gets its 204 at once instead of
+    /// holding a connection open for a wake no check would hand out (a
+    /// disabled check does nothing -- see `IPCWakeCoordinator`'s header
+    /// comment).
     private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
@@ -1834,22 +1844,33 @@ final class CalyxMCPServer {
     }
 
     /// Runs `route(request:)`, additionally wiring a connection-drop
-    /// watch scoped to `POST /approval-request` ONLY (both method AND
-    /// path -- a stray non-POST request to the same path just falls
-    /// through to the plain `await route(request:)` path below, same as
-    /// every other route, and gets its ordinary 404 with no Task+sentinel
-    /// wrapping): that endpoint alone can suspend for up to
-    /// `approvalRequestTimeoutMs` (~9.5 minutes)
-    /// awaiting a human decision, so it alone needs to notice the peer
-    /// disappearing mid-poll (the hook process getting killed by curl's
-    /// own `-m` deadline or the CLI's hook-entry timeout) and cancel its
-    /// own `route(request:)` Task — cancellation propagates into
-    /// `approvalInbox.awaitDecision`'s cancellation handler, expiring
-    /// the pending request and clearing its banner (see
-    /// `routeApprovalRequest`'s own doc comment, point (c)). Every other
-    /// route still runs via the plain `await route(request:)` path below
-    /// completely unchanged — none of them block on a human, so none of
-    /// them need this.
+    /// watch scoped to a `POST` to one of `connectionDropWatchedPaths`
+    /// ONLY, `/approval-request` and `/ipc-wake` (both method AND path
+    /// -- a stray non-POST request to the same path just falls through
+    /// to the plain `await route(request:)` path below, same as every
+    /// other route, and gets its ordinary 404 with no Task+sentinel
+    /// wrapping). These two endpoints are the ones that hold a request
+    /// open as a long-poll, so they need to notice the peer disappearing
+    /// mid-poll and cancel their own `route(request:)` Task:
+    ///
+    /// - `/approval-request` can suspend for up to
+    ///   `approvalRequestTimeoutMs` (~9.5 minutes) awaiting a human
+    ///   decision. When the peer disappears (the hook process getting
+    ///   killed by curl's own `-m` deadline or the CLI's hook-entry
+    ///   timeout), cancellation propagates into
+    ///   `approvalInbox.awaitDecision`'s cancellation handler, expiring
+    ///   the pending request and clearing its banner (see
+    ///   `routeApprovalRequest`'s own doc comment, point (c)).
+    /// - `/ipc-wake` can suspend for up to `ipcWakeTimeoutMs` awaiting a
+    ///   wake. Cancellation reaches `IPCWakeCoordinator.awaitWake`'s
+    ///   cancellation handling, which ends that waiter and leaves every
+    ///   message flag untouched, so a pane whose hook process died is
+    ///   not left registered until `ipcWakeTimeoutMs`.
+    ///
+    /// Every other route still runs via the plain
+    /// `await route(request:)` path below completely unchanged: none of
+    /// them is held open here, so none of them need this (`/calyx-mcp`
+    /// arms the same sentinel itself, in `serveCalyxMCP`).
     ///
     /// THE REAL MECHANISM (empirically verified, replacing an earlier
     /// `connection.stateUpdateHandler`-based attempt that never actually
@@ -1877,7 +1898,7 @@ final class CalyxMCPServer {
     private func dispatchRoute(
         connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
     ) async -> HTTPResponse {
-        guard request.method == "POST", request.path == Self.approvalRequestPath else {
+        guard request.method == "POST", Self.connectionDropWatchedPaths.contains(request.path) else {
             return await route(request: request)
         }
 
@@ -1894,13 +1915,14 @@ final class CalyxMCPServer {
         return await routeTask.value
     }
 
-    /// Serves a `/calyx-mcp` request, whose response may be a stream. The
-    /// connection-drop sentinel `dispatchRoute` arms for
-    /// `/approval-request` watches this request too, for as long as its
-    /// response is pending or streaming: a drop cancels the route's Task
-    /// and ends `lifetime`, which finishes the stream and cancels whatever
-    /// was producing it. A stream is written with chunked transfer
-    /// encoding, one chunk per element, then the connection is closed.
+    /// Serves a `/calyx-mcp` request, whose response may be a stream.
+    /// The connection-drop sentinel `dispatchRoute` arms for
+    /// `/approval-request` and `/ipc-wake` watches this request too, for
+    /// as long as its response is pending or streaming: a drop cancels
+    /// the route's Task and ends `lifetime`, which finishes the stream
+    /// and cancels whatever was producing it. A stream is written with
+    /// chunked transfer encoding, one chunk per element, then the
+    /// connection is closed.
     private func serveCalyxMCP(connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator) async {
         let lifetime = Task<Void, Never> {
             while !Task.isCancelled {
@@ -2000,15 +2022,16 @@ final class CalyxMCPServer {
     }
 
     /// The sentinel receive `dispatchRoute` arms for `/approval-request`
-    /// and `serveCalyxMCP` for `/calyx-mcp` — see `dispatchRoute`'s own
-    /// doc comment for the full rationale. `isSettled` says whether the
-    /// response is already complete, in which case a completing receive
-    /// (including the one `sendHTTPResponse`'s own `connection.cancel()`
-    /// completes) is a no-op; otherwise a terminal receive calls `onDrop`.
-    /// Kept as its own recursive method (mirroring `receiveUntilComplete`'s
-    /// shape) rather than inline, so the re-arm-on-non-terminal-data step
-    /// reads as a plain recursive call instead of a nested closure
-    /// capturing itself.
+    /// and `/ipc-wake`, and `serveCalyxMCP` for `/calyx-mcp` -- see
+    /// `dispatchRoute`'s own doc comment for the full rationale.
+    /// `isSettled` says whether the response is already complete, in
+    /// which case a completing receive (including the one
+    /// `sendHTTPResponse`'s own `connection.cancel()` completes) is a
+    /// no-op; otherwise a terminal receive calls `onDrop`. Kept as its
+    /// own recursive method (mirroring `receiveUntilComplete`'s shape)
+    /// rather than inline, so the re-arm-on-non-terminal-data step reads
+    /// as a plain recursive call instead of a nested closure capturing
+    /// itself.
     private func armConnectionDropSentinel(
         connection: NWConnection,
         isSettled: @escaping @MainActor () -> Bool,
