@@ -78,6 +78,10 @@ final class CalyxMCPServer {
     /// that gates the connection-drop watch exists in exactly one place.
     private static let approvalRequestPath = "/approval-request"
 
+    /// The `/ipc-wake` route's path: the long-poll held open on behalf
+    /// of a Claude Code pane (see `routeIPCWake`).
+    private static let ipcWakePath = "/ipc-wake"
+
     /// Shared request-body size cap (bytes), checked BEFORE decode, by
     /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
     /// ceiling for every event-ingestion route on this server, rather
@@ -189,6 +193,30 @@ final class CalyxMCPServer {
     /// production value, same rationale as `MCPCockpitBridge`'s own
     /// `approvalTimeoutMs`.
     var approvalRequestTimeoutMs: Int = ApprovalHookTiming.serverTimeoutMs
+
+    /// The timeout `POST /ipc-wake`'s long-poll (`routeIPCWake`) gives
+    /// `ipcWakeCoordinator.awaitWake` before answering 204. Defaults to
+    /// `IPCWakeHookTiming.serverTimeoutMs` (see that enum's header
+    /// comment for the full nesting rationale against the polling
+    /// client's own curl timeout and the CLI's hook-entry timeout);
+    /// test-overridable so tests can drive the timeout path in well
+    /// under a second, same rationale as `approvalRequestTimeoutMs`.
+    var ipcWakeTimeoutMs: Int = IPCWakeHookTiming.serverTimeoutMs
+
+    /// Holds every suspended `POST /ipc-wake` long-poll and wakes one
+    /// when its pane's bound peer has messages it has not been told
+    /// about yet -- see `IPCWakeCoordinator`'s header comment. `lazy`
+    /// because its `agentRegistry` closure captures `self`, weakly, to
+    /// read the swappable `agentRegistry` property each time rather
+    /// than whichever registry was installed when the coordinator was
+    /// built, and a stored property's initializer cannot refer to
+    /// `self` otherwise. Never optional: the first access builds it,
+    /// whichever caller that is, so `stop()` may be the one that
+    /// creates it (releasing no waiters, as a new coordinator has
+    /// none).
+    private(set) lazy var ipcWakeCoordinator = IPCWakeCoordinator(
+        store: store, agentRegistry: { [weak self] in self?.agentRegistry }
+    )
 
     // MARK: - /calyx-mcp
 
@@ -310,6 +338,8 @@ final class CalyxMCPServer {
             return await routeCommandEvent(request: request)
         case ("POST", Self.approvalRequestPath):
             return await routeApprovalRequest(request: request)
+        case ("POST", Self.ipcWakePath):
+            return await routeIPCWake(request: request)
         case ("POST", HTTPParser.calyxMCPPath):
             return await routeCalyxMCP(request: request)
         case ("GET", HTTPParser.calyxMCPPath):
@@ -468,9 +498,9 @@ final class CalyxMCPServer {
     /// present-but-blank (e.g. a proxy/plugin bug that sends
     /// `X-Calyx-Agent-Kind: ` with no value), rather than letting an
     /// empty-string kind reach the registry, the sidebar, or the
-    /// approval inbox. Shared by `routeAgentEvent` and
-    /// `routeApprovalRequest` so the same header is resolved identically
-    /// on both routes.
+    /// approval inbox. Shared by `routeAgentEvent`,
+    /// `routeApprovalRequest` and `routeIPCWake` so the same header is
+    /// resolved identically on all three routes.
     private func agentKind(from headers: [String: String]) -> String {
         explicitAgentKind(from: headers) ?? AgentEntry.claudeCodeKind
     }
@@ -936,6 +966,56 @@ final class CalyxMCPServer {
         return HTTPParser.response(
             statusCode: 200,
             body: AgentHookPermissionResponse.body(kind: kind, decision: decision)
+        )
+    }
+
+    /// Handles `POST /ipc-wake`: a long-poll held open on behalf of a
+    /// Claude Code pane so the pane can be told that its bound peer
+    /// has messages waiting. Answers 200 with
+    /// `IPCWakeResponse`'s note as `text/plain` when
+    /// `ipcWakeCoordinator` hands this surface a wake, and 204 with no
+    /// body in every case where there is nothing to say. The note only
+    /// nudges the agent to call `receive_messages` itself; this route
+    /// never reads a message. The request body is ignored: the pane's
+    /// identity comes from its headers alone.
+    ///
+    /// Guard order: bearer auth (401) -> `resolveSurfaceID` (400) -> an
+    /// `X-Calyx-Agent-Kind` other than claude-code short-circuits to
+    /// 204 (this route serves Claude Code panes only; `agentKind(from:)`
+    /// reads an absent header as claude-code) ->
+    /// `IPCWakeSettings.enabled` being off short-circuits to 204 the
+    /// same way -> otherwise long-polls `ipcWakeCoordinator.awaitWake`
+    /// for up to `ipcWakeTimeoutMs`: a wake is 200, and nil (timeout,
+    /// this call's own Task being cancelled, a newer poll for the same
+    /// surface, the surface destroyed, `stop()`) is 204.
+    ///
+    /// The setting gate comes BEFORE any waiter is registered: with the
+    /// setting off the client long-polling `/ipc-wake` gets its 204 at
+    /// once instead of holding a connection open for a wake no check
+    /// would hand out (a disabled check does nothing -- see
+    /// `IPCWakeCoordinator`'s header comment).
+    private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard agentKind(from: request.headers) == AgentEntry.claudeCodeKind else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard IPCWakeSettings.enabled else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard let wake = await ipcWakeCoordinator.awaitWake(surfaceID: surfaceID, timeoutMs: ipcWakeTimeoutMs) else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+        return HTTPParser.response(
+            statusCode: 200, body: wake.bodyData, contentType: "text/plain; charset=utf-8"
         )
     }
 
@@ -1412,6 +1492,11 @@ final class CalyxMCPServer {
         // decision nobody can make anymore -- see
         // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
         approvalInbox.expireAll()
+        // Ends every waiting `/ipc-wake` long-poll: each one returns
+        // 204, so a stopped server never strands a client waiting on a
+        // wake nobody can hand out anymore -- see
+        // `CalyxMCPServerIPCWakeTests.test_serverStop_makesAWaitingPollReturn204`.
+        ipcWakeCoordinator.releaseAllWaiters()
         // Clears every Always-Allow memory recorded this session so a
         // restarted server never silently auto-allows a request the
         // human never actually decided to trust across a stop/start
@@ -2119,6 +2204,15 @@ final class CalyxMCPServer {
         // directly touched — see `syncBoundPeerInboxCounts`'s doc
         // comment.
         await syncBoundPeerInboxCounts(toolName: toolName)
+
+        // Re-check every waiting `/ipc-wake` long-poll after the same
+        // calyx-ipc messaging tools/call requests. Every production
+        // caller of `store.sendMessage`/`broadcast`/`requeue` is reached
+        // through this function, so this one call covers every way a
+        // message enters an inbox.
+        if Self.inboxSyncToolNames.contains(toolName) {
+            ipcWakeCoordinator.reevaluateAllWaiters()
+        }
 
         return response
     }

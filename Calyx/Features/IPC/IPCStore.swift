@@ -22,6 +22,42 @@ struct Message: Sendable, Codable {
     let to: UUID
     let content: String
     var timestamp: Date
+    /// Whether a waiting `/ipc-wake` poll has already been told this
+    /// message exists. `false` for every new message;
+    /// `IPCStore.offerWakes(to:)` is the only writer, and sets it only
+    /// for a wake a waiter actually received, so each message causes at
+    /// most one wake. A field of the message rather than state kept
+    /// beside the inbox, so it travels with the value through
+    /// `receiveMessages`, `requeue`, the inbox cap, `removePeer` and
+    /// `cleanup` with no bookkeeping of its own.
+    ///
+    /// Wake bookkeeping that lives only in this process: never
+    /// serialized. It is not one of `CodingKeys`, so an encoded message
+    /// has no `nudged` key and a decoded message starts un-nudged (this
+    /// default value). The `receive_messages` output is built by
+    /// `CalyxMCPServer.messageToDict`, key by key, and never included
+    /// it either.
+    var nudged = false
+
+    /// Exactly the five keys `Message` had before `nudged` existed, so
+    /// its Codable form is unchanged by that field: the synthesized
+    /// encoder emits these and nothing else, and the synthesized
+    /// decoder reads these and leaves `nudged` at its default. A new
+    /// stored property is serialized only if its key is added here.
+    private enum CodingKeys: String, CodingKey {
+        case id, from, to, content, timestamp
+    }
+}
+
+/// What `IPCStore.offerWakes(to:)` offers a waiter for one peer's inbox:
+/// counts only, never anything a peer chose.
+struct IPCWakeTicket: Sendable, Equatable {
+    /// Messages in the inbox with `nudged == false`; at least 1.
+    let newCount: Int
+    /// Distinct senders among those messages.
+    let senderCount: Int
+    /// Every message in the inbox, nudged or not.
+    let unreadCount: Int
 }
 
 // MARK: - Errors
@@ -349,6 +385,56 @@ actor IPCStore {
         return result
     }
 
+    // MARK: - IPC wake
+
+    /// Offers a wake to each peer in `takers` whose inbox holds at least
+    /// one message with `nudged == false`: builds that inbox's
+    /// `IPCWakeTicket`, calls the peer's taker with it, and, only if the
+    /// taker returns `true` (a waiter actually received the wake), sets
+    /// `nudged` on exactly the messages the ticket counted as new.
+    /// Returns the peers whose taker accepted. A peer with an empty
+    /// inbox, with nothing but nudged messages, or with no inbox at all
+    /// never has its taker called.
+    ///
+    /// The whole method is one actor-isolated synchronous section: it
+    /// has no `await`, so no other store operation can run between the
+    /// check for un-nudged messages, the hand-over to the taker and the
+    /// marking. That is what "each message causes at most one wake"
+    /// rests on: a message cannot arrive, be received or be requeued
+    /// halfway through, and two overlapping calls run one after the
+    /// other, the second seeing the flags the first one set.
+    ///
+    /// A taker therefore runs INSIDE the actor. It must return quickly
+    /// and must not call back into the store (it could not anyway: it
+    /// is synchronous, and every store API needs an `await` from
+    /// outside).
+    ///
+    /// Same read-mostly contract as `inboxCounts(for:)`: no
+    /// `aliveOrPurge`, no `lastSeen` bump, no purge-on-expiry. The
+    /// `nudged` flags are the only thing this writes. Cost is bounded by
+    /// `maxMessagesPerPeer` per peer in `takers`.
+    func offerWakes(to takers: [UUID: @Sendable (IPCWakeTicket) -> Bool]) -> Set<UUID> {
+        var woken: Set<UUID> = []
+        for (peerID, taker) in takers {
+            guard let messages = inbox[peerID] else { continue }
+            let newIndices = messages.indices.filter { !messages[$0].nudged }
+            guard !newIndices.isEmpty else { continue }
+
+            let ticket = IPCWakeTicket(
+                newCount: newIndices.count,
+                senderCount: Set(newIndices.map { messages[$0].from }).count,
+                unreadCount: messages.count
+            )
+            guard taker(ticket) else { continue }
+
+            for index in newIndices {
+                inbox[peerID]?[index].nudged = true
+            }
+            woken.insert(peerID)
+        }
+        return woken
+    }
+
     // MARK: - Cleanup
 
     /// Removes ALL peers and ALL inboxes.
@@ -371,5 +457,11 @@ actor IPCStore {
             messages[index].timestamp = date
             inbox[peerId] = messages
         }
+    }
+
+    /// The `nudged` flag of every message in `peerID`'s inbox, in inbox
+    /// order; `[]` when the peer has no inbox.
+    func _testNudgedFlags(for peerID: UUID) -> [Bool] {
+        (inbox[peerID] ?? []).map(\.nudged)
     }
 }

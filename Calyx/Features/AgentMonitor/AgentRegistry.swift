@@ -845,7 +845,15 @@ final class AgentRegistry {
     /// calyx-ipc tool itself and so never fires the hook path at all.
     /// Both call sites share the same "1 peer = 1 surface" invariant this
     /// method enforces.
+    ///
+    /// Posts `.calyxAgentPeerBindingChanged` for `surfaceID` exactly
+    /// once, after both maps are written, when `surfaceID`'s own bound
+    /// peer actually changed (it had none, or a different one). A
+    /// re-bind of the pair it already has posts nothing, and so does
+    /// the eviction above: a surface that merely lost its peer to
+    /// another surface has no peer left for anyone to act on.
     func bindSurface(_ surfaceID: UUID, toPeer peerID: UUID) {
+        let previousPeerID = surfaceToPeer[surfaceID]
         if let oldPeerID = surfaceToPeer[surfaceID], oldPeerID != peerID {
             peerToSurface.removeValue(forKey: oldPeerID)
         }
@@ -854,6 +862,11 @@ final class AgentRegistry {
         }
         surfaceToPeer[surfaceID] = peerID
         peerToSurface[peerID] = surfaceID
+
+        guard previousPeerID != peerID else { return }
+        NotificationCenter.default.post(
+            name: .calyxAgentPeerBindingChanged, object: self, userInfo: ["surfaceID": surfaceID]
+        )
     }
 
     /// Removes `surfaceID`'s binding in both directions, if any.
@@ -994,4 +1007,10 @@ extension Notification.Name {
     /// Posted when an Agents sidebar row is clicked. `userInfo["surfaceID"]`
     /// carries the `UUID` of the surface to focus.
     static let calyxFocusSurface = Notification.Name("com.calyx.agentMonitor.focusSurface")
+
+    /// Posted by `AgentRegistry.bindSurface` when a surface's bound peer
+    /// is set or changes. `object` is the registry;
+    /// `userInfo["surfaceID"]` carries the `UUID` of the surface whose
+    /// binding changed. Not posted for a surface that lost its peer.
+    static let calyxAgentPeerBindingChanged = Notification.Name("com.calyx.agentMonitor.agentPeerBindingChanged")
 }
