@@ -482,7 +482,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         // reconstructs explicitly.
         let stalePort = server.port
         server.stop()
-        try AgentEndpointFile.write(port: stalePort, token: testToken, directory: appSupportDir)
+        try AgentEndpointFile.write(port: stalePort, token: testToken, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir)
 
         let (exitCode, stdout) = try await Self.runHookScript(
             scriptPath: scriptPath, home: tempHome, stdinJSON: bashLsStdin, surfaceID: UUID()
@@ -544,128 +544,24 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
 
     // MARK: - Connection drop mid-poll (R5)
 
-    /// Handle returned by `runHookScriptCapturingPID`: the spawned
-    /// script's own pid, available as soon as `Process.run()` returns --
-    /// well before the script's `curl` call has even resolved -- plus a
-    /// `Task` the caller can await later for its final
-    /// `(exitCode, stdout)`. Unlike `runHookScript` above (which blocks
-    /// until the whole child process tree has exited before returning
-    /// anything), this lets a test locate and kill the script's own curl
-    /// child WHILE the script is still blocked reading
-    /// `/approval-request`'s long-poll response.
-    private struct RunningHookScript {
-        let pid: Int32
-        let result: Task<(exitCode: Int32, stdout: String), Never>
-    }
-
-    /// `Process`/`Pipe`/`FileHandle` are all `Sendable` in this SDK
-    /// (`Process`/`Pipe` bridge to `NSTask`/`NSPipe`, both confirmed
-    /// `Sendable` -- verified against the installed SDK), so capturing
-    /// them across the `Task.detached` boundary below is safe under
-    /// Swift 6 strict concurrency; unlike `runHookScript`'s `self`-sending
-    /// concern (see its own doc comment), nothing non-Sendable is
-    /// captured here.
+    /// Starts the installed script through the shared
+    /// `HookScriptProcessTree.startHookScript` and returns its pid (known
+    /// as soon as `Process.run()` returns, well before the script's curl
+    /// has even started) plus a Task yielding its exit code, stdout and
+    /// stderr. Unlike `runHookScript` above (which blocks until the whole
+    /// child process tree has exited), this lets a test locate and kill
+    /// the script's own curl WHILE the script is still blocked reading
+    /// `/approval-request`'s long-poll response. The environment is
+    /// HOME, the inherited PATH and, when given, CALYX_SURFACE_ID.
     private nonisolated static func runHookScriptCapturingPID(
         scriptPath: String, home: String, stdinJSON: String, surfaceID: UUID?
-    ) throws -> RunningHookScript {
+    ) throws -> HookScriptProcessTree.RunningScript {
         let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
         var env = ["HOME": home, "PATH": inheritedPath]
         if let surfaceID {
             env["CALYX_SURFACE_ID"] = surfaceID.uuidString
         }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [scriptPath]
-        process.environment = env
-
-        let stdinPipe = Pipe()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        try process.run()
-        stdinPipe.fileHandleForWriting.write(Data(stdinJSON.utf8))
-        stdinPipe.fileHandleForWriting.closeFile()
-
-        let pid = process.processIdentifier
-        let resultTask = Task.detached(priority: .userInitiated) {
-            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            _ = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return (exitCode: process.terminationStatus, stdout: String(data: stdoutData, encoding: .utf8) ?? "")
-        }
-
-        return RunningHookScript(pid: pid, result: resultTask)
-    }
-
-    /// Breadth-first search of `ancestorPID`'s process-tree descendants
-    /// for the first process whose `comm` (bare executable name, no
-    /// arguments) is `processName`, polling up to `timeout` since the
-    /// descendant may not have forked yet the instant this is first
-    /// called. `sh -c 'x=$(curl ...)'` was confirmed empirically (spawn a
-    /// backgrounded `sh -c 'x=$(sleep 5)'` and inspect `ps -o pid,ppid,comm`)
-    /// to fork an intermediate subshell before `curl` itself runs --
-    /// `curl` is a GRANDCHILD of the script's own pid, not a direct
-    /// child -- so a single-level `pgrep -P <sh pid>` alone is not
-    /// enough; this walks the whole descendant tree instead.
-    private nonisolated static func findDescendantProcess(
-        ofAncestor ancestorPID: Int32, commandName processName: String, timeout: TimeInterval = 3.0
-    ) async -> Int32? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let found = descendantMatching(ofAncestor: ancestorPID, commandName: processName) {
-                return found
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return nil
-    }
-
-    private nonisolated static func descendantMatching(ofAncestor ancestorPID: Int32, commandName processName: String) -> Int32? {
-        var frontier = childPIDs(ofParent: ancestorPID)
-        var visited = Set<Int32>()
-        while !frontier.isEmpty {
-            let current = frontier.removeFirst()
-            guard !visited.contains(current) else { continue }
-            visited.insert(current)
-            if processCommandName(ofPID: current) == processName {
-                return current
-            }
-            frontier.append(contentsOf: childPIDs(ofParent: current))
-        }
-        return nil
-    }
-
-    private nonisolated static func childPIDs(ofParent pid: Int32) -> [Int32] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-P", String(pid)]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-        return output.split(separator: "\n").compactMap { Int32($0) }
-    }
-
-    private nonisolated static func processCommandName(ofPID pid: Int32) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-p", String(pid), "-o", "comm="]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : (trimmed as NSString).lastPathComponent
+        return try HookScriptProcessTree.startHookScript(scriptPath: scriptPath, environment: env, stdin: stdinJSON)
     }
 
     /// Polls `approvalInbox.pending` for up to `timeout` seconds,
@@ -706,7 +602,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(pendingRequest,
                         "the script's real POST must reach the injected approval inbox before its curl child is killed")
 
-        let curlPID = await Self.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
+        let curlPID = await HookScriptProcessTree.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
         let killPID = try XCTUnwrap(curlPID, "must locate the script's own curl child process to kill it")
 
         XCTAssertEqual(kill(killPID, SIGKILL), 0, "must be able to SIGKILL the located curl child")
@@ -717,7 +613,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                       "under the 30s approvalRequestTimeoutMs above -- rather than leaving it pending until " +
                       "that timeout")
 
-        let (exitCode, stdout) = await running.result.value
+        let (exitCode, stdout, _) = await running.result.value
         XCTAssertEqual(exitCode, 0, "the hook script must always exit 0, even when its own curl child is killed")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so the long-poll can only resolve by the " +
@@ -761,7 +657,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                         "the script's real POST must reach the injected approval inbox before the script " +
                         "itself is killed")
 
-        let curlPID = await Self.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
+        let curlPID = await HookScriptProcessTree.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
         let observedCurlPID = try XCTUnwrap(curlPID, "must locate the script's own curl child before killing the script")
 
         XCTAssertEqual(kill(running.pid, SIGTERM), 0, "must be able to SIGTERM the script's own /bin/sh process")
@@ -774,26 +670,14 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
 
         // Poll rather than a single immediate check: the trap's `kill` and
         // the OS actually reaping the process are not the same instant.
-        let curlGone = await Self.waitUntilProcessGone(pid: observedCurlPID, timeout: 3.0)
+        let curlGone = await HookScriptProcessTree.waitUntilProcessGone(pid: observedCurlPID, timeout: 3.0)
         XCTAssertTrue(curlGone,
                       "the script's own curl child must not survive as an orphan once the script itself is " +
                       "killed -- the trap must kill it explicitly")
 
-        let (exitCode, stdout) = await running.result.value
+        let (exitCode, stdout, _) = await running.result.value
         XCTAssertEqual(exitCode, 0, "the hook script's own trap must still exit 0 on SIGTERM")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so a killed script must never print anything")
-    }
-
-    /// Polls until `pid` no longer identifies a live process (either
-    /// exited or reaped), used to confirm curl doesn't linger as an
-    /// orphan after the fix kills it.
-    private nonisolated static func waitUntilProcessGone(pid: Int32, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if kill(pid, 0) != 0 { return true }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return kill(pid, 0) != 0
     }
 }

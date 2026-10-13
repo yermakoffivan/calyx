@@ -1,8 +1,9 @@
 // CalyxEndpointFileFallbackConsistencyTests.swift
 // CalyxTests
 //
-// Ties the six generated bodies that read agent-endpoint.json --
-// AgentHookScript, ApprovalHookScript, OpenCodePluginManager,
+// Ties the seven generated bodies that read agent-endpoint.json --
+// AgentHookScript, ApprovalHookScript, IPCWakeHookScript,
+// OpenCodePluginManager,
 // PiExtensionManager, and ShellIntegrationInstaller's zsh (calyxZshBody)
 // and fish (fishIntegrationBody) bodies -- to one shared source of
 // truth for their literal CALYX_ENDPOINT_FILE fallback path:
@@ -12,11 +13,11 @@
 // already pins its own body's exact fallback expression; this file
 // exists so that if a future edit changes one generator's literal
 // without going through AgentEndpointFile, the resulting drift between
-// generators is caught here rather than only visible as six separately
+// generators is caught here rather than only visible as seven separately
 // worded (and now silently disagreeing) fallback paths.
 //
-// Coverage: every one of the six bodies contains CALYX_ENDPOINT_FILE,
-// and every one of the four shell-syntax bodies contains the exact
+// Coverage: every one of the seven bodies contains CALYX_ENDPOINT_FILE,
+// and every one of the five shell-syntax bodies contains the exact
 // same AgentEndpointFile.shellFallbackPath literal
 // ("$HOME/Library/Application Support/Calyx/agent-endpoint.json"),
 // while the two JavaScript bodies contain the exact same
@@ -33,6 +34,7 @@ final class CalyxEndpointFileFallbackConsistencyTests: XCTestCase {
         let bodies: [(name: String, body: String)] = [
             ("AgentHookScript", AgentHookScript.scriptBody),
             ("ApprovalHookScript", ApprovalHookScript.scriptBody),
+            ("IPCWakeHookScript", IPCWakeHookScript.scriptBody),
             ("OpenCodePluginManager", OpenCodePluginManager.scriptBody),
             ("PiExtensionManager", PiExtensionManager.scriptBody),
             ("ShellIntegrationInstaller.calyxZshBody", ShellIntegrationInstaller.calyxZshBody),
@@ -51,6 +53,7 @@ final class CalyxEndpointFileFallbackConsistencyTests: XCTestCase {
         let shellBodies: [(name: String, body: String)] = [
             ("AgentHookScript", AgentHookScript.scriptBody),
             ("ApprovalHookScript", ApprovalHookScript.scriptBody),
+            ("IPCWakeHookScript", IPCWakeHookScript.scriptBody),
             ("ShellIntegrationInstaller.calyxZshBody", ShellIntegrationInstaller.calyxZshBody),
             ("ShellIntegrationInstaller.fishIntegrationBody", ShellIntegrationInstaller.fishIntegrationBody),
         ]

@@ -1,13 +1,18 @@
 // AgentHooksCoordinator.swift
 // Calyx
 //
-// Coordinates installing/removing calyx-agent-hook plus each agent CLI's
-// own hook/plugin wiring (Claude Code's hooks.json, Codex's config.toml
-// managed block, OpenCode's plugin file, Grok's own hook file under
-// ~/.grok/hooks, pi's extension file under ~/.pi/agent/extensions) across
-// the tools Calyx supports, collecting results independently so one
-// tool's failure does not block the others. Mirrors IPCConfigManager's
-// shape (ConfigStatus per tool, directory-existence-based skip).
+// Coordinates each agent CLI's own hook/plugin wiring (Claude Code's
+// "hooks" section in settings.json, Codex's config.toml managed block,
+// OpenCode's plugin file, Grok's own hook file under ~/.grok/hooks, pi's
+// extension file under ~/.pi/agent/extensions) across the tools Calyx
+// supports, together with the hook scripts that wiring runs:
+// calyx-agent-hook and calyx-approval-hook (shared by Claude Code, Codex
+// and Grok) and calyx-ipc-wake-hook (Claude Code alone). `install()` and
+// `resyncInstalled()` write the scripts and the wiring; `remove()`
+// removes only each tool's wiring and leaves the scripts in place.
+// Results are collected independently so one tool's failure does not
+// block the others. Mirrors IPCConfigManager's shape (ConfigStatus per
+// tool, directory-existence-based skip).
 
 import Foundation
 
@@ -82,6 +87,12 @@ struct AgentHooksCoordinator: Sendable {
     /// misleading `.failed`. Does not block OpenCode or pi, whose plugin
     /// and extension talk to the IPC endpoint over `fetch` rather than
     /// through the shared shell scripts.
+    ///
+    /// `calyx-ipc-wake-hook` is not one of the scripts written up front:
+    /// Claude Code's leg writes it, after its own guard passed (see
+    /// `writeClaudeCodeHooks`), so a machine without Claude Code never
+    /// gets that file, and a failure to write it is Claude Code's
+    /// `.failed` status alone.
     static func install() -> AgentHooksResult {
         let scriptPath: String
         let approvalScriptPath: String
@@ -134,11 +145,14 @@ struct AgentHooksCoordinator: Sendable {
     /// `.skipped` when it isn't already present, exactly like `remove()`
     /// above.
     ///
-    /// When none of the tools already have Calyx's hooks, returns
-    /// every tool `.skipped` WITHOUT installing the shared
+    /// When none of the tools already have Calyx's hooks, returns every
+    /// tool `.skipped` WITHOUT installing the shared
     /// `calyx-agent-hook`/`calyx-approval-hook` scripts at all -- a user
     /// who has never opted into IPC for any tool must never get hook
     /// files written to disk on their behalf just from this running.
+    /// `calyx-ipc-wake-hook` is written by Claude Code's leg only, and
+    /// only when that leg is not skipped: a resync where only another
+    /// tool has Calyx's hooks never writes it.
     static func resyncInstalled() -> AgentHooksResult {
         let claudeInstalled = ClaudeHooksConfigManager.areHooksInstalled()
         let codexInstalled = CodexHooksConfigManager.areHooksInstalled()
@@ -190,8 +204,22 @@ struct AgentHooksCoordinator: Sendable {
             return .skipped(reason: "not installed")
         }
         return captureStatus {
-            try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
+            try writeClaudeCodeHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
         }
+    }
+
+    /// The body `installClaudeCode` and `resyncClaudeCode` share once
+    /// their own guard passed: writes `calyx-ipc-wake-hook`, then Claude
+    /// Code's hook entries. The wake script is written here rather than
+    /// next to the two shared scripts because only Claude Code has a
+    /// hook entry that runs it. Script before entries: an entry must
+    /// never point at a script that is not there, so when the script
+    /// cannot be written this throws and no entry is written.
+    private static func writeClaudeCodeHooks(scriptPath: String, approvalScriptPath: String) throws {
+        let wakeScriptPath = try IPCWakeHookScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
+        try ClaudeHooksConfigManager.installHooks(
+            scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, wakeScriptPath: wakeScriptPath
+        )
     }
 
     private static func removeClaudeCode() -> ConfigStatus {
@@ -213,7 +241,8 @@ struct AgentHooksCoordinator: Sendable {
     /// `resyncInstalled()`'s own pre-captured `areHooksInstalled()`
     /// snapshot, not re-queried here, so it stays consistent with the
     /// value that decided whether the shared scripts were installed at
-    /// all.
+    /// all. Past the guard it writes the wake script and the hook
+    /// entries exactly as `installClaudeCode` does.
     private static func resyncClaudeCode(
         alreadyInstalled: Bool, scriptPath: String, approvalScriptPath: String
     ) -> ConfigStatus {
@@ -221,7 +250,7 @@ struct AgentHooksCoordinator: Sendable {
             return .skipped(reason: "not installed")
         }
         return captureStatus {
-            try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
+            try writeClaudeCodeHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
         }
     }
 

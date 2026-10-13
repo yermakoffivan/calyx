@@ -184,7 +184,7 @@ final class CalyxMCPServerUsageToolsTests: XCTestCase {
             XCTAssertEqual(response.statusCode, 200)
             let names = try toolNames(response.body)
             XCTAssertEqual(names.filter { $0 == "usage_report" }.count, 1)
-            XCTAssertEqual(names.count, 86)
+            XCTAssertEqual(names.count, 87)
         }
     }
 

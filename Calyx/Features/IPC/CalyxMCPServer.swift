@@ -19,6 +19,17 @@ final class CalyxMCPServer {
 
     private(set) var isRunning: Bool = false
     private(set) var port: Int = 0
+    /// The key `routeIPCWake` proves this server's identity with (see
+    /// `IPCWakeProofKey`). `start` replaces it with a fresh one before
+    /// `finishStart` writes its two blocks into `agent-endpoint.json`.
+    /// Neither the key nor its blocks ever go into a response header or
+    /// body, and none of them is ever logged.
+    private(set) var wakeProofKey = IPCWakeProofKey.random()
+    /// Whether `wakeProofKey`'s blocks reached `agent-endpoint.json`.
+    /// `start` clears it with each fresh key, and `finishStart` sets it
+    /// only when `AgentEndpointFile.write` succeeds; `routeIPCWake`
+    /// hands out no wake while it is false (D20).
+    private(set) var wakeProofKeyPublished = false
     private(set) var token: String = "" {
         didSet { sessionBearerToken.value = token }
     }
@@ -73,10 +84,19 @@ final class CalyxMCPServer {
         return fmt
     }()
 
-    /// The `/approval-request` route's path, shared by `route(request:)`'s
-    /// own switch case and `dispatchRoute`'s guard so the one path string
-    /// that gates the connection-drop watch exists in exactly one place.
+    /// The `/approval-request` route's path, shared by
+    /// `route(request:)`'s own switch case and
+    /// `connectionDropWatchedPaths` below, so the path string exists in
+    /// exactly one place.
     private static let approvalRequestPath = "/approval-request"
+
+    /// The `/ipc-wake` route's path: the long-poll held open on behalf
+    /// of a Claude Code pane (see `routeIPCWake`).
+    private static let ipcWakePath = "/ipc-wake"
+
+    /// The paths whose `POST` gets `dispatchRoute`'s connection-drop
+    /// watch: the two routes that hold a request open as a long-poll.
+    private static let connectionDropWatchedPaths: Set<String> = [approvalRequestPath, ipcWakePath]
 
     /// Shared request-body size cap (bytes), checked BEFORE decode, by
     /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
@@ -190,6 +210,45 @@ final class CalyxMCPServer {
     /// `approvalTimeoutMs`.
     var approvalRequestTimeoutMs: Int = ApprovalHookTiming.serverTimeoutMs
 
+    /// The timeout `POST /ipc-wake`'s long-poll (`routeIPCWake`) gives
+    /// `ipcWakeCoordinator.awaitWake` before answering 204. Defaults to
+    /// `IPCWakeHookTiming.serverTimeoutMs` (see that enum's header
+    /// comment for the full nesting rationale against the polling
+    /// client's own curl timeout and the CLI's hook-entry timeout);
+    /// test-overridable so tests can drive the timeout path in well
+    /// under a second, same rationale as `approvalRequestTimeoutMs`.
+    var ipcWakeTimeoutMs: Int = IPCWakeHookTiming.serverTimeoutMs
+
+    /// Holds every suspended `POST /ipc-wake` long-poll and wakes one
+    /// when its pane's bound peer has messages it has not been told
+    /// about yet -- see `IPCWakeCoordinator`'s header comment. `lazy`
+    /// because its `agentRegistry` closure captures `self`, weakly, to
+    /// read the swappable `agentRegistry` property each time rather
+    /// than whichever registry was installed when the coordinator was
+    /// built, and a stored property's initializer cannot refer to
+    /// `self` otherwise. Never optional: the first access builds it,
+    /// whichever caller that is, so `stop()` may be the one that
+    /// creates it (releasing no waiters, as a new coordinator has
+    /// none).
+    private(set) lazy var ipcWakeCoordinator: IPCWakeCoordinator = {
+        #if DEBUG
+        let isEnabled = _testIPCWakeIsEnabled ?? { IPCWakeSettings.enabled }
+        #else
+        let isEnabled: @MainActor () -> Bool = { IPCWakeSettings.enabled }
+        #endif
+        return IPCWakeCoordinator(
+            store: store, agentRegistry: { [weak self] in self?.agentRegistry }, isEnabled: isEnabled
+        )
+    }()
+
+    #if DEBUG
+    /// Test seam: when set before `ipcWakeCoordinator` is first accessed,
+    /// the coordinator is built with this as its `isEnabled` provider
+    /// instead of `{ IPCWakeSettings.enabled }`. DO NOT use from
+    /// production code.
+    var _testIPCWakeIsEnabled: (@MainActor () -> Bool)?
+    #endif
+
     // MARK: - /calyx-mcp
 
     /// The router `/calyx-mcp` dispatches to. Every `/calyx-mcp` request
@@ -222,10 +281,23 @@ final class CalyxMCPServer {
     /// dispatch, by which point any test that overrides
     /// `cockpitAccess`/`sessionSurfaceMap`/`approvalInbox`/
     /// `agentRegistry`/`commandLogStore` has already done so.
-    private lazy var lazyCockpitBridge = MCPCockpitBridge(
-        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
-        approvals: approvalInbox, agentRegistry: agentRegistry, commandLogStore: commandLogStore
-    )
+    /// agent_status's unread counts are read live from this server's
+    /// own `store`, not from the agent rows' cached `unreadCount`.
+    private lazy var lazyCockpitBridge = makeCockpitBridge()
+
+    /// Builds `lazyCockpitBridge`. A method rather than an inline
+    /// property initializer: the compiler rejects a stored property's
+    /// initializer that mixes the main actor with the `IPCStore` actor
+    /// the inbox-count closure calls into.
+    private func makeCockpitBridge() -> MCPCockpitBridge {
+        let store = self.store
+        return MCPCockpitBridge(
+            access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
+            approvals: approvalInbox, agentRegistry: agentRegistry,
+            inboxCounts: { peerIDs in await store.inboxCounts(for: peerIDs) },
+            commandLogStore: commandLogStore
+        )
+    }
 
     /// Records an agent hook event's self-reported session ID into the
     /// calyx-session daemon's per-session meta map, so a later
@@ -310,6 +382,8 @@ final class CalyxMCPServer {
             return await routeCommandEvent(request: request)
         case ("POST", Self.approvalRequestPath):
             return await routeApprovalRequest(request: request)
+        case ("POST", Self.ipcWakePath):
+            return await routeIPCWake(request: request)
         case ("POST", HTTPParser.calyxMCPPath):
             return await routeCalyxMCP(request: request)
         case ("GET", HTTPParser.calyxMCPPath):
@@ -468,9 +542,9 @@ final class CalyxMCPServer {
     /// present-but-blank (e.g. a proxy/plugin bug that sends
     /// `X-Calyx-Agent-Kind: ` with no value), rather than letting an
     /// empty-string kind reach the registry, the sidebar, or the
-    /// approval inbox. Shared by `routeAgentEvent` and
-    /// `routeApprovalRequest` so the same header is resolved identically
-    /// on both routes.
+    /// approval inbox. Shared by `routeAgentEvent`,
+    /// `routeApprovalRequest` and `routeIPCWake` so the same header is
+    /// resolved identically on all three routes.
     private func agentKind(from headers: [String: String]) -> String {
         explicitAgentKind(from: headers) ?? AgentEntry.claudeCodeKind
     }
@@ -939,6 +1013,95 @@ final class CalyxMCPServer {
         )
     }
 
+    /// Handles `POST /ipc-wake`: a long-poll held open on behalf of a
+    /// Claude Code pane so the pane can be told that its bound peer
+    /// has messages waiting. Answers 200 with a proof line followed by
+    /// `IPCWakeResponse`'s note as `text/plain` when
+    /// `ipcWakeCoordinator` hands this surface a wake, and 204 with no
+    /// body in every case where there is nothing to say. The note only
+    /// nudges the agent to call `receive_messages` itself; this route
+    /// never reads a message. The request body is ignored: the pane's
+    /// identity comes from its headers alone.
+    ///
+    /// Guard order: bearer auth (401) -> `resolveSurfaceID` (400) -> an
+    /// `X-Calyx-Agent-Kind` other than claude-code short-circuits to 204
+    /// (this route serves Claude Code panes only; `agentKind(from:)`
+    /// reads an absent header as claude-code) ->
+    /// `ipcWakeCoordinator.isEnabled` (the single reader of the setting)
+    /// being false short-circuits to 204 the same way ->
+    /// `wakeProofKeyPublished` being false (this start's key never
+    /// reached `agent-endpoint.json`) short-circuits to 204 the same
+    /// way -> an `X-Calyx-Wake-Nonce` (`IPCWakeResponse.nonceHeader`)
+    /// that is absent or not a UUID in its canonical uppercase form
+    /// (what `UUID().uuidString` produces; `HTTPParser` trims
+    /// surrounding whitespace from header values, and the trimmed value
+    /// must equal its canonical uppercase form exactly) is 400, with no waiter registered -> otherwise long-polls
+    /// `ipcWakeCoordinator.awaitWake` for up to
+    /// `ipcWakeTimeoutMs`: a wake is 200, and every release is 204. The
+    /// release paths are: the timeout; a connection drop (the
+    /// connection-drop watch in `dispatchRoute` cancels this call's
+    /// Task); a newer poll for the same surface; the surface destroyed;
+    /// the setting turned off (`SettingsWindowController.ipcWakeDidChange`
+    /// calls `releaseAllWaiters()`); and `stop()`.
+    ///
+    /// The setting gate comes BEFORE any waiter is registered: with the
+    /// setting off `calyx-ipc-wake-hook` (`IPCWakeHookScript`), the
+    /// client long-polling `/ipc-wake`, gets its 204 at once instead of
+    /// holding a connection open for a wake no check would hand out (a
+    /// disabled check does nothing -- see `IPCWakeCoordinator`'s header
+    /// comment).
+    ///
+    /// The unpublished-key gate also comes before any waiter (D20): a
+    /// restart can reuse the port and token, so a stale
+    /// `agent-endpoint.json` still looks valid to the hook but holds the
+    /// previous key's blocks. Handing a wake over then would mark the
+    /// messages announced while the hook rejects the proof, so this
+    /// route answers 204 and leaves them unannounced.
+    ///
+    /// The 200 body is `IPCWakeResponse.responseBody(proof:note:)` with
+    /// the proof `wakeProofKey.proof(nonce:note:)`: line 1 is the
+    /// HMAC-SHA256 under `wakeProofKey` over the request's nonce and the
+    /// note, line 2 is the note. The proof shows `calyx-ipc-wake-hook`
+    /// that the answer comes from the Calyx that wrote
+    /// `agent-endpoint.json`, and the nonce binds it to this poll, so it
+    /// cannot be replayed as the answer to another one.
+    private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard agentKind(from: request.headers) == AgentEntry.claudeCodeKind else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard ipcWakeCoordinator.isEnabled else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard wakeProofKeyPublished else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard let nonce = header(named: IPCWakeResponse.nonceHeader, in: request.headers),
+              UUID(uuidString: nonce)?.uuidString == nonce
+        else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let wake = await ipcWakeCoordinator.awaitWake(surfaceID: surfaceID, timeoutMs: ipcWakeTimeoutMs) else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+        return HTTPParser.response(
+            statusCode: 200,
+            body: IPCWakeResponse.responseBody(proof: wakeProofKey.proof(nonce: nonce, note: wake.note), note: wake.note),
+            contentType: "text/plain; charset=utf-8"
+        )
+    }
+
     // MARK: - /calyx-mcp routes
 
     /// Like `route(request:)`, but a `/calyx-mcp` POST or GET may answer
@@ -1232,6 +1395,21 @@ final class CalyxMCPServer {
         let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
 
         self.token = token
+        // A fresh key per start, before `finishStart` publishes its
+        // blocks in `agent-endpoint.json`.
+        self.wakeProofKey = IPCWakeProofKey.random()
+        self.wakeProofKeyPublished = false
+
+        // Connect the store's inbox-growth reports to the wake
+        // coordinator before the listener accepts anything, so every
+        // message that enters an inbox from now on requests a check for
+        // its recipient's waiting poll. Left installed by `stop()`: with
+        // no waiters the coordinator does nothing.
+        await store.setInboxAppendedSink { [weak self] peerID in
+            Task { @MainActor in
+                self?.ipcWakeCoordinator.inboxGrew(peerID: peerID)
+            }
+        }
 
         var lastError: Error?
 
@@ -1331,17 +1509,26 @@ final class CalyxMCPServer {
     /// production wiring.
     ///
     /// Writes `agent-endpoint.json` (port/token for the calyx-agent-hook
-    /// script) on a best-effort basis: a write failure only degrades the
-    /// Agents sidebar (hook events from panes have nowhere to POST to)
-    /// and must not take down the whole IPC server, whose MCP tools have
-    /// nothing to do with this file.
+    /// script, and `wakeProofKey`'s two blocks for calyx-ipc-wake-hook)
+    /// on a best-effort basis: a write failure only degrades the Agents
+    /// sidebar (hook events from panes have nowhere to POST to) and the
+    /// wake hook, and must not take down the whole IPC server, whose MCP
+    /// tools have nothing to do with this file. On a fresh install there
+    /// is no file, so the hooks exit before curl; after a restart the
+    /// previous file may remain and still name a valid port and token
+    /// but the previous key's blocks, which is why `routeIPCWake`
+    /// withholds wakes until this write succeeds and sets
+    /// `wakeProofKeyPublished` (D20).
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
         priorTeardown: Task<Void, Never>?
     ) {
         do {
-            try AgentEndpointFile.write(port: boundPort, token: token, directory: agentEndpointDirectory)
+            try AgentEndpointFile.write(
+                port: boundPort, token: token, wakeProofKey: wakeProofKey, directory: agentEndpointDirectory
+            )
+            wakeProofKeyPublished = true
         } catch {
             NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
         }
@@ -1412,6 +1599,11 @@ final class CalyxMCPServer {
         // decision nobody can make anymore -- see
         // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
         approvalInbox.expireAll()
+        // Ends every waiting `/ipc-wake` long-poll: each one returns
+        // 204, so a stopped server never strands a client waiting on a
+        // wake nobody can hand out anymore -- see
+        // `CalyxMCPServerIPCWakeTests.test_serverStop_makesAWaitingPollReturn204`.
+        ipcWakeCoordinator.releaseAllWaiters()
         // Clears every Always-Allow memory recorded this session so a
         // restarted server never silently auto-allows a request the
         // human never actually decided to trust across a stop/start
@@ -1749,22 +1941,33 @@ final class CalyxMCPServer {
     }
 
     /// Runs `route(request:)`, additionally wiring a connection-drop
-    /// watch scoped to `POST /approval-request` ONLY (both method AND
-    /// path -- a stray non-POST request to the same path just falls
-    /// through to the plain `await route(request:)` path below, same as
-    /// every other route, and gets its ordinary 404 with no Task+sentinel
-    /// wrapping): that endpoint alone can suspend for up to
-    /// `approvalRequestTimeoutMs` (~9.5 minutes)
-    /// awaiting a human decision, so it alone needs to notice the peer
-    /// disappearing mid-poll (the hook process getting killed by curl's
-    /// own `-m` deadline or the CLI's hook-entry timeout) and cancel its
-    /// own `route(request:)` Task — cancellation propagates into
-    /// `approvalInbox.awaitDecision`'s cancellation handler, expiring
-    /// the pending request and clearing its banner (see
-    /// `routeApprovalRequest`'s own doc comment, point (c)). Every other
-    /// route still runs via the plain `await route(request:)` path below
-    /// completely unchanged — none of them block on a human, so none of
-    /// them need this.
+    /// watch scoped to a `POST` to one of `connectionDropWatchedPaths`
+    /// ONLY, `/approval-request` and `/ipc-wake` (both method AND path
+    /// -- a stray non-POST request to the same path just falls through
+    /// to the plain `await route(request:)` path below, same as every
+    /// other route, and gets its ordinary 404 with no Task+sentinel
+    /// wrapping). These two endpoints are the ones that hold a request
+    /// open as a long-poll, so they need to notice the peer disappearing
+    /// mid-poll and cancel their own `route(request:)` Task:
+    ///
+    /// - `/approval-request` can suspend for up to
+    ///   `approvalRequestTimeoutMs` (~9.5 minutes) awaiting a human
+    ///   decision. When the peer disappears (the hook process getting
+    ///   killed by curl's own `-m` deadline or the CLI's hook-entry
+    ///   timeout), cancellation propagates into
+    ///   `approvalInbox.awaitDecision`'s cancellation handler, expiring
+    ///   the pending request and clearing its banner (see
+    ///   `routeApprovalRequest`'s own doc comment, point (c)).
+    /// - `/ipc-wake` can suspend for up to `ipcWakeTimeoutMs` awaiting a
+    ///   wake. Cancellation reaches `IPCWakeCoordinator.awaitWake`'s
+    ///   cancellation handling, which ends that waiter and leaves every
+    ///   message flag untouched, so a pane whose hook process died is
+    ///   not left registered until `ipcWakeTimeoutMs`.
+    ///
+    /// Every other route still runs via the plain
+    /// `await route(request:)` path below completely unchanged: none of
+    /// them is held open here, so none of them need this (`/calyx-mcp`
+    /// arms the same sentinel itself, in `serveCalyxMCP`).
     ///
     /// THE REAL MECHANISM (empirically verified, replacing an earlier
     /// `connection.stateUpdateHandler`-based attempt that never actually
@@ -1792,7 +1995,7 @@ final class CalyxMCPServer {
     private func dispatchRoute(
         connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
     ) async -> HTTPResponse {
-        guard request.method == "POST", request.path == Self.approvalRequestPath else {
+        guard request.method == "POST", Self.connectionDropWatchedPaths.contains(request.path) else {
             return await route(request: request)
         }
 
@@ -1809,13 +2012,14 @@ final class CalyxMCPServer {
         return await routeTask.value
     }
 
-    /// Serves a `/calyx-mcp` request, whose response may be a stream. The
-    /// connection-drop sentinel `dispatchRoute` arms for
-    /// `/approval-request` watches this request too, for as long as its
-    /// response is pending or streaming: a drop cancels the route's Task
-    /// and ends `lifetime`, which finishes the stream and cancels whatever
-    /// was producing it. A stream is written with chunked transfer
-    /// encoding, one chunk per element, then the connection is closed.
+    /// Serves a `/calyx-mcp` request, whose response may be a stream.
+    /// The connection-drop sentinel `dispatchRoute` arms for
+    /// `/approval-request` and `/ipc-wake` watches this request too, for
+    /// as long as its response is pending or streaming: a drop cancels
+    /// the route's Task and ends `lifetime`, which finishes the stream
+    /// and cancels whatever was producing it. A stream is written with
+    /// chunked transfer encoding, one chunk per element, then the
+    /// connection is closed.
     private func serveCalyxMCP(connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator) async {
         let lifetime = Task<Void, Never> {
             while !Task.isCancelled {
@@ -1915,15 +2119,16 @@ final class CalyxMCPServer {
     }
 
     /// The sentinel receive `dispatchRoute` arms for `/approval-request`
-    /// and `serveCalyxMCP` for `/calyx-mcp` — see `dispatchRoute`'s own
-    /// doc comment for the full rationale. `isSettled` says whether the
-    /// response is already complete, in which case a completing receive
-    /// (including the one `sendHTTPResponse`'s own `connection.cancel()`
-    /// completes) is a no-op; otherwise a terminal receive calls `onDrop`.
-    /// Kept as its own recursive method (mirroring `receiveUntilComplete`'s
-    /// shape) rather than inline, so the re-arm-on-non-terminal-data step
-    /// reads as a plain recursive call instead of a nested closure
-    /// capturing itself.
+    /// and `/ipc-wake`, and `serveCalyxMCP` for `/calyx-mcp` -- see
+    /// `dispatchRoute`'s own doc comment for the full rationale.
+    /// `isSettled` says whether the response is already complete, in
+    /// which case a completing receive (including the one
+    /// `sendHTTPResponse`'s own `connection.cancel()` completes) is a
+    /// no-op; otherwise a terminal receive calls `onDrop`. Kept as its
+    /// own recursive method (mirroring `receiveUntilComplete`'s shape)
+    /// rather than inline, so the re-arm-on-non-terminal-data step reads
+    /// as a plain recursive call instead of a nested closure capturing
+    /// itself.
     private func armConnectionDropSentinel(
         connection: NWConnection,
         isSettled: @escaping @MainActor () -> Bool,
@@ -2162,7 +2367,8 @@ final class CalyxMCPServer {
             return await handleCockpitToolCall(
                 id: id,
                 toolName: toolName,
-                params: params
+                params: params,
+                surfaceID: surfaceID
             )
         }
 
@@ -2517,19 +2723,23 @@ final class CalyxMCPServer {
 
     // MARK: - Cockpit Tool Dispatch
 
-    /// Route a Cockpit tool call (`pane_list`/`pane_split`/`tab_create`)
-    /// to `MCPCockpitBridge`, mirroring
-    /// `handleTerminalToolCall`'s shape exactly: `MCPCockpitBridgeError`
+    /// Route a Cockpit tool call to `MCPCockpitBridge`, mirroring
+    /// `handleTerminalToolCall`'s shape: `MCPCockpitBridgeError`
     /// also conforms to `LocalizedError`, so a single generic `catch`
     /// builds the tool-error text from `error.localizedDescription`.
+    /// Passes the request's surface, as `handleUsageToolCall` does, so
+    /// agent_status can mark the calling pane with `is_self`.
     private func handleCockpitToolCall(
         id: JSONRPCId,
         toolName: String,
-        params: [String: AnyCodable]
+        params: [String: AnyCodable],
+        surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
         let arguments = extractDict(params, "arguments") ?? [:]
         do {
-            let text = try await lazyCockpitBridge.handleToolCall(name: toolName, arguments: arguments)
+            let text = try await lazyCockpitBridge.handleToolCall(
+                name: toolName, arguments: arguments, callerSurfaceID: surfaceID
+            )
             return toolSuccess(id: id, text: text)
         } catch {
             return toolError(id: id, text: error.localizedDescription)

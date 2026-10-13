@@ -52,7 +52,7 @@ final class AgentEndpointFileReadTests: XCTestCase {
     // MARK: - Success
 
     func test_read_decodesFileWrittenByWrite() throws {
-        try AgentEndpointFile.write(port: 41833, token: "read-token-xyz", directory: tempDir)
+        try AgentEndpointFile.write(port: 41833, token: "read-token-xyz", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         let endpoint = AgentEndpointFile.read(directory: tempDir)
 

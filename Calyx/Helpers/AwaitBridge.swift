@@ -12,6 +12,13 @@
 // consolidation rationale as ProcessCancellationBridge: a future fix
 // to the exactly-once discipline now only has to land in one place.
 //
+// `IPCWakeCoordinator.awaitWake` is a third user. Its resuming call
+// site is not a mutation on its own actor: the taker it hands to
+// `IPCStore.offerWakes` calls `resume(with:)` from inside the
+// `IPCStore` actor, while its timeout Task and its other release paths
+// run on the main actor and its `onCancel` on any thread -- the same
+// reason a lock, not actor isolation, guards the shared state.
+//
 // Deliberately NOT used by SessionDaemonClient's own
 // SessionDaemonBoundedRaceBridge: that type races two independent,
 // separately-cancellable arms (an operation Task AND a timeout Task)
@@ -23,12 +30,18 @@
 import Foundation
 
 /// Thread-safe exactly-once resume for a single suspended continuation,
-/// shared by `CommandLogStore.waitForRecord` and
-/// `ApprovalInboxStore.waitForDecision`. `register`/`resume`/`cancel`
-/// may be called from any of those methods' three call sites (a store
-/// mutation, a timeout Task, and `onCancel`), so `lock` -- not actor
-/// isolation -- is what makes this safe. `@unchecked Sendable` is sound
-/// because every stored property is only ever touched inside `lock`.
+/// shared by `CommandLogStore.waitForRecord`,
+/// `ApprovalInboxStore.waitForDecision` and
+/// `IPCWakeCoordinator.awaitWake`. `register`/`resume`/`cancel` may be
+/// called from several call sites that share no isolation: a mutation
+/// or release on the owning actor, a timeout Task, `onCancel` (which
+/// is NOT actor-isolated and may run on any thread), and, for
+/// `IPCWakeCoordinator`, the taker passed to `IPCStore.offerWakes`,
+/// which calls `resume(with:)` from inside the `IPCStore` actor while
+/// the coordinator itself is main-actor-isolated. So `lock` -- not
+/// actor isolation -- is what makes this safe. `@unchecked Sendable` is
+/// sound because every stored property is only ever touched inside
+/// `lock`.
 final class AwaitBridge<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var resumed = false

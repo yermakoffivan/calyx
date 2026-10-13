@@ -251,7 +251,7 @@ struct AgentEvent: Sendable, Equatable {
         )
     }
 
-    /// The single-line, capped, empty-mapped-to-nil summary for one
+    /// The single-line, redacted, capped, empty-mapped-to-nil summary for one
     /// event's tool name and raw tool-input value. `toolInput` is passed
     /// in as `Any?` so both envelopes supply their own key spelling
     /// (`tool_input` / `toolInput`) and share every other rule.

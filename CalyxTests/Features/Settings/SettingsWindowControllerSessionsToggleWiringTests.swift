@@ -105,6 +105,13 @@
 //  stays independently pinned by AgentHookApprovalSettingsToggleWiringTests,
 //  same division of labor as commandTracking's.
 //
+//  LATER ROWS: agentIPC (first), usageTracking (last) and ipcWake
+//  (second, directly after agentIPC) joined the Agents pane, which now
+//  has 8 switches: agentIPC, ipcWake, agentResume, agentResumeAutoExecute,
+//  cockpitAutoApprove, commandTracking, agentHookApproval, usageTracking.
+//  ipcWake's wiring is pinned by IPCWakeSettingsToggleWiringTests and
+//  usageTracking's by UsageTrackingSettingsToggleWiringTests.
+//
 //  Coverage:
 //  - (A) each Sessions-pane switch (persistentSessions/historyPersistence)
 //    and each Agents-pane switch this file covers (agentResume/
@@ -112,7 +119,7 @@
 //    SettingsWindowController.shared as its `.target` and its own
 //    expected handler selector as `.action`
 //  - (A) exactly 2 switches exist in the Sessions pane's own view
-//    subtree, and exactly 5 in the Agents pane's, both in SettingsRow's
+//    subtree, and exactly 8 in the Agents pane's, both in SettingsRow's
 //    declared top-to-bottom order (openSessionBrowserButton is a button,
 //    not a switch, so excluded)
 //  - (B) sessionToggleInitialState(for:) reads true/false exactly from
@@ -213,10 +220,13 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
         }
     }
 
-    // The 7 switches that live on the Agents pane. agentIPC, commandTracking,
-    // agentHookApproval and usageTracking are intentionally NOT included
-    // in the wiring zip below -- they're already independently covered by
+    // The 8 switches that live on the Agents pane. agentIPC, ipcWake,
+    // commandTracking, agentHookApproval and usageTracking are
+    // intentionally NOT included in the wiring zip below -- they're
+    // already independently covered by
     // test_agentIPCToggleSwitch_hasTargetAndActionWired below,
+    // IPCWakeSettingsToggleWiringTests
+    // .test_ipcWakeSwitch_existsOnceWithTargetAndActionWired,
     // CommandTrackingSettingsToggleWiringTests
     // .test_commandTrackingSwitch_existsWithTargetAndActionWired,
     // AgentHookApprovalSettingsToggleWiringTests
@@ -225,19 +235,19 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
     // .test_usageTrackingSwitch_existsOnceWithTargetAndActionWired
     // (all identifier-based lookups, position-independent), same
     // division of labor this file uses for the Sessions pane.
-    func test_agentsToggleSwitches_exactlySeven_inRowOrder() throws {
+    func test_agentsToggleSwitches_exactlyEight_inRowOrder() throws {
         let switches = collectSwitches(in: try agentsPaneView())
 
         XCTAssertEqual(
-            switches.count, 7,
-            "The Agents pane must show exactly 7 switches (agentIPC/agentResume/agentResumeAutoExecute/" +
+            switches.count, 8,
+            "The Agents pane must show exactly 8 switches (agentIPC/ipcWake/agentResume/agentResumeAutoExecute/" +
             "cockpitAutoApprove/commandTracking/agentHookApproval/usageTracking). Found \(switches.count)."
         )
     }
 
     func test_agentIPCToggleSwitch_hasTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 7, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 8, "covered, and already failing, by the count pin above")
 
         let agentIPCSwitch = switches[0]
         XCTAssertTrue(
@@ -253,23 +263,24 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
 
     func test_agentsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 7, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 8, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Agents pane, filtered
         // to the switch-backed rows (SettingsPaneTests.expectedRows pins
-        // this exact ordering). agentIPC (index 0) is skipped here --
-        // its own wiring is covered by
-        // test_agentIPCToggleSwitch_hasTargetAndActionWired above --
-        // and only the next 3 are asserted: commandTracking's and
-        // agentHookApproval's wiring are each covered by their own
-        // dedicated files instead (see comment above).
+        // this exact ordering). agentIPC (index 0) and ipcWake (index 1)
+        // are skipped here -- agentIPC's wiring is covered by
+        // test_agentIPCToggleSwitch_hasTargetAndActionWired above and
+        // ipcWake's by IPCWakeSettingsToggleWiringTests -- and only the
+        // next 3 are asserted: commandTracking's, agentHookApproval's and
+        // usageTracking's wiring are each covered by their own dedicated
+        // files instead (see comment above).
         let expected: [(name: String, selectorName: String)] = [
             ("agentResume", "agentResumeDidChange:"),
             ("agentResumeAutoExecute", "agentResumeAutoExecuteDidChange:"),
             ("cockpitAutoApprove", "cockpitAutoApproveDidChange:"),
         ]
 
-        for (toggleSwitch, (name, selectorName)) in zip(switches.dropFirst(), expected) {
+        for (toggleSwitch, (name, selectorName)) in zip(switches.dropFirst(2), expected) {
             XCTAssertTrue(
                 toggleSwitch.target === SettingsWindowController.shared,
                 "\(name)'s switch must have SettingsWindowController.shared as its .target, so toggling it " +

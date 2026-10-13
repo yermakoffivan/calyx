@@ -350,4 +350,27 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
         toggleElement.click()
         XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
     }
+
+    /// Pins the Agents pane's "Wake Claude Code on IPC messages" toggle,
+    /// the second row of the pane, as reachable and operable in the same
+    /// way as the "Usage Tracking" toggle above: present in the AX tree,
+    /// fully inside the pane's scroll view, hittable, and flipped by a
+    /// click.
+    ///
+    /// The click writes the setting into this test's own defaults suite
+    /// (`CALYX_UITEST_DEFAULTS_SUITE`) and starts nothing: the setting
+    /// only decides whether a `POST /ipc-wake` long-poll is held, and no
+    /// Claude Code session runs in this launch to send one.
+    func test_ipcWakeSwitch_isReachableAndTogglesOnAgentsPane() {
+        waitForMenuBarAndWindow()
+        openSettingsPane("Agents")
+
+        let toggleElement = toggle(identifier: "calyx.settings.agents.ipcWakeSwitch")
+        XCTAssertTrue(waitFor(toggleElement, timeout: 5), "ipcWake switch not found on Agents pane.")
+        XCTAssertTrue(scrollSettingsPane(toReveal: toggleElement), "ipcWake switch never scrolled fully inside the Agents pane's scroll view.")
+        XCTAssertTrue(toggleElement.isHittable, "ipcWake switch is present but not hittable even after scrolling the Agents pane.")
+        let before = toggleElement.value as? Int
+        toggleElement.click()
+        XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
+    }
 }

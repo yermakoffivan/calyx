@@ -98,21 +98,11 @@ final class MissionMapGitPoller {
                     }
                     continue
                 }
-                async let head = GitService.headSummary(workDir: root)
-                async let status = GitService.gitStatus(workDir: root)
-                let badge = try await MissionMapGitBadge(
-                    branch: head.branch,
-                    shortHash: head.shortHash,
-                    changedFileCount: Set(status.map(\.path)).count
-                )
-                badgesByRoot[root] = badge
-                // Read once per root, outside the head/status failure path:
-                // a failed marker read yields no task badge but keeps the
-                // git badge.
-                let task = await worktreeTaskBadge(branch: badge.branch, location: location)
-                worktreeTasksByRoot[root] = .some(task)
-                nextBadges[cwd] = badge
-                if let task {
+                let summary = try await Self.loadRepositorySummary(at: location)
+                badgesByRoot[root] = summary.badge
+                worktreeTasksByRoot[root] = .some(summary.worktreeTask)
+                nextBadges[cwd] = summary.badge
+                if let task = summary.worktreeTask {
                     nextWorktreeTasks[cwd] = task
                 }
             } catch {
@@ -125,6 +115,27 @@ final class MissionMapGitPoller {
         worktreeTasks = nextWorktreeTasks
     }
 
+    /// The git badge and worktree-task badge of the work tree at
+    /// `location`. Shared by `refresh` (which caches results per root)
+    /// and `MCPCockpitBridge`'s `agent_status`, so both compute a cwd's
+    /// badges the same way. Throws when HEAD or `git status` cannot be
+    /// read; a failed task-marker read yields no task badge but keeps
+    /// the git badge (see `worktreeTaskBadge`).
+    nonisolated static func loadRepositorySummary(
+        at location: GitRepositoryLocation
+    ) async throws -> (badge: MissionMapGitBadge, worktreeTask: MissionMapWorktreeTaskBadge?) {
+        let root = location.workTree
+        async let head = GitService.headSummary(workDir: root)
+        async let status = GitService.gitStatus(workDir: root)
+        let badge = try await MissionMapGitBadge(
+            branch: head.branch,
+            shortHash: head.shortHash,
+            changedFileCount: Set(status.map(\.path)).count
+        )
+        let task = await worktreeTaskBadge(branch: badge.branch, location: location)
+        return (badge, task)
+    }
+
     /// The task badge for the work tree at `location` on `branch`, or nil
     /// when the work tree is the repository's main one (a task always
     /// lives in a linked worktree; the same rule as `GitRepoDiscovery`'s
@@ -132,7 +143,7 @@ final class MissionMapGitPoller {
     /// one), HEAD is detached, the branch carries no task marker, or the marker
     /// cannot be read (the task badge is optional decoration; a read
     /// failure must not cost the pane its git badge).
-    private func worktreeTaskBadge(branch: String?, location: GitRepositoryLocation) async -> MissionMapWorktreeTaskBadge? {
+    private nonisolated static func worktreeTaskBadge(branch: String?, location: GitRepositoryLocation) async -> MissionMapWorktreeTaskBadge? {
         guard location.gitDirectory != location.gitCommonDirectory else { return nil }
         guard let branch else { return nil }
         let root = location.workTree

@@ -1363,4 +1363,521 @@ final class IPCStoreTests: XCTestCase {
         XCTAssertEqual(contents.first, "requeued-10",
                        "The oldest surviving requeued message must still be returned first")
     }
+
+    // ============================================================
+    // MARK: - IPC wake: offerWakes and the per-message nudged flag
+    // ============================================================
+    //
+    // A message carries one flag, `nudged`: whether a waiting `/ipc-wake`
+    // poll has already been told about it. `offerWakes(to:)` is the only
+    // writer. For each peer in `takers` that has at least one un-nudged
+    // message it builds an IPCWakeTicket and calls that peer's taker; the
+    // un-nudged messages become nudged only if the taker returns true.
+    // The flag is part of the Message value, so every operation that
+    // moves or drops messages moves or drops the flag with them.
+
+    private func wakeTaker(
+        _ recorder: WakeTicketRecorder, accept: Bool
+    ) -> @Sendable (IPCWakeTicket) -> Bool {
+        { ticket in
+            recorder.record(ticket)
+            return accept
+        }
+    }
+
+    // ==================== offerWakes: ticket contents ====================
+
+    func test_offerWakes_unNudgedMessages_callsTakerWithNewSenderAndUnreadCounts() async throws {
+        let store = makeStore()
+        let senderX = await store.registerPeer(name: "X", role: "terminal")
+        let senderY = await store.registerPeer(name: "Y", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: senderX.id, to: recipient.id, content: "x1")
+        _ = try await store.sendMessage(from: senderX.id, to: recipient.id, content: "x2")
+        _ = try await store.sendMessage(from: senderY.id, to: recipient.id, content: "y1")
+        let recorder = WakeTicketRecorder()
+
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [IPCWakeTicket(newCount: 3, senderCount: 2, unreadCount: 3)],
+                       "the taker must be called exactly once, with 3 new messages from 2 distinct " +
+                       "senders out of 3 in the inbox")
+    }
+
+    func test_newMessages_startUnNudged() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        let sent = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.broadcast(from: sender.id, content: "two")
+
+        XCTAssertFalse(sent.nudged, "a freshly sent message must not be nudged")
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [false, false], "sent and broadcast messages must both start un-nudged")
+    }
+
+    // ==================== offerWakes: taker decides ====================
+
+    func test_offerWakes_takerReturnsTrue_marksThoseMessagesAndReturnsThePeer() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(woken, [recipient.id], "a peer whose taker returned true must be in the result")
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [true, true], "both offered messages must be nudged once the taker accepted")
+        let count = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(count, 2, "a wake only marks messages; it never removes them from the inbox")
+    }
+
+    func test_offerWakes_takerReturnsFalse_changesNothingAndReturnsNothing() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: false)])
+
+        XCTAssertEqual(recorder.tickets.count, 1, "precondition: the taker was offered the wake")
+        XCTAssertEqual(woken, [], "a peer whose taker returned false must not be in the result")
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [false, false], "a refused wake must leave every message un-nudged")
+
+        // The refused messages are offered again, unchanged, next time.
+        let secondRecorder = WakeTicketRecorder()
+        let wokenAgain = await store.offerWakes(to: [recipient.id: wakeTaker(secondRecorder, accept: true)])
+        XCTAssertEqual(secondRecorder.tickets, [IPCWakeTicket(newCount: 2, senderCount: 1, unreadCount: 2)])
+        XCTAssertEqual(wokenAgain, [recipient.id])
+    }
+
+    // ==================== offerWakes: nothing to offer ====================
+
+    func test_offerWakes_emptyInbox_doesNotCallTaker() async {
+        let store = makeStore()
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [], "a peer with no message must not have its taker called")
+        XCTAssertEqual(woken, [])
+    }
+
+    func test_offerWakes_allMessagesAlreadyNudged_doesNotCallTaker() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        let flagsBefore = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsBefore, [true], "precondition: the only message is nudged")
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [],
+                       "a nudged message must never cause a second wake: the taker must not be called")
+        XCTAssertEqual(woken, [])
+    }
+
+    func test_offerWakes_unknownPeer_doesNotCallTaker() async {
+        let store = makeStore()
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [UUID(): wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [])
+        XCTAssertEqual(woken, [])
+    }
+
+    func test_offerWakes_noTakers_returnsEmptyAndMarksNothing() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+
+        let woken = await store.offerWakes(to: [:])
+
+        XCTAssertEqual(woken, [])
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [false], "a peer that is not in takers must keep its messages un-nudged")
+    }
+
+    // ==================== offerWakes: nudged and un-nudged mixed ====================
+
+    func test_offerWakes_mixedInbox_countsNewAndSendersAmongUnNudgedOnly_unreadForWholeInbox() async throws {
+        let store = makeStore()
+        let senderX = await store.registerPeer(name: "X", role: "terminal")
+        let senderY = await store.registerPeer(name: "Y", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        // X's message is nudged by a first wake.
+        _ = try await store.sendMessage(from: senderX.id, to: recipient.id, content: "x1")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        // Y's two messages arrive afterwards and are un-nudged.
+        _ = try await store.sendMessage(from: senderY.id, to: recipient.id, content: "y1")
+        _ = try await store.sendMessage(from: senderY.id, to: recipient.id, content: "y2")
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [IPCWakeTicket(newCount: 2, senderCount: 1, unreadCount: 3)],
+                       "newCount counts the 2 un-nudged messages, senderCount their 1 sender (Y; X only " +
+                       "sent the nudged one), unreadCount all 3 in the inbox")
+        XCTAssertEqual(woken, [recipient.id])
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [true, true, true])
+    }
+
+    func test_offerWakes_afterAWake_onlyLaterArrivalsAreInTheNextTicket() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        let firstRecorder = WakeTicketRecorder()
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(firstRecorder, accept: true)])
+        XCTAssertEqual(firstRecorder.tickets, [IPCWakeTicket(newCount: 2, senderCount: 1, unreadCount: 2)],
+                       "precondition: the first wake counted both messages")
+
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "three")
+        let flagsBetween = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsBetween, [true, true, false], "only the later arrival is un-nudged")
+        let secondRecorder = WakeTicketRecorder()
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(secondRecorder, accept: true)])
+
+        XCTAssertEqual(secondRecorder.tickets, [IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 3)],
+                       "the second ticket must count only the message that arrived after the first wake")
+    }
+
+    // ==================== offerWakes: several peers ====================
+
+    func test_offerWakes_severalPeersInOneCall_areIndependent() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let accepting = await store.registerPeer(name: "accepting", role: "terminal")
+        let refusing = await store.registerPeer(name: "refusing", role: "terminal")
+        let empty = await store.registerPeer(name: "empty", role: "terminal")
+        let notOffered = await store.registerPeer(name: "not-offered", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: accepting.id, content: "a1")
+        _ = try await store.sendMessage(from: sender.id, to: refusing.id, content: "r1")
+        _ = try await store.sendMessage(from: sender.id, to: refusing.id, content: "r2")
+        _ = try await store.sendMessage(from: sender.id, to: notOffered.id, content: "n1")
+        let acceptingRecorder = WakeTicketRecorder()
+        let refusingRecorder = WakeTicketRecorder()
+        let emptyRecorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [
+            accepting.id: wakeTaker(acceptingRecorder, accept: true),
+            refusing.id: wakeTaker(refusingRecorder, accept: false),
+            empty.id: wakeTaker(emptyRecorder, accept: true),
+        ])
+
+        XCTAssertEqual(woken, [accepting.id], "only the peer whose taker accepted is in the result")
+        XCTAssertEqual(acceptingRecorder.tickets, [IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 1)])
+        XCTAssertEqual(refusingRecorder.tickets, [IPCWakeTicket(newCount: 2, senderCount: 1, unreadCount: 2)])
+        XCTAssertEqual(emptyRecorder.tickets, [], "the peer with an empty inbox is never offered a wake")
+        let acceptingFlags = await store._testNudgedFlags(for: accepting.id)
+        let refusingFlags = await store._testNudgedFlags(for: refusing.id)
+        let notOfferedFlags = await store._testNudgedFlags(for: notOffered.id)
+        XCTAssertEqual(acceptingFlags, [true])
+        XCTAssertEqual(refusingFlags, [false, false], "one peer's accepted wake must not mark another's messages")
+        XCTAssertEqual(notOfferedFlags, [false], "a peer that is not in takers is untouched")
+    }
+
+    // ==================== offerWakes: read-only apart from the flag ====================
+
+    func test_offerWakes_doesNotBumpLastSeen() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let accepting = await store.registerPeer(name: "accepting", role: "terminal")
+        let refusing = await store.registerPeer(name: "refusing", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: accepting.id, content: "a1")
+        _ = try await store.sendMessage(from: sender.id, to: refusing.id, content: "r1")
+        // Well within the TTL, so a spurious bump is observable.
+        let fiveMinutesAgo = Date().addingTimeInterval(-5 * 60)
+        for peer in [sender, accepting, refusing] {
+            await store._testSetPeerLastSeen(peerId: peer.id, date: fiveMinutesAgo)
+        }
+        let senderBefore = await store.peerStatus(id: sender.id)?.lastSeen
+        let acceptingBefore = await store.peerStatus(id: accepting.id)?.lastSeen
+        let refusingBefore = await store.peerStatus(id: refusing.id)?.lastSeen
+        XCTAssertEqual(acceptingBefore, fiveMinutesAgo, "precondition: lastSeen was set back")
+
+        let woken = await store.offerWakes(to: [
+            accepting.id: wakeTaker(WakeTicketRecorder(), accept: true),
+            refusing.id: wakeTaker(WakeTicketRecorder(), accept: false),
+        ])
+        XCTAssertEqual(woken, [accepting.id], "precondition: one wake was accepted and one refused")
+
+        let senderAfter = await store.peerStatus(id: sender.id)?.lastSeen
+        let acceptingAfter = await store.peerStatus(id: accepting.id)?.lastSeen
+        let refusingAfter = await store.peerStatus(id: refusing.id)?.lastSeen
+        XCTAssertEqual(acceptingAfter, acceptingBefore, "an accepted wake must not bump the recipient's lastSeen")
+        XCTAssertEqual(refusingAfter, refusingBefore, "a refused wake must not bump the recipient's lastSeen")
+        XCTAssertEqual(senderAfter, senderBefore, "a wake must not bump the sender's lastSeen")
+    }
+
+    /// Every liveness-gated API purges an expired peer it is asked about.
+    /// offerWakes is not one of them: the expired entry is left exactly as
+    /// it was. `_testSetPeerLastSeen` only changes a peer that is still
+    /// stored, so making the peer fresh again afterwards and then reading
+    /// it tells a kept entry (non-nil) from a purged one (nil).
+    func test_offerWakes_doesNotPurgeAnExpiredPeer() async {
+        let store = makeStore()
+        let expired = await store.registerPeer(name: "expired", role: "terminal")
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: expired.id, date: elevenMinutesAgo)
+        let recorder = WakeTicketRecorder()
+
+        let woken = await store.offerWakes(to: [expired.id: wakeTaker(recorder, accept: true)])
+
+        XCTAssertEqual(recorder.tickets, [], "the expired peer has no message, so its taker is not called")
+        XCTAssertEqual(woken, [])
+        await store._testSetPeerLastSeen(peerId: expired.id, date: Date())
+        let status = await store.peerStatus(id: expired.id)
+        XCTAssertEqual(status?.id, expired.id,
+                       "offerWakes must not purge an expired peer: its entry must still be stored")
+    }
+
+    // ==================== The flag travels with the message ====================
+
+    func test_receiveMessages_returnsMessagesCarryingTheirFlags() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        let first = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        let second = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        let third = try await store.sendMessage(from: sender.id, to: recipient.id, content: "three")
+
+        let received = await store.receiveMessages(for: recipient.id)
+
+        XCTAssertEqual(received.map(\.id), [first.id, second.id, third.id])
+        XCTAssertEqual(received.map(\.nudged), [true, true, false],
+                       "received messages must carry the flag they had in the inbox")
+        let flagsAfter = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsAfter, [], "receiveMessages removes the messages, and their flags with them")
+    }
+
+    func test_requeue_restoresMessagesWithTheFlagsTheyHadWhenDrained() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "three")
+        let received = await store.receiveMessages(for: recipient.id)
+        XCTAssertEqual(received.count, 3, "precondition: all three messages were drained")
+
+        await store.requeue(received, for: recipient.id)
+
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [true, true, false],
+                       "requeue must keep each message's flag: nudged stays nudged, un-nudged stays un-nudged")
+
+        // The requeued nudged messages cause no second wake; the requeued
+        // un-nudged one is still owed its wake.
+        let recorder = WakeTicketRecorder()
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+        XCTAssertEqual(recorder.tickets, [IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 3)])
+    }
+
+    func test_requeue_aheadOfANewArrival_keepsEachMessagesOwnFlag() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        let received = await store.receiveMessages(for: recipient.id)
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "arrived during the gap")
+
+        await store.requeue(received, for: recipient.id)
+
+        let flags = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flags, [true, false],
+                       "the requeued (nudged) message goes first and the gap arrival stays un-nudged")
+    }
+
+    // ==================== The flag is dropped with the message ====================
+
+    func test_messageLimit_overflowDropsFlagsTogetherWithTheOldestMessages() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        for i in 0..<100 {
+            _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "old-\(i)")
+        }
+        let recorder = WakeTicketRecorder()
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+        XCTAssertEqual(recorder.tickets, [IPCWakeTicket(newCount: 100, senderCount: 1, unreadCount: 100)],
+                       "precondition: all 100 messages were nudged by one wake")
+
+        // One more pushes the oldest (nudged) message out.
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "new-0")
+
+        let flagsAfterOne = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsAfterOne, Array(repeating: true, count: 99) + [false],
+                       "the inbox stays at 100: 99 surviving nudged messages and the 1 new un-nudged one")
+
+        // 99 more push out every nudged message.
+        for i in 1..<100 {
+            _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "new-\(i)")
+        }
+
+        let flagsAfterAll = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsAfterAll, Array(repeating: false, count: 100),
+                       "no nudged flag may outlive the message it belonged to")
+    }
+
+    func test_removePeer_dropsFlagsTogetherWithTheMessages() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        let flagsBefore = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsBefore, [true, false], "precondition: one nudged and one un-nudged message")
+
+        await store.removePeer(id: recipient.id)
+
+        let flagsAfter = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsAfter, [], "removing the peer removes its messages and their flags")
+        let recorder = WakeTicketRecorder()
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+        XCTAssertEqual(recorder.tickets, [], "a removed peer has nothing left to be woken for")
+        XCTAssertEqual(woken, [])
+    }
+
+    func test_cleanup_dropsFlagsTogetherWithTheMessages() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+        let flagsBefore = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsBefore, [true, false], "precondition: one nudged and one un-nudged message")
+
+        await store.cleanup()
+
+        let flagsAfter = await store._testNudgedFlags(for: recipient.id)
+        XCTAssertEqual(flagsAfter, [], "cleanup removes every message and its flag")
+        let recorder = WakeTicketRecorder()
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(recorder, accept: true)])
+        XCTAssertEqual(recorder.tickets, [])
+        XCTAssertEqual(woken, [])
+    }
+
+    // ==================== Message's Codable form does not carry the flag ====================
+    //
+    // `nudged` is in-memory wake bookkeeping. The encoded form of a
+    // Message is what it was before the field existed: exactly `id`,
+    // `from`, `to`, `content`, `timestamp`. Encoding never emits the flag,
+    // and JSON without it decodes to an un-nudged message.
+
+    /// Sends one message and has a wake accepted for it, then drains it:
+    /// the returned value is a nudged Message obtained the real way.
+    private func makeNudgedMessage() async throws -> Message {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "nudged one")
+        let woken = await store.offerWakes(to: [recipient.id: wakeTaker(WakeTicketRecorder(), accept: true)])
+        XCTAssertEqual(woken, [recipient.id], "precondition: the wake was accepted")
+        let received = await store.receiveMessages(for: recipient.id)
+        let message = try XCTUnwrap(received.first)
+        XCTAssertTrue(message.nudged, "precondition: the drained message is nudged")
+        return message
+    }
+
+    private func encodedKeys(of message: Message) throws -> Set<String> {
+        let data = try JSONEncoder().encode(message)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return Set(object.keys)
+    }
+
+    func test_messageEncoding_unNudgedMessage_hasExactlyTheFiveOriginalKeys() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "S", role: "terminal")
+        let recipient = await store.registerPeer(name: "R", role: "terminal")
+        let message = try await store.sendMessage(from: sender.id, to: recipient.id, content: "plain")
+        XCTAssertFalse(message.nudged, "precondition: a freshly sent message is un-nudged")
+
+        let keys = try encodedKeys(of: message)
+
+        XCTAssertEqual(keys, ["id", "from", "to", "content", "timestamp"],
+                       "an encoded Message must have exactly its five original keys; nudged is never serialized")
+    }
+
+    func test_messageEncoding_nudgedMessage_hasExactlyTheFiveOriginalKeys() async throws {
+        let message = try await makeNudgedMessage()
+
+        let keys = try encodedKeys(of: message)
+
+        XCTAssertEqual(keys, ["id", "from", "to", "content", "timestamp"],
+                       "an encoded Message must have exactly its five original keys, nudged or not")
+    }
+
+    /// The JSON below is written by hand in the shape JSONEncoder produced
+    /// before the field existed: UUIDs as strings and, with the encoder's
+    /// default date strategy, the timestamp as seconds since the reference
+    /// date.
+    func test_messageDecoding_jsonWithTheFiveOriginalKeys_succeedsWithNudgedFalse() throws {
+        let json = Data("""
+        {"id":"0A0B0C0D-1111-4222-8333-444455556666",
+         "from":"1A1B1C1D-1111-4222-8333-444455556666",
+         "to":"2A2B2C2D-1111-4222-8333-444455556666",
+         "content":"from before the flag",
+         "timestamp":700000000.5}
+        """.utf8)
+
+        let message = try JSONDecoder().decode(Message.self, from: json)
+
+        XCTAssertEqual(message.id, UUID(uuidString: "0A0B0C0D-1111-4222-8333-444455556666"))
+        XCTAssertEqual(message.from, UUID(uuidString: "1A1B1C1D-1111-4222-8333-444455556666"))
+        XCTAssertEqual(message.to, UUID(uuidString: "2A2B2C2D-1111-4222-8333-444455556666"))
+        XCTAssertEqual(message.content, "from before the flag")
+        XCTAssertEqual(message.timestamp, Date(timeIntervalSinceReferenceDate: 700_000_000.5))
+        XCTAssertFalse(message.nudged, "a decoded Message is un-nudged")
+    }
+
+    func test_messageCodableRoundTrip_nudgedMessage_comesBackUnNudgedWithTheOtherFieldsEqual() async throws {
+        let message = try await makeNudgedMessage()
+
+        let decoded = try JSONDecoder().decode(Message.self, from: try JSONEncoder().encode(message))
+
+        XCTAssertFalse(decoded.nudged, "the encoded form does not carry the flag, so a round trip yields un-nudged")
+        XCTAssertEqual(decoded.id, message.id)
+        XCTAssertEqual(decoded.from, message.from)
+        XCTAssertEqual(decoded.to, message.to)
+        XCTAssertEqual(decoded.content, message.content)
+        XCTAssertEqual(decoded.timestamp, message.timestamp)
+    }
+}
+
+/// Records every ticket a wake taker is offered. A taker is `@Sendable`
+/// and runs inside the IPCStore actor, so the record is lock-protected
+/// rather than a captured local.
+private final class WakeTicketRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [IPCWakeTicket] = []
+
+    func record(_ ticket: IPCWakeTicket) {
+        lock.lock(); defer { lock.unlock() }
+        recorded.append(ticket)
+    }
+
+    var tickets: [IPCWakeTicket] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded
+    }
 }

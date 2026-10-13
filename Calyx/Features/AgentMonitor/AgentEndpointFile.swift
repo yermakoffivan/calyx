@@ -1,9 +1,11 @@
 // AgentEndpointFile.swift
 // Calyx
 //
-// Writes/removes `agent-endpoint.json` (port + token) so the
-// calyx-agent-hook script can always reach the current IPC server, even
-// after a restart or token rotation.
+// Writes/removes `agent-endpoint.json` (port, token, and the two HMAC
+// blocks of the server's `IPCWakeProofKey`) so the hook scripts can
+// always reach the current IPC server, even after a restart or token
+// rotation, and `calyx-ipc-wake-hook` can verify that a wake answer came
+// from that server.
 
 import Foundation
 
@@ -22,7 +24,7 @@ enum AgentEndpointFile {
     /// `GhosttySurfaceController` injects as `CALYX_ENDPOINT_FILE`, so a
     /// pane's environment always names the exact file this process wrote
     /// (or would write), not a rebuilt string a caller could drift from
-    /// `write(port:token:directory:)`'s own path.
+    /// `write(port:token:wakeProofKey:directory:)`'s own path.
     static var path: String {
         (defaultDirectory as NSString).appendingPathComponent(fileName)
     }
@@ -79,17 +81,28 @@ enum AgentEndpointFile {
         return Endpoint(port: port, token: token)
     }
 
-    /// Writes `agent-endpoint.json` (0600) to `directory` with the given
-    /// `port` and `token`. Uses `ConfigFileUtils.atomicWrite` (temp file +
-    /// rename) rather than a direct `Data.write` so a reader — the
-    /// `calyx-agent-hook` script, invoked concurrently from every active
-    /// pane's hooks — never observes a partially-written file.
-    static func write(port: Int, token: String, directory: String) throws {
+    /// Writes `agent-endpoint.json` (0600) to `directory` with `port`,
+    /// `token`, and `wakeProofInner`/`wakeProofOuter`: the
+    /// `innerBlockHex`/`outerBlockHex` of `wakeProofKey`, never the key
+    /// itself. The blocks are read only by `calyx-ipc-wake-hook`
+    /// (`IPCWakeHookScript`), which checks with them that a
+    /// `POST /ipc-wake` 200 answer carries a proof made with the running
+    /// server's key; `read` and every other reader ignore them. Uses
+    /// `ConfigFileUtils.atomicWrite` (temp file + rename) rather than a
+    /// direct `Data.write` so a reader, any hook script invoked
+    /// concurrently from every active pane, never observes a
+    /// partially-written file.
+    static func write(port: Int, token: String, wakeProofKey: IPCWakeProofKey, directory: String) throws {
         let fm = FileManager.default
         if !fm.fileExists(atPath: directory) {
             try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
-        let dict: [String: Any] = ["port": port, "token": token]
+        let dict: [String: Any] = [
+            "port": port,
+            "token": token,
+            "wakeProofInner": wakeProofKey.innerBlockHex,
+            "wakeProofOuter": wakeProofKey.outerBlockHex,
+        ]
         let data = try JSONSerialization.data(withJSONObject: dict)
         let filePath = (directory as NSString).appendingPathComponent(fileName)
         try ConfigFileUtils.atomicWrite(data: data, to: filePath)
@@ -121,7 +134,7 @@ enum AgentEndpointFile {
         guard !token.isEmpty else { return }
         let filePath = (directory as NSString).appendingPathComponent(fileName)
         // 0600: Calyx owns this file outright and it carries the bearer
-        // token (see `write(port:token:directory:)` above).
+        // token (see `write(port:token:wakeProofKey:directory:)` above).
         try? ConfigFileUtils.withExclusiveConfig(path: filePath, mode: 0o600, restoreModeOnNoWrite: true) { current in
             guard let current else { return current }
             guard let onDisk = decode(current), onDisk.port == port, onDisk.token == token

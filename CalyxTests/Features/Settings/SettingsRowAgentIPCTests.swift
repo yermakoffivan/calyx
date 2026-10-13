@@ -13,8 +13,9 @@
 //  divider rule is actually two conditions ANDed together --
 //  sectionHeading(for:) non-nil AND index > 0 within the pane-filtered
 //  array -- so agentIPC landing at index 0 gets no divider regardless of
-//  whether it has a heading, and agentResume landing at index 1 (with
-//  its own heading) gets one. That divider rendering itself lives in a
+//  whether it has a heading, ipcWake landing at index 1 (with no heading
+//  of its own) gets none, and agentResume landing at index 2 (with its
+//  own heading) gets one. That divider rendering itself lives in a
 //  private method and isn't asserted here; this file only pins the
 //  ordering fact (.agentIPC is index 0) that rule depends on.
 //

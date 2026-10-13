@@ -81,6 +81,18 @@ class SettingsWindowController: NSWindowController {
     /// running, instead of `CalyxMCPServer.shared.isRunning`. DO NOT use
     /// from production code.
     var _usageServerRunningForTesting: Bool?
+
+    /// Test seam: what `ipcWakeDidChange(_:)` runs to release the
+    /// waiting `/ipc-wake` polls when the switch is turned off, instead
+    /// of `CalyxMCPServer.shared.ipcWakeCoordinator.releaseAllWaiters()`.
+    /// DO NOT use from production code.
+    var _ipcWakeReleaseForTesting: (@MainActor () -> Void)?
+
+    /// Test seam: what `ipcWakeDidChange(_:)` runs to re-evaluate the
+    /// waiting `/ipc-wake` polls when the switch is turned on, instead
+    /// of `CalyxMCPServer.shared.ipcWakeCoordinator.reevaluateAllWaiters()`.
+    /// DO NOT use from production code.
+    var _ipcWakeReevaluateForTesting: (@MainActor () -> Void)?
     #endif
 
     private init() {
@@ -215,7 +227,7 @@ class SettingsWindowController: NSWindowController {
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
-             .historyPersistence, .agentResumeAutoExecute,
+             .historyPersistence, .ipcWake, .agentResumeAutoExecute,
              .openSessionBrowserButton:
             return nil
         }
@@ -267,6 +279,8 @@ class SettingsWindowController: NSWindowController {
             return historyPersistenceRow()
         case .agentIPC:
             return agentIPCRow()
+        case .ipcWake:
+            return ipcWakeRow()
         case .agentResume:
             return agentResumeRow()
         case .agentResumeAutoExecute:
@@ -373,8 +387,8 @@ class SettingsWindowController: NSWindowController {
     /// across multiple panes, each backed by its own store: SessionSettings
     /// for the session rows, CockpitSettings for cockpitAutoApprove and
     /// agentHookApproval, CommandTrackingSettings for commandTracking,
-    /// UsageTrackingSettings for usageTracking,
-    /// and UserDefaults.standard directly for
+    /// UsageTrackingSettings for usageTracking, IPCWakeSettings for
+    /// ipcWake, and UserDefaults.standard directly for
     /// glassOpacityCells (it has no dedicated settings type). Extracted as its own function (rather than
     /// reading each backing store directly inline in each row builder)
     /// because SettingsWindowController.shared's one-shot, process-lifetime
@@ -394,6 +408,7 @@ class SettingsWindowController: NSWindowController {
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
         case .agentHookApproval: return CockpitSettings.agentHookApprovalEnabled
         case .usageTracking: return UsageTrackingSettings.enabled
+        case .ipcWake: return IPCWakeSettings.enabled
         case .glassOpacityCells: return UserDefaults.standard.bool(forKey: "terminalGlassOpacityCells")
         default: return false
         }
@@ -493,6 +508,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(agentHookApprovalDidChange(_:))
         return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
+    }
+
+    private func ipcWakeRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.ipcWakeSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .ipcWake) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(ipcWakeDidChange(_:))
+        return controlRow(label: "Wake Claude Code on IPC messages", control: toggleSwitch)
     }
 
     private func usageTrackingRow() -> NSView {
@@ -716,6 +740,38 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
+    }
+
+    /// Writes the setting, then acts once on the waiting `/ipc-wake`
+    /// polls. Off: releases every one. With the setting off no check
+    /// hands out a wake, so a hook process still long-polling would
+    /// otherwise sit there until the poll's timeout; releasing answers
+    /// it 204 at once, and the route answers later polls 204 without
+    /// registering them. On: re-evaluates every one, so a poll that
+    /// registered just before the setting went off, and whose peer got
+    /// a message while it was off, is woken now instead of at the next
+    /// message or its timeout. A pane with no poll at that moment
+    /// becomes wakeable from its next turn end or session start.
+    @objc private func ipcWakeDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        IPCWakeSettings.enabled = enabled
+        if enabled {
+            #if DEBUG
+            if let reevaluate = _ipcWakeReevaluateForTesting {
+                reevaluate()
+                return
+            }
+            #endif
+            CalyxMCPServer.shared.ipcWakeCoordinator.reevaluateAllWaiters()
+            return
+        }
+        #if DEBUG
+        if let release = _ipcWakeReleaseForTesting {
+            release()
+            return
+        }
+        #endif
+        CalyxMCPServer.shared.ipcWakeCoordinator.releaseAllWaiters()
     }
 
     /// Writes the setting, refreshes the status line and requests a

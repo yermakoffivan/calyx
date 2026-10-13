@@ -22,10 +22,14 @@ enum ApprovalHookScript {
     /// by path, alongside `AgentHookScript.fileName`.
     static let fileName = "calyx-approval-hook"
 
+    /// The script opens with `AgentHookScriptPrologue.body`, the section
+    /// shared by every Calyx hook script: the guards and the endpoint
+    /// resolution described below live there, not in this literal.
+    ///
     /// Both `CALYX_SURFACE_ID` and `CALYX_SESSION_ID` unset means this
     /// pane wasn't launched by Calyx at all (e.g. a plain Terminal.app
-    /// tab running `claude`) -- exit immediately, exactly like
-    /// `AgentHookScript`'s identical guard, so those instances are
+    /// tab running `claude`) -- exit immediately, through the shared
+    /// prologue's first guard, so those instances are
     /// unaffected. `agent-endpoint.json` is re-read on every invocation
     /// (rather than baked in at install time) so a server restart or
     /// token rotation never leaves the hook posting to a stale
@@ -33,8 +37,9 @@ enum ApprovalHookScript {
     ///
     /// Second fail-open guard, herdr environment contamination: exits
     /// immediately whenever `HERDR_PANE_ID` is set to a non-empty value
-    /// (`[ -n "$HERDR_PANE_ID" ]`), exactly like `AgentHookScript`'s
-    /// identical guard -- see its doc comment for the fuller rationale,
+    /// (`[ -n "$HERDR_PANE_ID" ]`). This is the shared prologue's
+    /// guard, the same one `AgentHookScript` runs -- see
+    /// `AgentHookScript`'s doc comment for the fuller rationale,
     /// including why `HERDR_PANE_ID` specifically (not any
     /// `HERDR_`-prefixed variable name, and not a text-based
     /// environment scan) is the only reliable herdr-managed-pane
@@ -45,6 +50,13 @@ enum ApprovalHookScript {
     /// MCP client config substitutes a stale `CALYX_SURFACE_ID` inside
     /// the agent binary itself, a code path this hook script never runs
     /// in and cannot intercept.
+    ///
+    /// Third fail-open guard, Grok: `kind` resolved to `claude-code`
+    /// while `GROK_HOOK_EVENT` is set means Grok picked this entry up
+    /// from `~/.claude/settings.json` (see `AgentHookScriptPrologue`).
+    /// Without the guard this script's stdout would become Grok's
+    /// decision in a vocabulary (Claude Code's nested
+    /// `hookSpecificOutput.decision`) Grok does not recognize.
     ///
     /// `$1` defaults `kind` to `claude-code` for the same reason as
     /// `AgentHookScript`: Claude Code's own hook `command` entries
@@ -161,54 +173,7 @@ enum ApprovalHookScript {
     # ApprovalHookScript's own doc comment for the full empirical
     # writeup and the residual-path fallback that covers it.
 
-    if [ -z "$CALYX_SURFACE_ID" ] && [ -z "$CALYX_SESSION_ID" ]; then
-        exit 0
-    fi
-
-    # A herdr server started from inside a Calyx pane can spawn shells
-    # that inherit that pane's CALYX_SURFACE_ID/CALYX_SESSION_ID -- a
-    # non-empty HERDR_PANE_ID means this shell is herdr-managed, so skip
-    # posting under that stale, misattributed surface identity. Other
-    # HERDR_-prefixed variables (e.g. HERDR_SOCKET_PATH) are NOT this
-    # signal: a user may export HERDR_SOCKET_PATH in their own shell
-    # profile from inside an ordinary Calyx pane herdr never touched, so
-    # only HERDR_PANE_ID itself is checked here.
-    if [ -n "$HERDR_PANE_ID" ]; then
-        exit 0
-    fi
-
-    kind="${1:-claude-code}"
-
-    # Grok scans ~/.claude/settings.json for hooks by default, so Calyx's
-    # Claude Code entries -- which pass no kind argument and therefore
-    # resolve to claude-code -- also fire inside a Grok session, where
-    # this script's stdout would become Grok's decision in a vocabulary
-    # (Claude Code's nested hookSpecificOutput.decision) Grok does not
-    # recognize. GROK_HOOK_EVENT is a reserved variable Grok's hook
-    # runner injects into every hook process, so it is set for Calyx's
-    # own Grok entries too; those pass an explicit kind and are
-    # unaffected. The user's own [compat.*] settings are never touched.
-    if [ "$kind" = "claude-code" ] && [ -n "$GROK_HOOK_EVENT" ]; then
-        exit 0
-    fi
-
-    # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController alongside
-    # CALYX_SURFACE_ID, scoped to wherever this Calyx process actually
-    # wrote agent-endpoint.json (a --calyx-path-root scratch directory
-    # under test, the real Application Support directory otherwise). The
-    # literal fallback covers a pane launched before that injection
-    # existed, or a shell that stripped the variable.
-    endpoint_file="${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}"
-    if [ ! -f "$endpoint_file" ]; then
-        exit 0
-    fi
-
-    port=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
-    token=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
-
-    if [ -z "$port" ] || [ -z "$token" ]; then
-        exit 0
-    fi
+    \(AgentHookScriptPrologue.body)
 
     payload_file=$(mktemp) || exit 0
     response_file=$(mktemp) || { rm -f "$payload_file"; exit 0; }

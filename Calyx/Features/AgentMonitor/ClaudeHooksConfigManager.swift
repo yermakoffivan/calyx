@@ -1,12 +1,15 @@
 // ClaudeHooksConfigManager.swift
 // Calyx
 //
-// Manages the "hooks" section of ~/.claude/settings.json for the
-// calyx-agent-hook lifecycle hook. Mirrors ClaudeConfigManager's API shape
-// and file-safety guarantees (symlink rejection, atomic write): both
-// entry points go through `ConfigFileUtils.withExclusiveConfig` and edit
-// only Calyx's own array elements via `JSONConfigDocumentEditor`, leaving
-// co-located user hooks and unrelated top-level keys byte-identical.
+// Manages the "hooks" section of ~/.claude/settings.json for Calyx's
+// three hook scripts: the calyx-agent-hook lifecycle hook on every
+// target event, plus calyx-approval-hook on `PermissionRequest` and
+// calyx-ipc-wake-hook on `Stop` and `SessionStart`. Mirrors
+// ClaudeConfigManager's API shape and file-safety guarantees (symlink
+// rejection, atomic write): both entry points go through
+// `ConfigFileUtils.withExclusiveConfig` and edit only Calyx's own array
+// elements via `JSONConfigDocumentEditor`, leaving co-located user hooks
+// and unrelated top-level keys byte-identical.
 
 import Foundation
 
@@ -41,25 +44,42 @@ struct ClaudeHooksConfigManager: Sendable {
         ("SubagentStop", "*"),
     ]
 
+    /// The target events whose group also carries the wake entry
+    /// (`wakeCommandEntry`). Each of these events starts one `/ipc-wake`
+    /// long-poll for the pane. `Stop` fires when a turn ends, so the
+    /// pane is polling while it then sits at its prompt. The
+    /// `SessionStart` entry has no matcher, so it fires on startup,
+    /// resume, clear, compact and fork, which also covers a session
+    /// that has not completed a turn yet. A poll started by either
+    /// replaces an earlier one for the same pane that is still open
+    /// (`IPCWakeCoordinator` keeps one waiter per surface). An
+    /// interrupted turn fires no `Stop`, so it starts no new poll.
+    private static let wakeEvents: Set<String> = ["Stop", "SessionStart"]
+
     // MARK: - Public API
 
-    /// Merges Calyx's 10 hook entries into `configPath`'s `"hooks"` section,
-    /// preserving the user's own existing hook entries and unrelated
-    /// top-level keys. Idempotent: re-running replaces Calyx's own prior
-    /// entries rather than duplicating them.
+    /// Merges Calyx's hook entries for the 10 target events into
+    /// `configPath`'s `"hooks"` section, preserving the user's own
+    /// existing hook entries and unrelated top-level keys. Idempotent:
+    /// re-running replaces Calyx's own prior entries rather than
+    /// duplicating them.
     ///
-    /// `PermissionRequest` alone gets a second Calyx-owned command entry:
-    /// the same-shaped async monitor entry every other event gets
-    /// (`scriptPath`) plus a synchronous approval entry
+    /// Every event gets the async monitor entry (`scriptPath`). Three
+    /// events get a second Calyx-owned command entry after it, in the
+    /// same group. `PermissionRequest` gets a synchronous approval entry
     /// (`approvalScriptPath`, no `"async"` key, timeout
-    /// `ApprovalHookTiming.hookEntryTimeoutSeconds`) that blocks the tool
-    /// call until Calyx's own `/approval-request` long-poll resolves.
-    /// `PreToolUse` carries only the monitor entry, since it fires for
-    /// every tool call regardless of whether it needs approval, unlike
-    /// `PermissionRequest`, which fires only once the CLI has already
-    /// decided it needs to show a confirmation prompt. Every event other
-    /// than `PermissionRequest` gets exactly one entry.
-    static func installHooks(scriptPath: String, approvalScriptPath: String, configPath: String? = nil) throws {
+    /// `ApprovalHookTiming.hookEntryTimeoutSeconds`) that blocks the
+    /// tool call until Calyx's own `/approval-request` long-poll
+    /// resolves. `PreToolUse` carries only the monitor entry, since it
+    /// fires for every tool call regardless of whether it needs
+    /// approval, unlike `PermissionRequest`, which fires only once the
+    /// CLI has already decided it needs to show a confirmation prompt.
+    /// `Stop` and `SessionStart` (`wakeEvents`) get the wake entry
+    /// (`wakeScriptPath`, see `wakeCommandEntry`). The other seven
+    /// events get exactly one entry.
+    static func installHooks(
+        scriptPath: String, approvalScriptPath: String, wakeScriptPath: String, configPath: String? = nil
+    ) throws {
         let path = configPath ?? defaultConfigPath
 
         // mode: nil (leave the mode as-is): ~/.claude/settings.json is a
@@ -70,7 +90,8 @@ struct ClaudeHooksConfigManager: Sendable {
                 guard eventShapeIsRecognized(target.name, in: bytes) else { continue }
 
                 let entries = commandEntries(
-                    scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, eventName: target.name
+                    scriptPath: scriptPath, approvalScriptPath: approvalScriptPath,
+                    wakeScriptPath: wakeScriptPath, eventName: target.name
                 )
                 let newGroup = commandGroup(entries: entries, matcher: target.matcher)
 
@@ -96,13 +117,14 @@ struct ClaudeHooksConfigManager: Sendable {
         }
     }
 
-    /// Removes only Calyx's own command entries (identified by the
-    /// `calyx-agent-hook` command path) from `configPath`'s `"hooks"`
-    /// section, leaving co-located user hooks and unrelated top-level keys
-    /// untouched. A no-op when the file doesn't exist. An event whose
-    /// group list becomes empty as a result has its key removed entirely
-    /// (no dangling `"EventName": []`), and the `"hooks"` key itself is
-    /// removed when every event under it became empty — mirroring
+    /// Removes only Calyx's own command entries (identified by their
+    /// command path naming one of `ownScriptFileNames`) from
+    /// `configPath`'s `"hooks"` section, leaving co-located user hooks
+    /// and unrelated top-level keys untouched. A no-op when the file
+    /// doesn't exist. An event whose group list becomes empty as a
+    /// result has its key removed entirely (no dangling
+    /// `"EventName": []`), and the `"hooks"` key itself is removed when
+    /// every event under it became empty -- mirroring
     /// `ClaudeConfigManager.disableIPC`'s `mcpServers`-key cleanup.
     static func removeHooks(configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
@@ -176,17 +198,43 @@ struct ClaudeHooksConfigManager: Sendable {
         ]
     }
 
-    /// The Calyx-owned command entries for one target event:
-    /// `PermissionRequest` gets both the async monitor entry and the
-    /// synchronous approval entry; every other event gets only the
+    /// The wake entry: runs `calyx-ipc-wake-hook` as a background hook
+    /// that may wake the session. `async: true` alone already makes the
+    /// entry a background hook, so it never blocks a turn, including on
+    /// a Claude Code that does not recognise `asyncRewake`.
+    /// `asyncRewake: true` is what gives exit status 2 its meaning of
+    /// waking an idle session and showing the hook's stderr to the model
+    /// (see `IPCWakeHookScript`). Both keys together were checked
+    /// against Claude Code 2.1.296 for both `wakeEvents`. The timeout is
+    /// `IPCWakeHookTiming.hookEntryTimeoutSeconds`, the outermost
+    /// deadline of the wake hook chain (see `IPCWakeHookTiming`'s header
+    /// comment).
+    private static func wakeCommandEntry(wakeScriptPath: String) -> [String: Any] {
+        [
+            "type": "command",
+            "command": "\"\(wakeScriptPath)\"",
+            "timeout": IPCWakeHookTiming.hookEntryTimeoutSeconds,
+            "async": true,
+            "asyncRewake": true,
+        ]
+    }
+
+    /// The Calyx-owned command entries for one target event, in the
+    /// order they are written: the async monitor entry first, then for
+    /// `PermissionRequest` the synchronous approval entry and for each
+    /// of `wakeEvents` the wake entry. Every other event gets only the
     /// monitor entry.
     private static func commandEntries(
-        scriptPath: String, approvalScriptPath: String, eventName: String
+        scriptPath: String, approvalScriptPath: String, wakeScriptPath: String, eventName: String
     ) -> [[String: Any]] {
-        guard eventName == ApprovalHookEvent.name else {
-            return [commandEntry(scriptPath: scriptPath)]
+        var entries = [commandEntry(scriptPath: scriptPath)]
+        if eventName == ApprovalHookEvent.name {
+            entries.append(approvalCommandEntry(approvalScriptPath: approvalScriptPath))
         }
-        return [commandEntry(scriptPath: scriptPath), approvalCommandEntry(approvalScriptPath: approvalScriptPath)]
+        if wakeEvents.contains(eventName) {
+            entries.append(wakeCommandEntry(wakeScriptPath: wakeScriptPath))
+        }
+        return entries
     }
 
     /// Builds the matcher-group Calyx installs for one target event:
@@ -286,10 +334,12 @@ struct ClaudeHooksConfigManager: Sendable {
     }
 
     /// A command entry is Calyx's own when its `command` path's last
-    /// component is `calyx-agent-hook` or `calyx-approval-hook` —
-    /// independent of the surrounding quoting and of the directory it
-    /// was installed into.
-    private static let ownScriptFileNames: Set<String> = [AgentHookScript.fileName, ApprovalHookScript.fileName]
+    /// component is `calyx-agent-hook`, `calyx-approval-hook` or
+    /// `calyx-ipc-wake-hook`, independent of the surrounding quoting and
+    /// of the directory it was installed into.
+    private static let ownScriptFileNames: Set<String> = [
+        AgentHookScript.fileName, ApprovalHookScript.fileName, IPCWakeHookScript.fileName,
+    ]
 
     private static func isOwnCommandEntry(_ entry: [String: Any]) -> Bool {
         guard entry["type"] as? String == "command",
