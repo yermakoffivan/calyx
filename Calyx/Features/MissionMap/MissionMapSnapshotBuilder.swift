@@ -92,8 +92,10 @@ enum MissionMapSnapshotBuilder {
     }
 
     /// The oldest pending request targeting `surfaceID` -- the one the
-    /// agent has been waiting on longest.
-    private static func approval(for surfaceID: UUID, in pending: [ApprovalRequest]) -> MissionMapApproval? {
+    /// agent has been waiting on longest. Internal rather than private:
+    /// `MCPCockpitBridge`'s `agent_status` applies the same allowable
+    /// rule to each pending request.
+    static func approval(for surfaceID: UUID, in pending: [ApprovalRequest]) -> MissionMapApproval? {
         let oldest = pending
             .filter { $0.targetSurfaceID == surfaceID }
             .min { $0.createdAt < $1.createdAt }

@@ -2,7 +2,7 @@
 // Calyx
 //
 // Bridges CockpitAppAccessing onto the MCP tool surface -- pane_list /
-// pane_split / tab_create (ungated); pane_run / pane_send_keys /
+// pane_split / tab_create / agent_status (ungated); pane_run / pane_send_keys /
 // palette_execute (gated by the approval flow -- see
 // `gate(toolName:targetSurfaceID:payload:)` below). Mirrors
 // MCPCommandLogBridge's shape (nonisolated tools catalogue, typed
@@ -111,6 +111,12 @@ final class MCPCockpitBridge {
     /// agent-pane status (no agent-pane exception, per the approved
     /// plan).
     private let agentRegistry: AgentRegistry
+    /// Reads the current inbox count of each given peer, for
+    /// agent_status's `unread_count`. Answers every asked peer id
+    /// (`IPCStore.inboxCounts(for:)` in production).
+    private let inboxCounts: ([UUID]) async -> [UUID: Int]
+    /// Live per-session token totals, for agent_status's `usage`.
+    private let usageSummaries: UsageLiveSummaries
     /// Consulted by pane_run's `await: true` path via
     /// `awaitNextCompletion(surfaceID:startedAfter:timeoutMs:)`, which
     /// correlates on `startedAfter` rather than resolving eagerly like
@@ -129,6 +135,10 @@ final class MCPCockpitBridge {
         sessionSurfaceMap: SessionSurfaceMap = .shared,
         approvals: ApprovalInboxStore = .shared,
         agentRegistry: AgentRegistry = .shared,
+        inboxCounts: @escaping ([UUID]) async -> [UUID: Int] = { peerIDs in
+            Dictionary(uniqueKeysWithValues: peerIDs.map { ($0, 0) })
+        },
+        usageSummaries: UsageLiveSummaries = .shared,
         commandLogStore: CommandLogStore = .shared,
         approvalTimeoutMs: Int = 55_000
     ) {
@@ -136,6 +146,8 @@ final class MCPCockpitBridge {
         self.sessionSurfaceMap = sessionSurfaceMap
         self.approvals = approvals
         self.agentRegistry = agentRegistry
+        self.inboxCounts = inboxCounts
+        self.usageSummaries = usageSummaries
         self.commandLogStore = commandLogStore
         self.approvalTimeoutMs = approvalTimeoutMs
     }
@@ -144,7 +156,7 @@ final class MCPCockpitBridge {
 
     /// The tool names this bridge dispatches.
     nonisolated static let toolNames: Set<String> = [
-        "pane_list", "pane_split", "tab_create",
+        "pane_list", "pane_split", "tab_create", "agent_status",
         "pane_run", "pane_send_keys", "palette_execute",
     ]
 
@@ -178,6 +190,20 @@ final class MCPCockpitBridge {
                 properties: [
                     "group_name": MCPRouter.prop("string", "Existing or new tab group name; defaults to the current window's active group"),
                     "cwd": MCPRouter.prop("string", "Working directory for the new tab's shell; must be an existing directory"),
+                ]
+            )
+        ),
+        MCPTool(
+            name: "agent_status",
+            description: "Report every terminal pane's agent status in one read-only call: the agent's "
+                + "state, source, session and in-flight tool, its subagents, the bound IPC peer and its "
+                + "unread message count, pending approvals targeting the pane, git branch and changes, "
+                + "worktree task, and token usage. Results are keyed by surface_id; is_self marks the "
+                + "calling pane. surface_id also accepts a calyx-session ID in place of the raw surface UUID.",
+            inputSchema: MCPRouter.schema(
+                properties: [
+                    "surface_id": MCPRouter.prop("string", "Surface UUID or calyx-session ID of the one pane to report; omit to report every pane"),
+                    "include_git": MCPRouter.prop("boolean", "Read each pane's git branch, changes and worktree task (default true)"),
                 ]
             )
         ),
@@ -237,8 +263,10 @@ final class MCPCockpitBridge {
     /// as a thrown `MCPCockpitBridgeError` -- `CalyxMCPServer
     /// .handleCockpitToolCall` catches it and builds the tool-error text
     /// from `error.localizedDescription`, mirroring
-    /// `handleTerminalToolCall`'s do/catch shape.
-    func handleToolCall(name: String, arguments: [String: Any]) async throws -> String {
+    /// `handleTerminalToolCall`'s do/catch shape. `callerSurfaceID` is
+    /// the calling pane's surface (the request's `X-Calyx-Surface-ID`),
+    /// used only by agent_status's `is_self`.
+    func handleToolCall(name: String, arguments: [String: Any], callerSurfaceID: UUID? = nil) async throws -> String {
         switch name {
         case "pane_list":
             return handlePaneList()
@@ -246,6 +274,8 @@ final class MCPCockpitBridge {
             return try handlePaneSplit(arguments: arguments)
         case "tab_create":
             return try handleTabCreate(arguments: arguments)
+        case "agent_status":
+            return try await handleAgentStatus(arguments: arguments, callerSurfaceID: callerSurfaceID)
         case "pane_run":
             return try await handlePaneRun(arguments: arguments)
         case "pane_send_keys":
@@ -281,6 +311,190 @@ final class MCPCockpitBridge {
         if let agentKind = pane.agentKind { dict["agent_kind"] = agentKind }
         if let calyxSessionID = pane.calyxSessionID { dict["calyx_session_id"] = calyxSessionID }
         return dict
+    }
+
+    // MARK: - agent_status
+
+    private func handleAgentStatus(arguments: [String: Any], callerSurfaceID: UUID?) async throws -> String {
+        let rawSurfaceID = try optionalString(arguments, "surface_id")
+        let includeGit = try optionalBool(arguments, "include_git") ?? true
+
+        var panes = access.listPanes()
+        if let rawSurfaceID {
+            guard let surfaceID = resolveSurfaceID(rawSurfaceID) else {
+                throw MCPCockpitBridgeError.unresolvableSurfaceID(rawSurfaceID)
+            }
+            guard access.paneExists(surfaceID) else {
+                throw MCPCockpitBridgeError.paneNotFound(surfaceID)
+            }
+            panes = panes.filter { $0.surfaceID == surfaceID }
+        }
+
+        // `entries` only: `externalEntries` rows are a separate store and
+        // never describe a Calyx pane here.
+        let entries = agentRegistry.entries
+        let cwds = panes.map { MissionMapSnapshotBuilder.resolvedCwd(entryCwd: entries[$0.surfaceID]?.cwd, paneCwd: $0.cwd) }
+        let peerIDs = panes.map { agentRegistry.boundPeerID(for: $0.surfaceID) }
+        let unread = await inboxCounts(peerIDs.compactMap { $0 })
+        let git = includeGit ? await Self.loadGitSummaries(cwds: Set(cwds.compactMap { $0 })) : [:]
+        let pending = approvals.pending.sorted { $0.createdAt < $1.createdAt }
+
+        var result: [String: Any] = [:]
+        for (index, pane) in panes.enumerated() {
+            let entry = entries[pane.surfaceID]
+            var dict = paneDict(pane)
+            dict["cwd"] = cwds[index]
+            dict["agent_kind"] = entry?.kind ?? pane.agentKind
+            dict["is_self"] = pane.surfaceID == callerSurfaceID
+            dict["agent"] = entry.map(Self.agentDict) ?? NSNull()
+            dict["subagents"] = agentRegistry.subagentRegistry.children(of: pane.surfaceID).map(Self.subagentDict)
+            if let peerID = peerIDs[index] {
+                dict["peer_id"] = peerID.uuidString
+                // The reader answers every asked peer id.
+                dict["unread_count"] = unread[peerID] ?? 0
+            } else {
+                dict["unread_count"] = 0
+            }
+            dict["pending_approvals"] = pending
+                .filter { $0.targetSurfaceID == pane.surfaceID }
+                .map { Self.approvalDict($0, surfaceID: pane.surfaceID) }
+            if let cwd = cwds[index], let summary = git[cwd] {
+                dict["git"] = Self.gitDict(summary.badge)
+                if let task = summary.worktreeTask {
+                    dict["worktree_task"] = [
+                        "branch": task.branch, "base": task.base, "worktree_path": task.worktreePath,
+                    ]
+                }
+            }
+            if let totals = entry?.sessionID.flatMap({ usageSummaries.bySession[$0] }) {
+                dict["usage"] = [
+                    "input": totals.input, "output": totals.output,
+                    "cache_read": totals.cacheRead, "cache_creation": totals.cacheCreation,
+                ]
+            }
+            result[pane.surfaceID.uuidString] = dict
+        }
+
+        return jsonString(
+            ["generated_at": MCPCommandLogBridge.iso8601.string(from: Date()), "panes": result],
+            options: [.sortedKeys]
+        )
+    }
+
+    /// Reads each distinct cwd's git summary concurrently. A cwd outside
+    /// any repository, or whose git state cannot be read, is absent from
+    /// the result: agent_status omits that pane's `git` rather than
+    /// failing the whole call (spec B.1).
+    private nonisolated static func loadGitSummaries(
+        cwds: Set<String>
+    ) async -> [String: (badge: MissionMapGitBadge, worktreeTask: MissionMapWorktreeTaskBadge?)] {
+        await withTaskGroup(
+            of: (String, (badge: MissionMapGitBadge, worktreeTask: MissionMapWorktreeTaskBadge?)?).self
+        ) { group in
+            for cwd in cwds {
+                group.addTask {
+                    do {
+                        let location = try await GitService.repositoryLocation(workDir: cwd).standardized
+                        return (cwd, try await MissionMapGitPoller.loadRepositorySummary(at: location))
+                    } catch {
+                        return (cwd, nil)
+                    }
+                }
+            }
+            var summaries: [String: (badge: MissionMapGitBadge, worktreeTask: MissionMapWorktreeTaskBadge?)] = [:]
+            for await (cwd, summary) in group {
+                if let summary { summaries[cwd] = summary }
+            }
+            return summaries
+        }
+    }
+
+    private static func agentDict(_ entry: AgentEntry) -> [String: Any] {
+        var dict: [String: Any] = [
+            "state": stateName(entry.state),
+            "source": sourceName(entry.source),
+            "last_event_at": MCPCommandLogBridge.iso8601.string(from: entry.lastEventAt),
+        ]
+        if let sessionID = entry.sessionID { dict["session_id"] = sessionID }
+        if let tool = toolDict(name: entry.currentToolName, summary: entry.currentToolSummary) {
+            dict["tool"] = tool
+        }
+        return dict
+    }
+
+    private static func subagentDict(_ child: SubagentEntry) -> [String: Any] {
+        var dict: [String: Any] = ["id": child.agentID, "state": stateName(child.state)]
+        if let agentType = child.agentType { dict["agent_type"] = agentType }
+        if let tool = toolDict(name: child.lastToolName, summary: child.lastToolSummary) {
+            dict["tool"] = tool
+        }
+        return dict
+    }
+
+    /// `{name, summary, line}` for a tool in flight, or nil when there is
+    /// none. The summary is redacted like a command log's text
+    /// (`SecretRedactor.redact`), and `line` is `AgentRowDisplay.toolLine`
+    /// over the redacted summary, so no raw secret reaches the caller.
+    private static func toolDict(name: String?, summary: String?) -> [String: Any]? {
+        guard let name, !name.isEmpty else { return nil }
+        let redacted = summary.map(SecretRedactor.redact)
+        var dict: [String: Any] = ["name": name]
+        if let redacted { dict["summary"] = redacted }
+        if let line = AgentRowDisplay.toolLine(toolName: name, toolSummary: redacted) { dict["line"] = line }
+        return dict
+    }
+
+    /// One pending request. `allowable` follows Mission Map's rule
+    /// (`MissionMapSnapshotBuilder.approval(for:in:)`) for that request.
+    private static func approvalDict(_ request: ApprovalRequest, surfaceID: UUID) -> [String: Any] {
+        let allowable: Bool
+        switch MissionMapSnapshotBuilder.approval(for: surfaceID, in: [request]) {
+        case .allowable?: allowable = true
+        case .openOnly?, nil: allowable = false
+        }
+        var dict: [String: Any] = [
+            "id": request.id.uuidString,
+            "allowable": allowable,
+            "created_at": MCPCommandLogBridge.iso8601.string(from: request.createdAt),
+        ]
+        switch request.source {
+        case .mcpTool(let name):
+            dict["source"] = "mcp_tool"
+            dict["tool_name"] = name
+        case .agentHook(let toolName, _, _, _):
+            dict["source"] = "agent_hook"
+            dict["tool_name"] = toolName
+        case .agentQuestion:
+            dict["source"] = "agent_question"
+        case .mcpApp:
+            dict["source"] = "mcp_app"
+        }
+        return dict
+    }
+
+    private static func gitDict(_ badge: MissionMapGitBadge) -> [String: Any] {
+        var dict: [String: Any] = ["changed_file_count": badge.changedFileCount]
+        if let branch = badge.branch { dict["branch"] = branch }
+        if let shortHash = badge.shortHash { dict["short_hash"] = shortHash }
+        return dict
+    }
+
+    private static func stateName(_ state: AgentState) -> String {
+        switch state {
+        case .idle: return "idle"
+        case .working: return "working"
+        case .blocked: return "blocked"
+        case .done: return "done"
+        }
+    }
+
+    private static func sourceName(_ source: AgentSource) -> String {
+        switch source {
+        case .hooks: return "hooks"
+        case .mcpConnection: return "mcp"
+        case .titleHeuristic: return "title"
+        case .external: return "external"
+        }
     }
 
     // MARK: - pane_split
@@ -707,9 +921,10 @@ final class MCPCockpitBridge {
     /// `JSONSerialization` encoding cannot actually fail here; `"{}"` is
     /// an unreachable-in-practice, still well-formed-JSON fallback
     /// rather than a partial/garbled payload (mirrors
-    /// `MCPCommandLogBridge.jsonString`).
-    private func jsonString(_ dict: [String: Any]) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+    /// `MCPCommandLogBridge.jsonString`). agent_status passes
+    /// `.sortedKeys`; it also carries `NSNull` for an absent agent.
+    private func jsonString(_ dict: [String: Any], options: JSONSerialization.WritingOptions = []) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: options),
               let text = String(data: data, encoding: .utf8) else {
             return "{}"
         }

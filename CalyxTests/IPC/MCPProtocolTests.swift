@@ -200,8 +200,8 @@ final class MCPProtocolTests: XCTestCase {
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP +
         // terminal_* + Cockpit + usage_* surface (6 IPC + 70 LSP + 3
-        // terminal_* + 6 Cockpit + 1 usage_* = 86 tools; no ack_messages,
-        // and the 6 Cockpit tools are 3 ungated + 3 gated). Each IPC name must be present
+        // terminal_* + 7 Cockpit + 1 usage_* = 87 tools; no ack_messages,
+        // and the 7 Cockpit tools are 4 ungated + 3 gated). Each IPC name must be present
         // and the LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
@@ -227,8 +227,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 86,
-                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit + 1 usage_* = 86 tools")
+        XCTAssertEqual(toolsResult.tools.count, 87,
+                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 7 Cockpit + 1 usage_* = 87 tools")
     }
 
     // ==================== ack_messages removed; receive is ====================
@@ -793,5 +793,52 @@ final class MCPProtocolTests: XCTestCase {
         XCTAssertTrue(MCPRouter.instructions.contains("terminal_await_command"),
                       "The default instructions text must mention terminal_await_command so an MCP " +
                       "client can discover the terminal_* tool surface")
+    }
+
+    // ==================== agent_status (Cockpit, read-only) ====================
+
+    func test_allTools_containsAgentStatus_withOptionalSurfaceIDAndIncludeGit() throws {
+        let tool = try XCTUnwrap(MCPRouter.allTools.first { $0.name == "agent_status" },
+                                 "allTools must advertise agent_status (via MCPCockpitBridge.tools)")
+        XCTAssertEqual(MCPRouter.allTools.filter { $0.name == "agent_status" }.count, 1)
+        XCTAssertTrue(MCPRouter.isCockpitTool(name: "agent_status"))
+
+        let schemaData = try jsonEncoder.encode(tool.inputSchema)
+        let schema = try XCTUnwrap(try JSONSerialization.jsonObject(with: schemaData) as? [String: Any])
+        XCTAssertEqual(schema["type"] as? String, "object")
+        let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
+        XCTAssertEqual(Set(properties.keys), ["surface_id", "include_git"])
+        XCTAssertEqual(properties["surface_id"]?["type"] as? String, "string")
+        XCTAssertEqual(properties["include_git"]?["type"] as? String, "boolean")
+        XCTAssertTrue((schema["required"] as? [String] ?? []).isEmpty, "both arguments are optional")
+        let includeGitDescription = try XCTUnwrap(properties["include_git"]?["description"] as? String)
+        XCTAssertTrue(includeGitDescription.lowercased().contains("default"),
+                      "include_git's description must state its default: \(includeGitDescription)")
+    }
+
+    /// Exactly one added sentence in a Cockpit paragraph: the paragraph
+    /// count stays 9 without a peer (intro, register_peer guidance, 7
+    /// common paragraphs) and 10 with one, and the only paragraph naming
+    /// agent_status is the ungated pane-discovery one.
+    func test_instructions_cockpitParagraph_mentionsAgentStatus_paragraphCountUnchanged() throws {
+        let plain = MCPRouter.instructions.components(separatedBy: "\n\n")
+        XCTAssertEqual(plain.count, 9)
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
+        let resultData = try jsonEncoder.encode(try XCTUnwrap(response.result))
+        let registered = try XCTUnwrap(
+            try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData).instructions
+        ).components(separatedBy: "\n\n")
+        XCTAssertEqual(registered.count, 10)
+
+        for paragraphs in [plain, registered] {
+            let mentioning = paragraphs.filter { $0.contains("agent_status") }
+            XCTAssertEqual(mentioning.count, 1, "exactly one paragraph names agent_status: \(paragraphs)")
+            XCTAssertTrue(mentioning.first?.hasPrefix("Cockpit pane-discovery") == true,
+                          "agent_status belongs in the ungated Cockpit paragraph: \(mentioning)")
+            let execution = paragraphs.filter { $0.hasPrefix("Cockpit also offers") }
+            XCTAssertEqual(execution.count, 1)
+            XCTAssertFalse(execution.first?.contains("agent_status") ?? true,
+                           "the gated execution paragraph must not name agent_status")
+        }
     }
 }

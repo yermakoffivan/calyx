@@ -36,6 +36,20 @@
 //  with a `mktemp` template under `${TMPDIR:-/tmp}`, so no `mktemp` shim
 //  is needed.
 //
+//  The recording wrappers (`installRecordingWrappers`,
+//  `makeRecordingFakeCurl`, `makeFakeUuidgen(recordDirectory:)`) write
+//  into a record DIRECTORY, one file per invocation
+//  (`<recordDirectory>/<tool>.$$`), never into one shared file. The wake
+//  hook's HMAC pipeline starts several wrapped tools at once (three `xxd`
+//  and two `openssl`), and each record is many separate writes (the argv
+//  header, one write per argument, the `env` output, `END`); appended to a
+//  shared file those writes interleave mid-line and splice headers such
+//  as `ARGV xxdARGV xxd [-r] ...`, so a line-anchored reader misses a tool
+//  that did run. `$$` is the wrapper's own PID, which stays the same
+//  across its `exec` and is unique among concurrently live processes, so
+//  no two concurrent writers ever share a file. `readRecordDirectory`
+//  and `recordedInvocations(of:inDirectory:)` concatenate every file.
+//
 //  Each call site still owns its own cleanup (matching
 //  TwoPaneSessionFixture.swift's established discipline): this file only
 //  builds the fixture and its fake curl, it does not manage any
@@ -208,19 +222,21 @@ func writeFakeTool(named name: String, atDirectory dir: String, body: String) th
 
 /// A fake `uuidgen` that prints `stdout` byte for byte (from a file, so no
 /// character is interpreted by the shell) and exits with `exitCode`. With
-/// `recordPath` it appends its argv and environment there as the recording
-/// wrappers do; with `noise` it prints `NOISE-uuidgen` to stderr.
+/// `recordDirectory` it writes its argv and environment to its own file
+/// there as the recording wrappers do; with `noise` it prints
+/// `NOISE-uuidgen` to stderr.
 func makeFakeUuidgen(
     atDirectory dir: String, stdout: String, exitCode: Int32 = 0,
-    recordPath: String? = nil, noise: Bool = false
+    recordDirectory: String? = nil, noise: Bool = false
 ) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let stdoutPath = dir + "/uuidgen-stdout"
     try Data(stdout.utf8).write(to: URL(fileURLWithPath: stdoutPath))
     var body = ""
-    if let recordPath {
+    if let recordDirectory {
+        try FileManager.default.createDirectory(atPath: recordDirectory, withIntermediateDirectories: true)
         body += "{ printf 'ARGV uuidgen'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; "
-            + "/usr/bin/env; printf 'END\\n'; } >> \"\(recordPath)\"\n"
+            + "/usr/bin/env; printf 'END\\n'; } >> \"\(recordDirectory)/uuidgen.$$\"\n"
     }
     if noise { body += "printf 'NOISE-uuidgen\\n' >&2\n" }
     body += "/bin/cat \"\(stdoutPath)\"\nexit \(exitCode)"
@@ -249,19 +265,22 @@ let wakeHookRealTools: [String: String] = [
 ]
 
 /// Puts a recording wrapper for each of `names` into `dir`. Each wrapper
-/// appends `ARGV <name> [arg1] [arg2] ...` and then the output of
-/// `/usr/bin/env` followed by `END` to `recordPath`, prints
+/// writes `ARGV <name> [arg1] [arg2] ...` and then the output of
+/// `/usr/bin/env` followed by `END` to its own file
+/// `<recordDirectory>/<name>.$$` (see this file's header comment for why
+/// one file per invocation), prints
 /// `NOISE-<name>` to stderr when `noise` is true, then `exec`s the real
 /// tool by absolute path with the same argv and stdin.
 func installRecordingWrappers(
-    atDirectory dir: String, recordPath: String, noise: Bool = false,
+    atDirectory dir: String, recordDirectory: String, noise: Bool = false,
     names: [String] = ["sed", "grep", "tr", "uuidgen", "openssl", "xxd", "mktemp", "cat", "rm"]
 ) throws {
+    try FileManager.default.createDirectory(atPath: recordDirectory, withIntermediateDirectories: true)
     for name in names {
         let real = try XCTUnwrapTool(wakeHookRealTools[name], name)
         let noiseLine = noise ? "printf 'NOISE-\(name)\\n' >&2\n" : ""
         try writeFakeTool(named: name, atDirectory: dir, body: """
-        { printf 'ARGV \(name)'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordPath)"
+        { printf 'ARGV \(name)'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordDirectory)/\(name).$$"
         \(noiseLine)exec \(real) "$@"
         """)
     }
@@ -274,13 +293,14 @@ private func XCTUnwrapTool(_ value: String?, _ name: String) throws -> String {
     return value
 }
 
-/// A fake `curl` that drains stdin, appends `ARGV curl [arg] ...` and its
-/// environment to `recordPath` (as the recording wrappers do), optionally
+/// A fake `curl` that drains stdin, writes `ARGV curl [arg] ...` and its
+/// environment to its own file `<recordDirectory>/curl.$$` (as the
+/// recording wrappers do), optionally
 /// lists `listDirectory` into `listingPath`, prints `NOISE-curl` to stderr
 /// when `noise`, prints `stdoutBody` byte for byte and exits `exitCode`.
 func makeRecordingFakeCurl(
     atDirectory dir: String,
-    recordPath: String,
+    recordDirectory: String,
     stdoutBody: Data,
     exitCode: Int32 = 0,
     noise: Bool = false,
@@ -288,6 +308,7 @@ func makeRecordingFakeCurl(
     listingPath: String? = nil
 ) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(atPath: recordDirectory, withIntermediateDirectories: true)
     let bodyPath = dir + "/curl-stdout-body"
     try stdoutBody.write(to: URL(fileURLWithPath: bodyPath))
     var listLine = ""
@@ -297,15 +318,26 @@ func makeRecordingFakeCurl(
     let noiseLine = noise ? "printf 'NOISE-curl\\n' >&2\n" : ""
     try writeFakeTool(named: "curl", atDirectory: dir, body: """
     /bin/cat > /dev/null
-    { printf 'ARGV curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordPath)"
+    { printf 'ARGV curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordDirectory)/curl.$$"
     \(listLine)\(noiseLine)/bin/cat "\(bodyPath)"
     exit \(exitCode)
     """)
 }
 
-/// The `ARGV <tool> ...` lines of a record file, in order.
-func recordedInvocations(of tool: String, in recordPath: String) -> [String] {
-    ((try? String(contentsOfFile: recordPath, encoding: .utf8)) ?? "")
+/// Every record file in `recordDirectory` concatenated, in file-name
+/// order (each file holds whole records, so records never split), or ""
+/// when the directory is missing or empty. The order across files is not
+/// invocation order; no reader depends on it.
+func readRecordDirectory(_ recordDirectory: String) -> String {
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: recordDirectory)) ?? []).sorted()
+    return names
+        .map { (try? String(contentsOfFile: recordDirectory + "/" + $0, encoding: .utf8)) ?? "" }
+        .joined()
+}
+
+/// The `ARGV <tool> ...` lines of every record file in `recordDirectory`.
+func recordedInvocations(of tool: String, inDirectory recordDirectory: String) -> [String] {
+    readRecordDirectory(recordDirectory)
         .components(separatedBy: "\n")
         .filter { $0 == "ARGV \(tool)" || $0.hasPrefix("ARGV \(tool) ") }
 }

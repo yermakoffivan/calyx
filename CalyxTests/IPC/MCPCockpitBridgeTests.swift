@@ -2,8 +2,8 @@
 //  MCPCockpitBridgeTests.swift
 //  CalyxTests
 //
-//  Covers all 6 of MCPCockpitBridge's tools: the 3 ungated ones
-//  (pane_list, pane_split, tab_create) and the 3 human-approval
+//  Covers all 7 of MCPCockpitBridge's tools: the 4 ungated ones
+//  (pane_list, pane_split, tab_create, agent_status) and the 3 human-approval
 //  gated ones (pane_run, pane_send_keys, palette_execute). Drives
 //  handleToolCall(name:arguments:) directly against a fake
 //  CockpitAppAccessing + a fresh, isolated SessionSurfaceMap (no
@@ -1187,5 +1187,727 @@ final class MCPCockpitBridgeTests: XCTestCase {
         XCTAssertEqual(json["status"] as? String, "executed")
         XCTAssertEqual(json["command_id"] as? String, "cmd-1")
         XCTAssertEqual(json["title"] as? String, "Restart Session")
+    }
+}
+
+// MARK: - agent_status (read-only, ungated)
+//
+// Pins the agent_status contract reachable through the bridge's current
+// init and `handleToolCall(name:arguments:)`: per-pane `agent` (or JSON
+// null), `subagents`, `peer_id`, `unread_count` when unbound,
+// `pending_approvals` (filtered by target, oldest first), `git` /
+// `worktree_task` behind `include_git`, `is_self` without a caller,
+// `surface_id` filtering and its errors, `generated_at`, sorted keys,
+// secret redaction of the tool summary and line, and exclusion of
+// `AgentRegistry.externalEntries`. The tests that need the planned
+// `inboxCounts` / `usageSummaries` init parameters or the planned
+// `callerSurfaceID` argument live in MCPCockpitBridgeAgentStatusTests.
+//
+// Enum encodings for the JSON: AgentState -> "blocked" / "working" /
+// "done" / "idle"; AgentSource -> "hooks" / "mcp" (mcpConnection) /
+// "title" (titleHeuristic) / "external". `tool.line` is `AgentRowDisplay.toolLine` over the
+// redacted summary ("Write: main.swift").
+
+extension MCPCockpitBridgeTests {
+
+    // MARK: Fixtures
+
+    private func agentStatusPane(
+        surfaceID: UUID = UUID(), groupName: String = "Default", title: String? = nil,
+        cwd: String? = nil, isFocused: Bool = false, agentKind: String? = nil, calyxSessionID: String? = nil
+    ) -> CockpitPaneInfo {
+        CockpitPaneInfo(
+            surfaceID: surfaceID, windowID: UUID(), groupName: groupName, tabID: UUID(),
+            tabTitle: "zsh", title: title, cwd: cwd, isFocused: isFocused,
+            agentKind: agentKind, calyxSessionID: calyxSessionID
+        )
+    }
+
+    /// A fixed instant with a fractional second, so the ISO8601 string
+    /// MCPCommandLogBridge.iso8601 renders for it is fully determined.
+    private var agentStatusFixedNow: Date { Date(timeIntervalSince1970: 1_800_000_000.25) }
+
+    private func sessionStart(_ registry: AgentRegistry, surfaceID: UUID, sessionID: String, cwd: String, now: Date) {
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "SessionStart", sessionID: sessionID, cwd: cwd, message: nil),
+            surfaceID: surfaceID, now: now
+        )
+    }
+
+    private func preToolUse(
+        _ registry: AgentRegistry, surfaceID: UUID, sessionID: String, cwd: String,
+        toolName: String, toolSummary: String?, agentID: String? = nil, agentType: String? = nil, now: Date
+    ) {
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: sessionID, cwd: cwd, message: nil,
+                agentID: agentID, agentType: agentType, toolName: toolName, toolSummary: toolSummary
+            ),
+            surfaceID: surfaceID, now: now
+        )
+    }
+
+    /// Calls agent_status and returns the raw text plus its parsed form.
+    private func callAgentStatus(
+        _ bridge: MCPCockpitBridge, arguments: [String: Any] = [:]
+    ) async throws -> (text: String, json: [String: Any]) {
+        let text = try await bridge.handleToolCall(name: "agent_status", arguments: arguments)
+        return (text, try jsonDict(text))
+    }
+
+    private func agentStatusPanes(_ json: [String: Any]) throws -> [String: [String: Any]] {
+        try XCTUnwrap(json["panes"] as? [String: [String: Any]], "panes must be an object keyed by surface_id: \(json)")
+    }
+
+    private func makeAgentStatusRepo(_ label: String) throws -> (scratch: URL, repo: URL) {
+        let scratch = try GitScratch.makeDirectory(label)
+        let repo = scratch.appendingPathComponent("repo")
+        try GitScratch.run(["init", "-q", "-b", "main", repo.path], in: scratch)
+        try GitScratch.commit(file: "base.txt", contents: "base\n", message: "base", in: repo)
+        return (scratch, repo)
+    }
+
+    // MARK: Catalogue and gating
+
+    func test_agentStatus_isInToolNamesAndCatalogue() {
+        XCTAssertTrue(MCPCockpitBridge.toolNames.contains("agent_status"))
+        XCTAssertTrue(MCPCockpitBridge.tools.contains { $0.name == "agent_status" })
+    }
+
+    /// Read-only: never submits an approval request, even with approval
+    /// required (auto-approve off), and returns without a human acting.
+    func test_agentStatus_isNotApprovalGated() async throws {
+        let suiteName = "com.calyx.tests.MCPCockpitBridgeTests.agentStatusUngated"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        CockpitSettings.autoApproveEnabled = false
+        XCTAssertTrue(ApprovalPolicy.requiresApproval(), "precondition: approval is required")
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane()]
+        let approvals = ApprovalInboxStore()
+        let bridge = MCPCockpitBridge(
+            access: access, sessionSurfaceMap: SessionSurfaceMap(), approvals: approvals, agentRegistry: AgentRegistry(),
+            approvalTimeoutMs: 50
+        )
+
+        let (_, json) = try await callAgentStatus(bridge)
+
+        XCTAssertTrue(approvals.pending.isEmpty, "agent_status must never call the approval gate")
+        XCTAssertEqual(try agentStatusPanes(json).count, 1)
+    }
+
+    // MARK: agent
+
+    func test_agentStatus_paneWithAgentRow_reportsAgentObject() async throws {
+        let surfaceID = UUID()
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(surfaceID: surfaceID, cwd: "/Users/dev/pane-dir", agentKind: "claude")]
+        let registry = AgentRegistry()
+        let now = agentStatusFixedNow
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-agent", cwd: "/Users/dev/entry-dir", now: now)
+        preToolUse(registry, surfaceID: surfaceID, sessionID: "s-agent", cwd: "/Users/dev/entry-dir",
+                   toolName: "Write", toolSummary: "main.swift", now: now)
+        let row = try XCTUnwrap(registry.entries[surfaceID], "precondition: the hook events created a row")
+        XCTAssertEqual(row.state, .working, "precondition")
+        XCTAssertEqual(row.source, .hooks, "precondition")
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let pane = try XCTUnwrap(try agentStatusPanes(json)[surfaceID.uuidString])
+        let agent = try XCTUnwrap(pane["agent"] as? [String: Any], "agent must be an object: \(pane)")
+        XCTAssertEqual(agent["state"] as? String, "working")
+        XCTAssertEqual(agent["source"] as? String, "hooks")
+        XCTAssertEqual(agent["session_id"] as? String, "s-agent")
+        XCTAssertEqual(agent["last_event_at"] as? String, MCPCommandLogBridge.iso8601.string(from: row.lastEventAt))
+        XCTAssertEqual(agent["last_event_at"] as? String, MCPCommandLogBridge.iso8601.string(from: now))
+        let tool = try XCTUnwrap(agent["tool"] as? [String: Any], "tool must be an object: \(agent)")
+        XCTAssertEqual(tool["name"] as? String, "Write")
+        XCTAssertEqual(tool["summary"] as? String, "main.swift")
+        XCTAssertEqual(tool["line"] as? String, "Write: main.swift")
+        // The entry's own cwd wins (MissionMapSnapshotBuilder.resolvedCwd),
+        // and the entry's kind wins over the pane's.
+        XCTAssertEqual(pane["cwd"] as? String, "/Users/dev/entry-dir")
+        XCTAssertEqual(pane["agent_kind"] as? String, AgentEntry.claudeCodeKind)
+    }
+
+    func test_agentStatus_paneWithoutAgentRow_agentIsJSONNull() async throws {
+        let access = FakeCockpitAccess()
+        let pane = agentStatusPane(cwd: "/Users/dev/plain", agentKind: "codex")
+        access.panes = [pane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        XCTAssertTrue(dict.keys.contains("agent"), "agent is always present")
+        XCTAssertTrue(dict["agent"] is NSNull, "a pane with no agent row has agent: null, got \(String(describing: dict["agent"]))")
+        XCTAssertEqual(dict["cwd"] as? String, "/Users/dev/plain")
+        XCTAssertEqual(dict["agent_kind"] as? String, "codex", "with no row, agent_kind falls back to the pane's")
+        XCTAssertEqual((dict["subagents"] as? [Any])?.count, 0)
+        XCTAssertEqual((dict["pending_approvals"] as? [Any])?.count, 0)
+    }
+
+    /// Reads one pane's `agent` object for a single-pane bridge.
+    private func soleAgent(_ registry: AgentRegistry, surfaceID: UUID) async throws -> [String: Any] {
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(surfaceID: surfaceID)]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+        return try XCTUnwrap(try agentStatusPanes(json)[surfaceID.uuidString]?["agent"] as? [String: Any])
+    }
+
+    func test_agentStatus_mcpConnectionRow_sourceIsMcp() async throws {
+        let surfaceID = UUID()
+        let registry = AgentRegistry()
+        registry.handleMCPConnection(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, now: agentStatusFixedNow)
+        XCTAssertEqual(registry.entries[surfaceID]?.source, .mcpConnection, "precondition")
+
+        let agent = try await soleAgent(registry, surfaceID: surfaceID)
+
+        XCTAssertEqual(agent["source"] as? String, "mcp")
+    }
+
+    func test_agentStatus_titleHeuristicRow_sourceIsTitle() async throws {
+        let surfaceID = UUID()
+        let registry = AgentRegistry()
+        // handleTitleChange only creates a row while the server is running.
+        registry.markServerStarted()
+        defer { registry.reset() }
+        registry.handleTitleChange(surfaceID: surfaceID, title: "\u{2733} Compacting conversation")
+        XCTAssertEqual(registry.entries[surfaceID]?.source, .titleHeuristic, "precondition")
+
+        let agent = try await soleAgent(registry, surfaceID: surfaceID)
+
+        XCTAssertEqual(agent["source"] as? String, "title")
+    }
+
+    func test_agentStatus_permissionRequestRow_stateIsBlocked() async throws {
+        let surfaceID = UUID()
+        let registry = AgentRegistry()
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-blocked", cwd: "/Users/dev/x", now: agentStatusFixedNow)
+        preToolUse(registry, surfaceID: surfaceID, sessionID: "s-blocked", cwd: "/Users/dev/x",
+                   toolName: "Bash", toolSummary: "ls", now: agentStatusFixedNow)
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PermissionRequest", sessionID: "s-blocked", cwd: "/Users/dev/x", message: nil),
+            surfaceID: surfaceID, now: agentStatusFixedNow.addingTimeInterval(5)
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked, "precondition")
+
+        let agent = try await soleAgent(registry, surfaceID: surfaceID)
+
+        XCTAssertEqual(agent["state"] as? String, "blocked")
+    }
+
+    func test_agentStatus_stopRow_stateIsIdle_andToolOmitted() async throws {
+        let surfaceID = UUID()
+        let registry = AgentRegistry()
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-idle", cwd: "/Users/dev/x", now: agentStatusFixedNow)
+        preToolUse(registry, surfaceID: surfaceID, sessionID: "s-idle", cwd: "/Users/dev/x",
+                   toolName: "Bash", toolSummary: "ls", now: agentStatusFixedNow)
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "Stop", sessionID: "s-idle", cwd: "/Users/dev/x", message: nil),
+            surfaceID: surfaceID, now: agentStatusFixedNow.addingTimeInterval(5)
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle, "precondition")
+        XCTAssertNil(registry.entries[surfaceID]?.currentToolName, "precondition: Stop clears the tool")
+
+        let agent = try await soleAgent(registry, surfaceID: surfaceID)
+
+        XCTAssertEqual(agent["state"] as? String, "idle")
+        XCTAssertFalse(agent.keys.contains("tool"), "no tool in flight: tool is omitted")
+    }
+
+    func test_agentStatus_sessionEndRow_stateIsDone() async throws {
+        let surfaceID = UUID()
+        let registry = AgentRegistry()
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-done", cwd: "/Users/dev/x", now: agentStatusFixedNow)
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "SessionEnd", sessionID: "s-done", cwd: "/Users/dev/x", message: nil),
+            surfaceID: surfaceID, now: agentStatusFixedNow.addingTimeInterval(5)
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .done, "precondition: SessionEnd settles the row to .done")
+
+        let agent = try await soleAgent(registry, surfaceID: surfaceID)
+
+        XCTAssertEqual(agent["state"] as? String, "done")
+    }
+
+    // MARK: peer_id / unread_count (unbound)
+
+    func test_agentStatus_unboundPane_hasNoPeerID_andZeroUnread() async throws {
+        let access = FakeCockpitAccess()
+        let pane = agentStatusPane()
+        access.panes = [pane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        XCTAssertFalse(dict.keys.contains("peer_id"), "an unbound pane must omit peer_id")
+        XCTAssertEqual(dict["unread_count"] as? Int, 0)
+    }
+
+    func test_agentStatus_boundPane_reportsPeerID() async throws {
+        let access = FakeCockpitAccess()
+        let pane = agentStatusPane()
+        access.panes = [pane]
+        let registry = AgentRegistry()
+        let peerID = UUID()
+        registry.bindSurface(pane.surfaceID, toPeer: peerID)
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        XCTAssertEqual(dict["peer_id"] as? String, peerID.uuidString)
+    }
+
+    // MARK: pending_approvals
+
+    func test_agentStatus_pendingApprovals_filteredByTarget_oldestFirst_withSourceAndAllowable() async throws {
+        let paneA = agentStatusPane()
+        let paneB = agentStatusPane()
+        let paneC = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [paneA, paneB, paneC]
+        let approvals = ApprovalInboxStore()
+        let t0 = agentStatusFixedNow
+        let mcpTool = ApprovalRequest(
+            id: UUID(), source: .mcpTool(name: "pane_run"), targetSurfaceID: paneA.surfaceID,
+            payload: "ls", createdAt: t0.addingTimeInterval(20)
+        )
+        let agentHook = ApprovalRequest(
+            id: UUID(),
+            source: .agentHook(
+                toolName: "Bash", kind: AgentEntry.claudeCodeKind, summary: "rm -rf build",
+                offers: AgentHookOffers(permissionUpdates: [], cliOwnsPersistence: false)
+            ),
+            targetSurfaceID: paneA.surfaceID, payload: "rm -rf build", createdAt: t0.addingTimeInterval(10)
+        )
+        let question = ApprovalRequest(
+            id: UUID(),
+            source: .agentQuestion(
+                kind: AgentEntry.claudeCodeKind,
+                prompt: AgentQuestionPrompt(
+                    questions: [
+                        AgentQuestionPrompt.Question(
+                            text: "Which?", header: nil,
+                            options: [AgentQuestionPrompt.Option(label: "a", description: nil, preview: nil)],
+                            multiSelect: false
+                        ),
+                    ],
+                    originalToolInputJSON: Data()
+                )
+            ),
+            targetSurfaceID: paneA.surfaceID, payload: "", createdAt: t0.addingTimeInterval(30)
+        )
+        let mcpApp = ApprovalRequest(
+            id: UUID(),
+            source: .mcpApp(viewID: UUID(), title: "Viewer", kind: .openLink(URL(string: "https://example.com")!)),
+            targetSurfaceID: paneB.surfaceID, payload: "", createdAt: t0
+        )
+        let untargeted = ApprovalRequest(
+            id: UUID(), source: .mcpTool(name: "palette_execute"), targetSurfaceID: nil,
+            payload: "palette", createdAt: t0
+        )
+        // Submitted out of age order, so "oldest first" cannot be the
+        // submission order.
+        for request in [mcpTool, question, agentHook, mcpApp, untargeted] {
+            approvals.submit(request)
+        }
+        let bridge = MCPCockpitBridge(
+            access: access, sessionSurfaceMap: SessionSurfaceMap(), approvals: approvals, agentRegistry: AgentRegistry()
+        )
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let panes = try agentStatusPanes(json)
+        let a = try XCTUnwrap(panes[paneA.surfaceID.uuidString]?["pending_approvals"] as? [[String: Any]])
+        XCTAssertEqual(a.map { $0["id"] as? String }, [agentHook.id.uuidString, mcpTool.id.uuidString, question.id.uuidString])
+        XCTAssertEqual(a.map { $0["source"] as? String }, ["agent_hook", "mcp_tool", "agent_question"])
+        XCTAssertEqual(a.map { $0["allowable"] as? Bool }, [true, true, false])
+        XCTAssertEqual(a[0]["tool_name"] as? String, "Bash")
+        XCTAssertEqual(a[1]["tool_name"] as? String, "pane_run")
+        XCTAssertEqual(a.map { $0["created_at"] as? String }, [
+            MCPCommandLogBridge.iso8601.string(from: agentHook.createdAt),
+            MCPCommandLogBridge.iso8601.string(from: mcpTool.createdAt),
+            MCPCommandLogBridge.iso8601.string(from: question.createdAt),
+        ])
+
+        let b = try XCTUnwrap(panes[paneB.surfaceID.uuidString]?["pending_approvals"] as? [[String: Any]])
+        XCTAssertEqual(b.map { $0["id"] as? String }, [mcpApp.id.uuidString])
+        XCTAssertEqual(b.first?["source"] as? String, "mcp_app")
+        XCTAssertEqual(b.first?["allowable"] as? Bool, false)
+
+        let c = try XCTUnwrap(panes[paneC.surfaceID.uuidString]?["pending_approvals"] as? [Any])
+        XCTAssertTrue(c.isEmpty, "a pane with no targeted request has pending_approvals: []")
+    }
+
+    // MARK: subagents
+
+    func test_agentStatus_subagents_fromSubagentRegistry_andEmptyWhenNone() async throws {
+        let parent = agentStatusPane()
+        let other = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [parent, other]
+        let registry = AgentRegistry()
+        let now = agentStatusFixedNow
+        sessionStart(registry, surfaceID: parent.surfaceID, sessionID: "s-parent", cwd: "/Users/dev/repo", now: now)
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "SubagentStart", sessionID: "s-parent", cwd: "/Users/dev/repo", message: nil,
+                agentID: "agent-x", agentType: "Explore"
+            ),
+            surfaceID: parent.surfaceID, now: now
+        )
+        preToolUse(registry, surfaceID: parent.surfaceID, sessionID: "s-parent", cwd: "/Users/dev/repo",
+                   toolName: "Read", toolSummary: "a.swift", agentID: "agent-x", agentType: "Explore", now: now)
+        let children = registry.subagentRegistry.children(of: parent.surfaceID)
+        XCTAssertEqual(children.count, 1, "precondition: one child tracked")
+        XCTAssertEqual(children.first?.state, .working, "precondition")
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let panes = try agentStatusPanes(json)
+        let subagents = try XCTUnwrap(panes[parent.surfaceID.uuidString]?["subagents"] as? [[String: Any]])
+        XCTAssertEqual(subagents.count, 1)
+        XCTAssertEqual(subagents.first?["id"] as? String, "agent-x")
+        XCTAssertEqual(subagents.first?["agent_type"] as? String, "Explore")
+        XCTAssertEqual(subagents.first?["state"] as? String, "working")
+        let tool = try XCTUnwrap(subagents.first?["tool"] as? [String: Any])
+        XCTAssertEqual(tool["name"] as? String, "Read")
+        XCTAssertEqual(tool["summary"] as? String, "a.swift")
+        XCTAssertEqual(tool["line"] as? String, "Read: a.swift")
+        // The child's tool never becomes the parent row's own tool.
+        let parentAgent = try XCTUnwrap(panes[parent.surfaceID.uuidString]?["agent"] as? [String: Any])
+        XCTAssertFalse(parentAgent.keys.contains("tool"), "the parent has no tool in flight: \(parentAgent)")
+
+        let none = try XCTUnwrap(panes[other.surfaceID.uuidString]?["subagents"] as? [Any])
+        XCTAssertTrue(none.isEmpty)
+    }
+
+    // MARK: surface_id
+
+    func test_agentStatus_surfaceIDUUID_returnsOnlyThatPane() async throws {
+        let target = agentStatusPane()
+        let other = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [target, other]
+        access.paneExistsResult = true
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["surface_id": target.surfaceID.uuidString, "include_git": false])
+
+        XCTAssertEqual(Set(try agentStatusPanes(json).keys), [target.surfaceID.uuidString])
+    }
+
+    func test_agentStatus_surfaceIDCalyxSession_resolvesLikePaneSplit() async throws {
+        let target = agentStatusPane()
+        let other = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [target, other]
+        access.paneExistsResult = true
+        let map = SessionSurfaceMap()
+        map.register(sessionID: "calyx-session-42", surfaceID: target.surfaceID)
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: map, agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["surface_id": "calyx-session-42", "include_git": false])
+
+        XCTAssertEqual(Set(try agentStatusPanes(json).keys), [target.surfaceID.uuidString])
+    }
+
+    func test_agentStatus_surfaceIDUnresolvable_throwsUnresolvable() async {
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane()]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        await expectError(
+            .unresolvableSurfaceID("no-such-session"), name: "agent_status",
+            arguments: ["surface_id": "no-such-session"], bridge: bridge
+        )
+    }
+
+    func test_agentStatus_surfaceIDNotAPane_throwsPaneNotFound() async {
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane()]
+        access.paneExistsResult = false
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+        let missing = UUID()
+
+        await expectError(
+            .paneNotFound(missing), name: "agent_status",
+            arguments: ["surface_id": missing.uuidString], bridge: bridge
+        )
+    }
+
+    // MARK: git / worktree_task
+
+    func test_agentStatus_includeGitFalse_omitsGitAndWorktreeTask() async throws {
+        let (scratch, repo) = try makeAgentStatusRepo("AgentStatusIncludeGitFalse")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let pane = agentStatusPane(cwd: repo.path)
+        let access = FakeCockpitAccess()
+        access.panes = [pane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        XCTAssertFalse(dict.keys.contains("git"))
+        XCTAssertFalse(dict.keys.contains("worktree_task"))
+    }
+
+    /// include_git defaults to true: no argument at all still reads git.
+    func test_agentStatus_repoCwd_reportsGitSummary_byDefault() async throws {
+        let (scratch, repo) = try makeAgentStatusRepo("AgentStatusGitSummary")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try "changed\n".write(to: repo.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
+        try "new\n".write(to: repo.appendingPathComponent("new.txt"), atomically: true, encoding: .utf8)
+        let shortHash = try GitScratch.run(["rev-parse", "--short", "HEAD"], in: repo)
+        let pane = agentStatusPane(cwd: repo.path)
+        let access = FakeCockpitAccess()
+        access.panes = [pane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge)
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        let git = try XCTUnwrap(dict["git"] as? [String: Any], "a repository cwd must report git: \(dict)")
+        XCTAssertEqual(git["branch"] as? String, "main")
+        XCTAssertEqual(git["short_hash"] as? String, shortHash)
+        XCTAssertEqual(git["changed_file_count"] as? Int, 2)
+        XCTAssertFalse(dict.keys.contains("worktree_task"), "the main work tree is no task")
+    }
+
+    func test_agentStatus_worktreeTaskCwd_reportsWorktreeTask() async throws {
+        let (scratch, repo) = try makeAgentStatusRepo("AgentStatusWorktreeTask")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let task = scratch.appendingPathComponent("task-wt")
+        try GitScratch.run(["worktree", "add", "-q", "-b", "task/demo", task.path, "main"], in: repo)
+        try GitScratch.run(["config", "branch.task/demo.calyxbase", "main"], in: repo)
+        let subdirectory = task.appendingPathComponent("src/deep")
+        try FileManager.default.createDirectory(at: subdirectory, withIntermediateDirectories: true)
+        let pane = agentStatusPane(cwd: subdirectory.path)
+        let access = FakeCockpitAccess()
+        access.panes = [pane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": true])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[pane.surfaceID.uuidString])
+        let git = try XCTUnwrap(dict["git"] as? [String: Any])
+        XCTAssertEqual(git["branch"] as? String, "task/demo")
+        let worktreeTask = try XCTUnwrap(dict["worktree_task"] as? [String: Any], "a task worktree cwd must report worktree_task: \(dict)")
+        XCTAssertEqual(worktreeTask["branch"] as? String, "task/demo")
+        XCTAssertEqual(worktreeTask["base"] as? String, "main")
+        XCTAssertEqual(worktreeTask["worktree_path"] as? String, task.path)
+    }
+
+    func test_agentStatus_nonRepoAndUnreadableCwds_omitGit_withoutFailingTheCall() async throws {
+        let scratch = try GitScratch.makeDirectory("AgentStatusNonRepo")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let (repoScratch, repo) = try makeAgentStatusRepo("AgentStatusNonRepoSibling")
+        defer { try? FileManager.default.removeItem(at: repoScratch) }
+        let nonRepo = agentStatusPane(cwd: scratch.path)
+        let unreadable = agentStatusPane(cwd: scratch.appendingPathComponent("does-not-exist").path)
+        let repoPane = agentStatusPane(cwd: repo.path)
+        let access = FakeCockpitAccess()
+        access.panes = [nonRepo, unreadable, repoPane]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge)
+
+        let panes = try agentStatusPanes(json)
+        let nonRepoDict = try XCTUnwrap(panes[nonRepo.surfaceID.uuidString])
+        XCTAssertFalse(nonRepoDict.keys.contains("git"))
+        XCTAssertFalse(nonRepoDict.keys.contains("worktree_task"))
+        let unreadableDict = try XCTUnwrap(panes[unreadable.surfaceID.uuidString])
+        XCTAssertFalse(unreadableDict.keys.contains("git"))
+        // A failing pane costs only its own git, not a sibling's.
+        XCTAssertEqual((panes[repoPane.surfaceID.uuidString]?["git"] as? [String: Any])?["branch"] as? String, "main")
+    }
+
+    // MARK: is_self (no caller)
+
+    func test_agentStatus_withoutCaller_isSelfFalseForEveryPane() async throws {
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(), agentStatusPane()]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let panes = try agentStatusPanes(json)
+        XCTAssertEqual(panes.count, 2)
+        for (_, dict) in panes {
+            XCTAssertEqual(dict["is_self"] as? Bool, false, "is_self is always present")
+        }
+    }
+
+    // MARK: usage (absent)
+
+    func test_agentStatus_noUsageForSession_omitsUsage() async throws {
+        let surfaceID = UUID()
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(surfaceID: surfaceID)]
+        let registry = AgentRegistry()
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "no-usage-\(UUID().uuidString)", cwd: "/Users/dev/x",
+                     now: agentStatusFixedNow)
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let dict = try XCTUnwrap(try agentStatusPanes(json)[surfaceID.uuidString])
+        XCTAssertNotNil(dict["agent"] as? [String: Any], "precondition: the pane has an agent row")
+        XCTAssertFalse(dict.keys.contains("usage"))
+    }
+
+    // MARK: Secret redaction
+
+    func test_agentStatus_toolSummaryAndLine_areRedacted() async throws {
+        let surfaceID = UUID()
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(surfaceID: surfaceID)]
+        let registry = AgentRegistry()
+        let token = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        let rawSummary = "git push https://x:\(token)@github.com/o/r"
+        let redacted = SecretRedactor.redact(rawSummary)
+        XCTAssertFalse(redacted.contains(token), "precondition: SecretRedactor redacts this token")
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-secret", cwd: "/Users/dev/x", now: agentStatusFixedNow)
+        preToolUse(registry, surfaceID: surfaceID, sessionID: "s-secret", cwd: "/Users/dev/x",
+                   toolName: "Bash", toolSummary: rawSummary, now: agentStatusFixedNow)
+        XCTAssertEqual(registry.entries[surfaceID]?.currentToolSummary, rawSummary, "precondition: the row holds the raw summary")
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (text, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        XCTAssertFalse(text.contains(token), "the raw token must not appear anywhere in the response")
+        let agent = try XCTUnwrap(try agentStatusPanes(json)[surfaceID.uuidString]?["agent"] as? [String: Any])
+        let tool = try XCTUnwrap(agent["tool"] as? [String: Any])
+        XCTAssertEqual(tool["summary"] as? String, redacted)
+        XCTAssertEqual(tool["line"] as? String, "Bash: \(redacted)")
+    }
+
+    func test_agentStatus_subagentToolSummaryAndLine_areRedacted() async throws {
+        let parent = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [parent]
+        let registry = AgentRegistry()
+        let now = agentStatusFixedNow
+        let token = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        let rawSummary = "git push https://x:\(token)@github.com/o/r"
+        let redacted = SecretRedactor.redact(rawSummary)
+        XCTAssertFalse(redacted.contains(token), "precondition: SecretRedactor redacts this token")
+        sessionStart(registry, surfaceID: parent.surfaceID, sessionID: "s-sub-secret", cwd: "/Users/dev/repo", now: now)
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "SubagentStart", sessionID: "s-sub-secret", cwd: "/Users/dev/repo", message: nil,
+                agentID: "agent-secret", agentType: "general-purpose"
+            ),
+            surfaceID: parent.surfaceID, now: now
+        )
+        preToolUse(registry, surfaceID: parent.surfaceID, sessionID: "s-sub-secret", cwd: "/Users/dev/repo",
+                   toolName: "Bash", toolSummary: rawSummary, agentID: "agent-secret", agentType: "general-purpose",
+                   now: now)
+        let children = registry.subagentRegistry.children(of: parent.surfaceID)
+        XCTAssertEqual(children.count, 1, "precondition: one child tracked")
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (text, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        XCTAssertFalse(text.contains(token), "the raw token must not appear anywhere in the response")
+        let subagents = try XCTUnwrap(try agentStatusPanes(json)[parent.surfaceID.uuidString]?["subagents"] as? [[String: Any]])
+        XCTAssertEqual(subagents.count, 1)
+        let tool = try XCTUnwrap(subagents.first?["tool"] as? [String: Any], "the subagent's tool must be reported")
+        XCTAssertEqual(tool["summary"] as? String, redacted)
+        XCTAssertEqual(tool["line"] as? String, "Bash: \(redacted)")
+    }
+
+    // MARK: Output shape
+
+    func test_agentStatus_outputShape_generatedAt_paneDictFields_sortedKeys() async throws {
+        let full = agentStatusPane(
+            groupName: "Ops", title: "vim file.rs", cwd: "/Users/dev/repo", isFocused: true,
+            agentKind: "claude", calyxSessionID: "session-abc"
+        )
+        let minimal = agentStatusPane()
+        let access = FakeCockpitAccess()
+        access.panes = [full, minimal]
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: AgentRegistry())
+        // ISO8601 with fractional seconds keeps milliseconds, so bound
+        // the instant at millisecond resolution on both sides.
+        let before = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 * 1000).rounded(.down) / 1000)
+
+        let (text, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let after = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 * 1000).rounded(.up) / 1000)
+        XCTAssertEqual(Set(json.keys), ["generated_at", "panes"])
+        let generatedAtText = try XCTUnwrap(json["generated_at"] as? String)
+        let generatedAt = try XCTUnwrap(MCPCommandLogBridge.iso8601.date(from: generatedAtText),
+                                        "generated_at must parse with MCPCommandLogBridge.iso8601: \(generatedAtText)")
+        XCTAssertGreaterThanOrEqual(generatedAt, before)
+        XCTAssertLessThanOrEqual(generatedAt, after)
+
+        let panes = try agentStatusPanes(json)
+        XCTAssertEqual(Set(panes.keys), [full.surfaceID.uuidString, minimal.surfaceID.uuidString])
+        let fullDict = try XCTUnwrap(panes[full.surfaceID.uuidString])
+        XCTAssertEqual(fullDict["surface_id"] as? String, full.surfaceID.uuidString)
+        XCTAssertEqual(fullDict["window_id"] as? String, full.windowID.uuidString)
+        XCTAssertEqual(fullDict["group_name"] as? String, "Ops")
+        XCTAssertEqual(fullDict["tab_id"] as? String, full.tabID.uuidString)
+        XCTAssertEqual(fullDict["tab_title"] as? String, "zsh")
+        XCTAssertEqual(fullDict["title"] as? String, "vim file.rs")
+        XCTAssertEqual(fullDict["cwd"] as? String, "/Users/dev/repo")
+        XCTAssertEqual(fullDict["is_focused"] as? Bool, true)
+        XCTAssertEqual(fullDict["agent_kind"] as? String, "claude")
+        XCTAssertEqual(fullDict["calyx_session_id"] as? String, "session-abc")
+        let minimalDict = try XCTUnwrap(panes[minimal.surfaceID.uuidString])
+        for key in ["title", "cwd", "agent_kind", "calyx_session_id", "peer_id", "usage"] {
+            XCTAssertFalse(minimalDict.keys.contains(key), "an absent \(key) must be omitted")
+        }
+        for key in ["is_self", "agent", "subagents", "unread_count", "pending_approvals"] {
+            XCTAssertTrue(minimalDict.keys.contains(key), "\(key) is always present")
+        }
+
+        // Sorted keys, checked on the raw text (a parsed dictionary has no order).
+        func index(_ needle: String) throws -> String.Index {
+            try XCTUnwrap(text.range(of: needle)?.lowerBound, "\(needle) missing from \(text)")
+        }
+        XCTAssertLessThan(try index("\"generated_at\""), try index("\"panes\""))
+        let fullRange = try XCTUnwrap(text.range(of: "\"\(full.surfaceID.uuidString)\":{"))
+        let fullText = String(text[fullRange.upperBound...])
+        func fullIndex(_ key: String) throws -> String.Index {
+            try XCTUnwrap(fullText.range(of: "\"\(key)\":")?.lowerBound, "\(key) missing from \(fullText)")
+        }
+        let ordered = ["agent", "agent_kind", "calyx_session_id", "cwd", "group_name", "is_focused", "is_self"]
+        for (lhs, rhs) in zip(ordered, ordered.dropFirst()) {
+            XCTAssertLessThan(try fullIndex(lhs), try fullIndex(rhs), "\(lhs) must precede \(rhs) under sorted keys")
+        }
+    }
+
+    // MARK: externalEntries
+
+    func test_agentStatus_externalEntries_areNotReported() async throws {
+        let pane = agentStatusPane(agentKind: "claude")
+        let access = FakeCockpitAccess()
+        access.panes = [pane]
+        let registry = AgentRegistry()
+        registry.upsertExternalEntry(AgentEntry(
+            surfaceID: pane.surfaceID, sessionID: "herdr-session", source: .external, state: .working,
+            cwd: "/Users/dev/herdr", kind: "herdr-kind", lastEventAt: agentStatusFixedNow,
+            focusSurfaceID: pane.surfaceID
+        ))
+        XCTAssertTrue(registry.entries.isEmpty, "precondition: no native row")
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (_, json) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        let panes = try agentStatusPanes(json)
+        XCTAssertEqual(panes.count, 1, "an external entry never adds a pane of its own")
+        let dict = try XCTUnwrap(panes[pane.surfaceID.uuidString])
+        XCTAssertTrue(dict["agent"] is NSNull, "an external entry must not become the pane's agent")
+        XCTAssertEqual(dict["agent_kind"] as? String, "claude")
+        XCTAssertFalse(dict.keys.contains("cwd"), "the external entry's cwd must not leak in")
     }
 }

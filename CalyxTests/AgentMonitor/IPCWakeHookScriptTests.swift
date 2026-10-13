@@ -150,9 +150,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
         let exitCode: Int32
         let stdout: String
         let stderr: String
-        /// `ARGV curl ...` lines of the record file.
+        /// `ARGV curl ...` lines of the record directory.
         let curlInvocations: [String]
-        /// The whole record file (argv and env of every recorded tool).
+        /// Every record file concatenated (argv and env of every recorded
+        /// tool, one file per invocation; see FakeCurlScriptFixture.swift).
         let record: String
         let tmpDir: String
         /// The entries of TMPDIR at the moment curl ran, nil when curl did
@@ -192,7 +193,7 @@ final class IPCWakeHookScriptTests: XCTestCase {
             wakeKeyBytes: keyBytes,
             install: IPCWakeHookScript.install(toDirectory:)
         )
-        let recordPath = fixture.rootDir + "/record.log"
+        let recordDirectory = fixture.rootDir + "/record.d"
         let listingPath = fixture.rootDir + "/tmp-listing-while-curl-ran.txt"
         let scriptTempDir = fixture.rootDir + (tmpDirMode == .withSpace ? "/script tmp" : "/script-tmp")
         if tmpDirMode == .regularFile {
@@ -202,16 +203,16 @@ final class IPCWakeHookScriptTests: XCTestCase {
         }
 
         if wrappers || noise {
-            try installRecordingWrappers(atDirectory: fixture.fakeBinDir, recordPath: recordPath, noise: noise)
+            try installRecordingWrappers(atDirectory: fixture.fakeBinDir, recordDirectory: recordDirectory, noise: noise)
         }
         try makeRecordingFakeCurl(
-            atDirectory: fixture.fakeBinDir, recordPath: recordPath, stdoutBody: body, exitCode: curlExitCode,
+            atDirectory: fixture.fakeBinDir, recordDirectory: recordDirectory, stdoutBody: body, exitCode: curlExitCode,
             noise: noise, listDirectory: tmpDirMode == .regularFile ? nil : scriptTempDir, listingPath: listingPath
         )
         if let uuidgenStdout {
             try makeFakeUuidgen(
                 atDirectory: fixture.fakeBinDir, stdout: uuidgenStdout, exitCode: uuidgenExitCode,
-                recordPath: (wrappers || noise) ? recordPath : nil, noise: noise
+                recordDirectory: (wrappers || noise) ? recordDirectory : nil, noise: noise
             )
         }
         for replacement in replacements {
@@ -236,13 +237,13 @@ final class IPCWakeHookScriptTests: XCTestCase {
             fixture, stdinJSON: sampleStdin, extraEnv: childEnv, kindArgument: kindArgument
         )
 
-        let curlInvocations = recordedInvocations(of: "curl", in: recordPath)
+        let curlInvocations = recordedInvocations(of: "curl", inDirectory: recordDirectory)
         let listing = (try? String(contentsOfFile: listingPath, encoding: .utf8))
             .map { $0.split(separator: "\n").map(String.init) }
         return WakeRun(
             exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
             curlInvocations: curlInvocations,
-            record: (try? String(contentsOfFile: recordPath, encoding: .utf8)) ?? "",
+            record: readRecordDirectory(recordDirectory),
             tmpDir: scriptTempDir,
             entriesWhileCurlRan: listing,
             entriesAfterExit: tmpDirMode == .regularFile
@@ -680,7 +681,7 @@ final class IPCWakeHookScriptTests: XCTestCase {
         XCTAssertEqual(run.exitCode, 2, "precondition: the wrappers do not break the wake")
         XCTAssertEqual(run.stderr, note)
         for tool in ["sed", "tr", "uuidgen", "mktemp", "cat", "curl", "grep", "xxd", "openssl", "rm"] {
-            XCTAssertFalse(recordedInvocations(of: tool, in: run.fixture.rootDir + "/record.log").isEmpty,
+            XCTAssertFalse(recordedInvocations(of: tool, inDirectory: run.fixture.rootDir + "/record.d").isEmpty,
                            "precondition: \(tool) was recorded")
         }
         let blocks = C.blocksHex(keyBytes: key)

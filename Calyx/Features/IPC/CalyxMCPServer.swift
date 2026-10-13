@@ -281,10 +281,23 @@ final class CalyxMCPServer {
     /// dispatch, by which point any test that overrides
     /// `cockpitAccess`/`sessionSurfaceMap`/`approvalInbox`/
     /// `agentRegistry`/`commandLogStore` has already done so.
-    private lazy var lazyCockpitBridge = MCPCockpitBridge(
-        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
-        approvals: approvalInbox, agentRegistry: agentRegistry, commandLogStore: commandLogStore
-    )
+    /// agent_status's unread counts are read live from this server's
+    /// own `store`, not from the agent rows' cached `unreadCount`.
+    private lazy var lazyCockpitBridge = makeCockpitBridge()
+
+    /// Builds `lazyCockpitBridge`. A method rather than an inline
+    /// property initializer: the compiler rejects a stored property's
+    /// initializer that mixes the main actor with the `IPCStore` actor
+    /// the inbox-count closure calls into.
+    private func makeCockpitBridge() -> MCPCockpitBridge {
+        let store = self.store
+        return MCPCockpitBridge(
+            access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
+            approvals: approvalInbox, agentRegistry: agentRegistry,
+            inboxCounts: { peerIDs in await store.inboxCounts(for: peerIDs) },
+            commandLogStore: commandLogStore
+        )
+    }
 
     /// Records an agent hook event's self-reported session ID into the
     /// calyx-session daemon's per-session meta map, so a later
@@ -2354,7 +2367,8 @@ final class CalyxMCPServer {
             return await handleCockpitToolCall(
                 id: id,
                 toolName: toolName,
-                params: params
+                params: params,
+                surfaceID: surfaceID
             )
         }
 
@@ -2709,19 +2723,23 @@ final class CalyxMCPServer {
 
     // MARK: - Cockpit Tool Dispatch
 
-    /// Route a Cockpit tool call (`pane_list`/`pane_split`/`tab_create`)
-    /// to `MCPCockpitBridge`, mirroring
-    /// `handleTerminalToolCall`'s shape exactly: `MCPCockpitBridgeError`
+    /// Route a Cockpit tool call to `MCPCockpitBridge`, mirroring
+    /// `handleTerminalToolCall`'s shape: `MCPCockpitBridgeError`
     /// also conforms to `LocalizedError`, so a single generic `catch`
     /// builds the tool-error text from `error.localizedDescription`.
+    /// Passes the request's surface, as `handleUsageToolCall` does, so
+    /// agent_status can mark the calling pane with `is_self`.
     private func handleCockpitToolCall(
         id: JSONRPCId,
         toolName: String,
-        params: [String: AnyCodable]
+        params: [String: AnyCodable],
+        surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
         let arguments = extractDict(params, "arguments") ?? [:]
         do {
-            let text = try await lazyCockpitBridge.handleToolCall(name: toolName, arguments: arguments)
+            let text = try await lazyCockpitBridge.handleToolCall(
+                name: toolName, arguments: arguments, callerSurfaceID: surfaceID
+            )
             return toolSuccess(id: id, text: text)
         } catch {
             return toolError(id: id, text: error.localizedDescription)
