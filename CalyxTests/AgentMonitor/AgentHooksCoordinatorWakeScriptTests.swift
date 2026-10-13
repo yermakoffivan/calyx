@@ -23,6 +23,20 @@
 //    settings.json is written, Codex and Grok are still wired
 //  - remove() takes the wake entries out and leaves the script file
 //  - Codex's and Grok's files never name the wake script
+//  - I11, behaviourally: once the hooks are installed, resyncInstalled()
+//    (the launch-time path) and a second install() leave settings.json
+//    byte for byte unchanged, with and without a user-owned Stop group
+//    next to Calyx's. The resync and install legs reach the file only
+//    through ClaudeHooksConfigManager.installHooks, so a writer that
+//    rewrote the wake entry on its own would show up here as changed
+//    bytes. That no other type in the app writes the entry cannot be
+//    proven from the test bundle; these tests pin the two paths that run
+//    on every launch and every Settings install.
+//
+//  Independence from other tests: whatever another test left at one of
+//  the default paths is moved aside in setUp and put back in tearDown,
+//  so this class neither depends on running first nor deletes state it
+//  did not create.
 //
 
 import XCTest
@@ -46,9 +60,14 @@ final class AgentHooksCoordinatorWakeScriptTests: XCTestCase {
     private var wakeScriptPath: String!
 
     // Set only once setUp has confirmed that every path lies beneath the
-    // test root and that none of them exists yet. tearDown removes
-    // nothing while this is false.
+    // test root and has moved aside whatever already existed there.
+    // tearDown removes nothing while this is false.
     private var ownsCreatedPaths = false
+
+    // Where setUp moved pre-existing paths, keyed by original path, so
+    // tearDown can put them back.
+    private var movedAside: [String: String] = [:]
+    private var asideDirectory: String?
 
     private static let wakeEvents = ["Stop", "SessionStart"]
 
@@ -85,16 +104,29 @@ final class AgentHooksCoordinatorWakeScriptTests: XCTestCase {
         }
 
         // Another test leaving one of these behind would change what
-        // install() does here, and tearDown would then delete state this
-        // class did not create.
+        // install() does here. Move it aside instead of failing, and put
+        // it back in tearDown, so this class does not depend on test
+        // order and never deletes state it did not create.
         let fm = FileManager.default
         let mustBeAbsent = [
             claudeDirectory!, codexDirectory!, grokDirectory!,
             agentScriptPath!, approvalScriptPath!, wakeScriptPath!,
             openCodeDirectory, piDirectory,
         ]
-        for path in mustBeAbsent where fm.fileExists(atPath: path) {
-            throw UnsafeEnvironment(description: "\(path) already exists: another test leaked state under the test root")
+        movedAside = [:]
+        asideDirectory = nil
+        for (index, path) in mustBeAbsent.enumerated() where fm.fileExists(atPath: path) {
+            let aside: String
+            if let existing = asideDirectory {
+                aside = existing
+            } else {
+                aside = root + "/AgentHooksCoordinatorWakeScriptTests-aside-" + UUID().uuidString
+                try fm.createDirectory(atPath: aside, withIntermediateDirectories: true)
+                asideDirectory = aside
+            }
+            let destination = aside + "/\(index)"
+            try fm.moveItem(atPath: path, toPath: destination)
+            movedAside[path] = destination
         }
 
         ownsCreatedPaths = true
@@ -111,7 +143,16 @@ final class AgentHooksCoordinatorWakeScriptTests: XCTestCase {
             ] {
                 try? fm.removeItem(atPath: path)
             }
+            for (original, aside) in movedAside {
+                try? fm.removeItem(atPath: original)
+                try? fm.moveItem(atPath: aside, toPath: original)
+            }
+            if let asideDirectory {
+                try? fm.removeItem(atPath: asideDirectory)
+            }
         }
+        movedAside = [:]
+        asideDirectory = nil
         ownsCreatedPaths = false
         super.tearDown()
     }
@@ -339,6 +380,56 @@ final class AgentHooksCoordinatorWakeScriptTests: XCTestCase {
         XCTAssertTrue(exists(wakeScriptPath),
                       "A resync that refreshes Claude Code must write calyx-ipc-wake-hook")
         assertWakeEventsHoldMonitorThenWake(try readSettings())
+    }
+
+    // MARK: - I11: no rewrite once installed
+
+    func test_resyncInstalled_hooksAlreadyInstalled_leavesSettingsBytesUnchanged() throws {
+        try createDirectory(claudeDirectory)
+        assertSuccess(AgentHooksCoordinator.install().claudeCode,
+                      "Precondition: Claude Code's hooks must be installed")
+        let before = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+
+        let result = AgentHooksCoordinator.resyncInstalled()
+
+        assertSuccess(result.claudeCode, "Claude Code carries Calyx's hooks, so a resync must refresh it")
+        let after = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+        XCTAssertEqual(after, before,
+                       "a resync over hooks that are already installed must not change settings.json: the " +
+                       "wake entry is written only by installHooks, which leaves an up-to-date file as it is")
+        assertWakeEventsHoldMonitorThenWake(try readSettings())
+    }
+
+    func test_resyncAndReinstall_withAUserStopGroupPresent_leaveSettingsBytesUnchanged() throws {
+        try createDirectory(claudeDirectory)
+        let userStopGroup: [String: Any] = [
+            "hooks": [["type": "command", "command": "/usr/local/bin/my-own-stop-hook", "timeout": 10]],
+        ]
+        let userSettings: [String: Any] = ["hooks": ["Stop": [userStopGroup]], "theme": "dark"]
+        try JSONSerialization.data(withJSONObject: userSettings).write(to: URL(fileURLWithPath: settingsPath))
+        assertSuccess(AgentHooksCoordinator.install().claudeCode,
+                      "Precondition: Claude Code's hooks must be installed next to the user's Stop group")
+        let installed = try readSettings()
+        XCTAssertTrue(
+            hookGroups(installed, event: "Stop").contains { group in
+                entries(of: group).contains { $0["command"] as? String == "/usr/local/bin/my-own-stop-hook" }
+            },
+            "Precondition: the user's own Stop group survives the install")
+        let before = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+
+        let resync = AgentHooksCoordinator.resyncInstalled()
+        assertSuccess(resync.claudeCode, "a resync must refresh Claude Code")
+        let afterResync = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+        let reinstall = AgentHooksCoordinator.install()
+        assertSuccess(reinstall.claudeCode, "a second install must succeed")
+        let afterReinstall = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+
+        XCTAssertEqual(afterResync, before,
+                       "a resync must not rewrite settings.json when the user's Stop group sits next to " +
+                       "Calyx's up-to-date group")
+        XCTAssertEqual(afterReinstall, before,
+                       "a second install must not rewrite settings.json when the user's Stop group sits next " +
+                       "to Calyx's up-to-date group")
     }
 
     // MARK: - remove()

@@ -92,6 +92,29 @@ actor IPCStore {
     /// Max content size per message: 64KB
     private let maxContentSize: Int = 65_536
 
+    /// Told the recipient peer ID each time a message enters that peer's
+    /// inbox. Called synchronously inside the actor method that wrote the
+    /// inbox, so the sink must not call back into this actor; hopping to
+    /// another isolation domain is the sink's job. `CalyxMCPServer.start()`
+    /// installs the one that forwards to `IPCWakeCoordinator.inboxGrew`.
+    private var inboxAppendedSink: (@Sendable (UUID) -> Void)?
+
+    // MARK: - Inbox growth
+
+    /// Installs `sink` as the inbox-growth sink, replacing any previous
+    /// one; nil removes it.
+    func setInboxAppendedSink(_ sink: (@Sendable (UUID) -> Void)?) {
+        inboxAppendedSink = sink
+    }
+
+    /// The single point that reports inbox growth. Called from exactly
+    /// two places, `appendCapped` (reached by `sendMessage` and
+    /// `broadcast`, once per recipient) and `requeue`. A new path that
+    /// writes messages into an inbox must call this too.
+    private func noteInboxGrew(for peerID: UUID) {
+        inboxAppendedSink?(peerID)
+    }
+
     // MARK: - Liveness
 
     /// A peer is alive if its `lastSeen` is within `peerTTL` OR it is pinned by
@@ -127,6 +150,7 @@ actor IPCStore {
         if let count = inbox[recipientID]?.count, count > maxMessagesPerPeer {
             inbox[recipientID]?.removeFirst(count - maxMessagesPerPeer)
         }
+        noteInboxGrew(for: recipientID)
     }
 
     // MARK: - Peer Management
@@ -351,6 +375,7 @@ actor IPCStore {
             combined.removeFirst(combined.count - maxMessagesPerPeer)
         }
         inbox[peerID] = combined
+        noteInboxGrew(for: peerID)
     }
 
     /// Number of messages currently waiting in `peerID`'s inbox — what

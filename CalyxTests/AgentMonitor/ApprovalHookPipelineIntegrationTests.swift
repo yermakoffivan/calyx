@@ -544,61 +544,24 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
 
     // MARK: - Connection drop mid-poll (R5)
 
-    /// Handle returned by `runHookScriptCapturingPID`: the spawned
-    /// script's own pid, available as soon as `Process.run()` returns --
-    /// well before the script's `curl` call has even resolved -- plus a
-    /// `Task` the caller can await later for its final
-    /// `(exitCode, stdout)`. Unlike `runHookScript` above (which blocks
-    /// until the whole child process tree has exited before returning
-    /// anything), this lets a test locate and kill the script's own curl
-    /// child WHILE the script is still blocked reading
-    /// `/approval-request`'s long-poll response.
-    private struct RunningHookScript {
-        let pid: Int32
-        let result: Task<(exitCode: Int32, stdout: String), Never>
-    }
-
-    /// `Process`/`Pipe`/`FileHandle` are all `Sendable` in this SDK
-    /// (`Process`/`Pipe` bridge to `NSTask`/`NSPipe`, both confirmed
-    /// `Sendable` -- verified against the installed SDK), so capturing
-    /// them across the `Task.detached` boundary below is safe under
-    /// Swift 6 strict concurrency; unlike `runHookScript`'s `self`-sending
-    /// concern (see its own doc comment), nothing non-Sendable is
-    /// captured here.
+    /// Starts the installed script through the shared
+    /// `HookScriptProcessTree.startHookScript` and returns its pid (known
+    /// as soon as `Process.run()` returns, well before the script's curl
+    /// has even started) plus a Task yielding its exit code, stdout and
+    /// stderr. Unlike `runHookScript` above (which blocks until the whole
+    /// child process tree has exited), this lets a test locate and kill
+    /// the script's own curl WHILE the script is still blocked reading
+    /// `/approval-request`'s long-poll response. The environment is
+    /// HOME, the inherited PATH and, when given, CALYX_SURFACE_ID.
     private nonisolated static func runHookScriptCapturingPID(
         scriptPath: String, home: String, stdinJSON: String, surfaceID: UUID?
-    ) throws -> RunningHookScript {
+    ) throws -> HookScriptProcessTree.RunningScript {
         let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
         var env = ["HOME": home, "PATH": inheritedPath]
         if let surfaceID {
             env["CALYX_SURFACE_ID"] = surfaceID.uuidString
         }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [scriptPath]
-        process.environment = env
-
-        let stdinPipe = Pipe()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        try process.run()
-        stdinPipe.fileHandleForWriting.write(Data(stdinJSON.utf8))
-        stdinPipe.fileHandleForWriting.closeFile()
-
-        let pid = process.processIdentifier
-        let resultTask = Task.detached(priority: .userInitiated) {
-            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            _ = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return (exitCode: process.terminationStatus, stdout: String(data: stdoutData, encoding: .utf8) ?? "")
-        }
-
-        return RunningHookScript(pid: pid, result: resultTask)
+        return try HookScriptProcessTree.startHookScript(scriptPath: scriptPath, environment: env, stdin: stdinJSON)
     }
 
     /// Polls `approvalInbox.pending` for up to `timeout` seconds,
@@ -650,7 +613,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                       "under the 30s approvalRequestTimeoutMs above -- rather than leaving it pending until " +
                       "that timeout")
 
-        let (exitCode, stdout) = await running.result.value
+        let (exitCode, stdout, _) = await running.result.value
         XCTAssertEqual(exitCode, 0, "the hook script must always exit 0, even when its own curl child is killed")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so the long-poll can only resolve by the " +
@@ -712,7 +675,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                       "the script's own curl child must not survive as an orphan once the script itself is " +
                       "killed -- the trap must kill it explicitly")
 
-        let (exitCode, stdout) = await running.result.value
+        let (exitCode, stdout, _) = await running.result.value
         XCTAssertEqual(exitCode, 0, "the hook script's own trap must still exit 0 on SIGTERM")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so a killed script must never print anything")

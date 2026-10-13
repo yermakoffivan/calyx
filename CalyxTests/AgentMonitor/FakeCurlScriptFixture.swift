@@ -31,11 +31,10 @@
 //  print a chosen response body, and
 //  `runFakeCurlHookScriptCapturingStderr` returns the script's stderr
 //  next to its exit code and stdout. `runFakeCurlHookScript` delegates to
-//  it, so the process-spawning code exists once. A third,
-//  `makeFakeMktemp`, writes a `mktemp` shim that creates its file inside
-//  a directory the test owns (or fails), so a test can watch the temp
-//  file of a script that calls bare `mktemp`: on macOS that call ignores
-//  TMPDIR in favour of the per-user temporary directory.
+//  it, so the process-spawning code exists once. Its temp file is
+//  watched through TMPDIR, passed in `extraEnv`: the script creates it
+//  with a `mktemp` template under `${TMPDIR:-/tmp}`, so no `mktemp` shim
+//  is needed.
 //
 //  Each call site still owns its own cleanup (matching
 //  TwoPaneSessionFixture.swift's established discipline): this file only
@@ -120,42 +119,6 @@ func makeFakeCurl(
     """
     try body.write(toFile: curlPath, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: curlPath)
-}
-
-/// Writes a `mktemp` shim executable at `<dir>/mktemp`, for a script
-/// that calls `mktemp` with no arguments. Put `dir` ahead of `/usr/bin`
-/// on the script's PATH and the script's temp file lands where the test
-/// can see it.
-///
-/// With `tempFileDir` non-nil the shim creates that directory's file
-/// with the real `/usr/bin/mktemp` (template `response.XXXXXX` inside
-/// `tempFileDir`, which this function creates if needed) and passes its
-/// output and exit status through. With `tempFileDir` nil the shim
-/// creates nothing, prints an error on stderr and exits 1: a failing
-/// `mktemp`. Either way it first appends one "invoked" line to
-/// `recordPath` when that is non-nil. Whatever arguments the shim is
-/// given are ignored.
-func makeFakeMktemp(
-    atDirectory dir: String,
-    creatingFilesIn tempFileDir: String?,
-    recordingTo recordPath: String? = nil
-) throws {
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let recordLine = recordPath.map { "printf 'invoked\\n' >> \"\($0)\"\n" } ?? ""
-    let action: String
-    if let tempFileDir {
-        try FileManager.default.createDirectory(atPath: tempFileDir, withIntermediateDirectories: true)
-        action = "exec /usr/bin/mktemp \"\(tempFileDir)/response.XXXXXX\""
-    } else {
-        action = "printf 'mktemp: simulated failure\\n' >&2\nexit 1"
-    }
-    let body = """
-    #!/bin/sh
-    \(recordLine)\(action)
-    """
-    let mktempPath = dir + "/mktemp"
-    try body.write(toFile: mktempPath, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mktempPath)
 }
 
 /// Runs `fixture.scriptPath` as a real child `/bin/sh` process, with

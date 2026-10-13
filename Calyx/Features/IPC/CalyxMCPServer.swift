@@ -219,9 +219,24 @@ final class CalyxMCPServer {
     /// whichever caller that is, so `stop()` may be the one that
     /// creates it (releasing no waiters, as a new coordinator has
     /// none).
-    private(set) lazy var ipcWakeCoordinator = IPCWakeCoordinator(
-        store: store, agentRegistry: { [weak self] in self?.agentRegistry }
-    )
+    private(set) lazy var ipcWakeCoordinator: IPCWakeCoordinator = {
+        #if DEBUG
+        let isEnabled = _testIPCWakeIsEnabled ?? { IPCWakeSettings.enabled }
+        #else
+        let isEnabled: @MainActor () -> Bool = { IPCWakeSettings.enabled }
+        #endif
+        return IPCWakeCoordinator(
+            store: store, agentRegistry: { [weak self] in self?.agentRegistry }, isEnabled: isEnabled
+        )
+    }()
+
+    #if DEBUG
+    /// Test seam: when set before `ipcWakeCoordinator` is first accessed,
+    /// the coordinator is built with this as its `isEnabled` provider
+    /// instead of `{ IPCWakeSettings.enabled }`. DO NOT use from
+    /// production code.
+    var _testIPCWakeIsEnabled: (@MainActor () -> Bool)?
+    #endif
 
     // MARK: - /calyx-mcp
 
@@ -988,15 +1003,15 @@ final class CalyxMCPServer {
     /// `X-Calyx-Agent-Kind` other than claude-code short-circuits to 204
     /// (this route serves Claude Code panes only; `agentKind(from:)`
     /// reads an absent header as claude-code) ->
-    /// `IPCWakeSettings.enabled` being off short-circuits to 204 the
-    /// same way -> otherwise long-polls `ipcWakeCoordinator.awaitWake`
-    /// for up to `ipcWakeTimeoutMs`: a wake is 200, and nil (timeout,
-    /// this call's own Task being cancelled by the connection-drop watch
-    /// in `dispatchRoute` because the client went away, a newer poll for
-    /// the same surface, the surface destroyed, `stop()`, the Settings
-    /// switch being turned off, where
-    /// `SettingsWindowController.ipcWakeDidChange` calls
-    /// `releaseAllWaiters()`) is 204.
+    /// `ipcWakeCoordinator.isEnabled` (the single reader of the setting)
+    /// being false short-circuits to 204 the same way -> otherwise
+    /// long-polls `ipcWakeCoordinator.awaitWake` for up to
+    /// `ipcWakeTimeoutMs`: a wake is 200, and every release is 204. The
+    /// release paths are: the timeout; a connection drop (the
+    /// connection-drop watch in `dispatchRoute` cancels this call's
+    /// Task); a newer poll for the same surface; the surface destroyed;
+    /// the setting turned off (`SettingsWindowController.ipcWakeDidChange`
+    /// calls `releaseAllWaiters()`); and `stop()`.
     ///
     /// The setting gate comes BEFORE any waiter is registered: with the
     /// setting off `calyx-ipc-wake-hook` (`IPCWakeHookScript`), the
@@ -1017,7 +1032,7 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 204, body: nil)
         }
 
-        guard IPCWakeSettings.enabled else {
+        guard ipcWakeCoordinator.isEnabled else {
             return HTTPParser.response(statusCode: 204, body: nil)
         }
 
@@ -1322,6 +1337,17 @@ final class CalyxMCPServer {
         let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
 
         self.token = token
+
+        // Connect the store's inbox-growth reports to the wake
+        // coordinator before the listener accepts anything, so every
+        // message that enters an inbox from now on requests a check for
+        // its recipient's waiting poll. Left installed by `stop()`: with
+        // no waiters the coordinator does nothing.
+        await store.setInboxAppendedSink { [weak self] peerID in
+            Task { @MainActor in
+                self?.ipcWakeCoordinator.inboxGrew(peerID: peerID)
+            }
+        }
 
         var lastError: Error?
 
@@ -2227,15 +2253,6 @@ final class CalyxMCPServer {
         // directly touched — see `syncBoundPeerInboxCounts`'s doc
         // comment.
         await syncBoundPeerInboxCounts(toolName: toolName)
-
-        // Re-check every waiting `/ipc-wake` long-poll after the same
-        // calyx-ipc messaging tools/call requests. Every production
-        // caller of `store.sendMessage`/`broadcast`/`requeue` is reached
-        // through this function, so this one call covers every way a
-        // message enters an inbox.
-        if Self.inboxSyncToolNames.contains(toolName) {
-            ipcWakeCoordinator.reevaluateAllWaiters()
-        }
 
         return response
     }

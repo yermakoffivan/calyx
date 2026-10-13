@@ -6,9 +6,12 @@
 //  long-polling `/ipc-wake` holds open, answered with 200 and a short note
 //  when the surface's peer has messages it has not been told about yet,
 //  otherwise 204. Same harness as CalyxMCPServerApprovalRequestTests: HTTPRequest
-//  values driven straight through `server.route(request:)`, no listener,
-//  an isolated `agent-endpoint.json` directory, a fresh AgentRegistry and
-//  an isolated IPCWakeSettings suite.
+//  values driven straight through `server.route(request:)`, an isolated
+//  `agent-endpoint.json` directory, a fresh AgentRegistry and an isolated
+//  IPCWakeSettings suite. The server is started (`start()` on a
+//  kernel-assigned port) because `start()` is what connects the store's
+//  inbox-growth sink to the coordinator: a message reaching the store by
+//  any path then requests a check.
 //
 //  Coverage:
 //  - ipcWakeTimeoutMs defaults to IPCWakeHookTiming.serverTimeoutMs
@@ -22,8 +25,8 @@
 //    and none of the sender's name, role or message content
 //  - A poll that is already waiting is woken by a send_message or
 //    broadcast tools/call once initialize or register_peer bound its
-//    surface, by any other calyx-ipc messaging tools/call after a message
-//    arrived, and by a hook event that binds its surface to a peer that
+//    surface, by a message put straight into the store (no tools/call at
+//    all), and by a hook event that binds its surface to a peer that
 //    already has un-nudged messages
 //  - Each message wakes at most once; a newer message wakes again
 //  - A second poll for the same surface makes the first return 204;
@@ -50,9 +53,8 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
     private let testToken = "ipc-wake-test-token"
     private let settingsSuiteName = "com.calyx.tests.CalyxMCPServerIPCWakeTests"
 
-    /// Test-isolated `agent-endpoint.json` directory -- this suite never
-    /// calls `start()`, but `tearDown`'s `server.stop()` still calls
-    /// `AgentEndpointFile.remove(directory:port:token:)`.
+    /// Test-isolated `agent-endpoint.json` directory, written by
+    /// `start()` and removed by `stopAndWait()`.
     private var agentEndpointDir: String!
 
     /// Timeout of every poll that is ended by an event other than its
@@ -74,12 +76,12 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         server.agentRegistry = registry
         server.approvalInbox = ApprovalInboxStore()
         server.agentHookApprovalMemory = AgentHookApprovalMemory()
-        server._testSetToken(testToken)
         server.ipcWakeTimeoutMs = longTimeoutMs
+        try await server.start(token: testToken, preferredPort: 0)
     }
 
     override func tearDown() async throws {
-        server.stop()
+        await server.stopAndWait()
         server = nil
         registry = nil
         if let agentEndpointDir {
@@ -163,14 +165,14 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         return try XCTUnwrap(UUID(uuidString: try XCTUnwrap(json["peerId"] as? String)))
     }
 
-    /// Registers a peer straight in the store: no tools/call, so no check
-    /// of waiting polls is requested.
+    /// Registers a peer straight in the store, with no tools/call.
     private func registerPeerInStore(_ name: String, role: String = "terminal") async -> UUID {
         await server.store.registerPeer(name: name, role: role).id
     }
 
-    /// Delivers a message straight through the store: no tools/call, so
-    /// no check of waiting polls is requested.
+    /// Delivers a message straight through the store, with no tools/call.
+    /// The server was started, so the store's inbox sink requests a check
+    /// for the recipient.
     private func deliverInStore(from sender: UUID, to recipient: UUID, _ content: String = "hello") async throws {
         _ = try await server.store.sendMessage(from: sender, to: recipient, content: content)
     }
@@ -496,43 +498,59 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         XCTAssertEqual(response.body, expectedBody(peer: peer, new: 1, senders: 1, unread: 1))
     }
 
-    /// The four messaging tools that deliver nothing themselves still
-    /// request a check: a message that reached the store by another route
-    /// (delivered straight through the store here) is noticed at the next
-    /// one of these calls.
-    func test_route_otherMessagingToolCalls_alsoRecheckWaitingPolls() async throws {
-        let bystander = await registerPeerInStore("bystander")
-        let toolCalls: [(name: String, arguments: [String: Any])] = [
-            ("list_peers", [:]),
-            ("get_peer_status", ["peer_id": bystander.uuidString]),
-            ("receive_messages", ["peer_id": bystander.uuidString]),
-            ("register_peer", ["name": "someone-else", "role": "terminal"]),
-        ]
+    /// The trigger follows the store, not the transport: once `start()`
+    /// has run, a message put straight into the store wakes a poll that
+    /// is already waiting, with no tools/call involved. The poll's
+    /// timeout is short so that a missing trigger fails as a 204 after
+    /// 2 s rather than a 30 s hang.
+    func test_route_messageDeliveredStraightIntoTheStoreAfterStart_wakesTheWaitingPoll() async throws {
+        server.ipcWakeTimeoutMs = 2_000
+        let sender = await registerPeerInStore("sender")
+        let peer = await registerPeerInStore("recipient")
+        let surface = UUID()
+        registry.bindSurface(surface, toPeer: peer)
+        let pollTask = startPoll(surface)
+        // The registration check runs on an empty inbox, so only the
+        // store's own report of the new message can wake the poll.
+        await assertWaitingAfterChecksIdle(surface)
 
-        for toolCall in toolCalls {
-            let sender = await registerPeerInStore("sender")
-            let peer = await registerPeerInStore("recipient")
-            let surface = UUID()
-            registry.bindSurface(surface, toPeer: peer)
-            let pollTask = startPoll(surface)
-            let waiting = await waitForWaitingPoll(surface)
-            XCTAssertTrue(waiting, "[\(toolCall.name)] precondition: the poll is waiting")
-            // The registration check must be over before the message
-            // exists, so only the tool call's re-check can wake the poll.
-            await assertWaitingAfterChecksIdle(surface)
-            try await deliverInStore(from: sender, to: peer)
-            let flagsBeforeCall = await flags(peer)
-            XCTAssertEqual(flagsBeforeCall, [false],
-                           "[\(toolCall.name)] precondition: delivering through the store woke nobody")
+        try await deliverInStore(from: sender, to: peer)
+        let response = await pollTask.value
 
-            try await callTool(toolCall.name, toolCall.arguments)
-            let response = await pollTask.value
+        XCTAssertEqual(response.statusCode, 200,
+                       "a message that reaches the store by any path must wake the waiting poll")
+        XCTAssertEqual(response.body, expectedBody(peer: peer, new: 1, senders: 1, unread: 1))
+        let flagsAfter = await flags(peer)
+        XCTAssertEqual(flagsAfter, [true])
+    }
 
-            XCTAssertEqual(response.statusCode, 200,
-                           "[\(toolCall.name)] this tools/call must re-check waiting polls")
-            XCTAssertEqual(response.body, expectedBody(peer: peer, new: 1, senders: 1, unread: 1),
-                           "[\(toolCall.name)]")
-        }
+    /// Pins that `start()` reinstalls the store's inbox sink on every call
+    /// and `stop()` does not remove it: after `stopAndWait()` and a second
+    /// `start()`, a message put straight into the store, with no
+    /// tools/call, still wakes a poll that is already waiting. The poll's
+    /// timeout is short so that a missing trigger fails as a 204 after
+    /// 2 s rather than a 30 s hang.
+    func test_route_afterStopAndRestart_messageDeliveredStraightIntoTheStore_stillWakesTheWaitingPoll() async throws {
+        await server.stopAndWait()
+        try await server.start(token: testToken, preferredPort: 0)
+        server.ipcWakeTimeoutMs = 2_000
+        let sender = await registerPeerInStore("sender")
+        let peer = await registerPeerInStore("recipient")
+        let surface = UUID()
+        registry.bindSurface(surface, toPeer: peer)
+        let pollTask = startPoll(surface)
+        // The registration check runs on an empty inbox, so only the
+        // store's own report of the new message can wake the poll.
+        await assertWaitingAfterChecksIdle(surface)
+
+        try await deliverInStore(from: sender, to: peer)
+        let response = await pollTask.value
+
+        XCTAssertEqual(response.statusCode, 200,
+                       "after a stop and restart a message put straight into the store must still wake the poll")
+        XCTAssertEqual(response.body, expectedBody(peer: peer, new: 1, senders: 1, unread: 1))
+        let flagsAfter = await flags(peer)
+        XCTAssertEqual(flagsAfter, [true])
     }
 
     // MARK: - Woken by a hook-derived binding
@@ -649,28 +667,40 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
 
     func test_route_taskCancelledWhileWaiting_removesTheWaiter_andLeavesTheMessageUnNudged() async throws {
         // The surface is bound and the message is un-nudged, so the poll
-        // is wakeable; the message reaches the store directly, after the
-        // poll's registration check, so no check is requested for it and
-        // the cancellation is the only event.
+        // is wakeable. Its registration check is held in the coordinator's
+        // `_testBeforeOffer` seam (after the taker was built, before the
+        // store call) while the route's Task is cancelled, so the
+        // cancellation always comes first and the check must then hand
+        // nothing over.
         let sender = await registerPeerInStore("sender")
         let peer = await registerPeerInStore("recipient")
         let surface = UUID()
         registry.bindSurface(surface, toPeer: peer)
-        let pollTask = startPoll(surface)
-        await assertWaitingAfterChecksIdle(surface)
         try await deliverInStore(from: sender, to: peer)
+        let pollBox = PollTaskBox()
+        server.ipcWakeCoordinator._testBeforeOffer = {
+            guard let pollTask = pollBox.task, !pollBox.cancelled else { return }
+            pollBox.cancelled = true
+            pollTask.cancel()
+            pollBox.response = await pollTask.value
+        }
 
         let clock = ContinuousClock()
         let start = clock.now
-        pollTask.cancel()
+        let pollTask = startPoll(surface)
+        pollBox.task = pollTask
         let response = await pollTask.value
         let elapsed = clock.now - start
 
+        XCTAssertTrue(pollBox.cancelled, "precondition: the poll was cancelled inside its registration check")
         XCTAssertEqual(response.statusCode, 204, "a cancelled poll resolves as no wake")
         XCTAssertNil(response.body)
         XCTAssertLessThan(elapsed, promptBound, "cancellation must end the poll, not its 30 s timeout")
         let removed = await waitUntil { !self.server.ipcWakeCoordinator.waitingSurfaceIDs.contains(surface) }
         XCTAssertTrue(removed, "cancelling the Task running route(request:) must remove the waiter")
+        server.ipcWakeCoordinator._testBeforeOffer = nil
+        let idle = await waitUntil { self.server.ipcWakeCoordinator._testChecksInFlight == 0 }
+        XCTAssertTrue(idle, "the held check must return from the store")
         let flagsAfter = await flags(peer)
         XCTAssertEqual(flagsAfter, [false], "the message must stay un-nudged")
 
@@ -706,4 +736,14 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         }
         XCTAssertFalse(text.contains("nudged"), "got: \(text)")
     }
+}
+
+/// The poll Task the `_testBeforeOffer` closure of the cancellation test
+/// cancels, set once the Task exists. A main-actor box so the closure
+/// captures no test case.
+@MainActor
+private final class PollTaskBox {
+    var task: Task<HTTPResponse, Never>?
+    var cancelled = false
+    var response: HTTPResponse?
 }

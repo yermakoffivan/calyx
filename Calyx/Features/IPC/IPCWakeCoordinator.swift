@@ -31,17 +31,23 @@
 // - No notification state lives here. `waiters` is the only stored
 //   state; which messages have been announced is the `nudged` field of
 //   each `Message`, inside the store.
-// - A check is requested whenever a waiter registers (`awaitWake`), an
-//   IPC messaging tools/call finishes (`reevaluateAllWaiters`, called by
-//   `CalyxMCPServer.handleToolCall`), or `AgentRegistry.bindSurface`
-//   sets or changes a surface's bound peer
-//   (`.calyxAgentPeerBindingChanged`). These three events are what
-//   request a check. `isEnabled()` is read when a check starts; a
-//   change of the flag requests no check by itself, so a waiter that
-//   is already registered when the flag turns true is evaluated at the
-//   next of the three events or ends by its timeout.
+// - A check is requested on four events: (a) a waiter registers
+//   (`awaitWake`); (b) a message enters an inbox, reported by the store
+//   itself through its inbox-growth sink (installed by
+//   `CalyxMCPServer.start()`), which calls `inboxGrew(peerID:)` for the
+//   recipient whatever path wrote the message (`sendMessage`,
+//   `broadcast`, `requeue`); (c) `AgentRegistry.bindSurface` sets or
+//   changes a surface's bound peer (`.calyxAgentPeerBindingChanged`);
+//   (d) the Settings switch turns the setting on, where
+//   `SettingsWindowController.ipcWakeDidChange` calls
+//   `reevaluateAllWaiters()`. `isEnabled` is read when a check starts.
 // - One waiter per surface: a new `awaitWake` for a surface makes the
-//   one already waiting return nil.
+//   one already waiting return nil. Claude Code runs the hook of a new
+//   turn's Stop while the previous turn's poll may still be open, so
+//   two polls for one surface can be in flight at once; the newer one
+//   supersedes the older, which gets 204. A wake handed over while a
+//   turn is running is absorbed into that turn by Claude Code (no new
+//   turn is created).
 // - Timeout, cancellation, surface destruction and `releaseAllWaiters()`
 //   (called by `CalyxMCPServer.stop()`, and by
 //   `SettingsWindowController.ipcWakeDidChange` when the Settings switch
@@ -49,7 +55,7 @@
 //   message flag: none of them goes through the store. Cancellation is
 //   what a dropped connection produces: the connection-drop watch in
 //   `CalyxMCPServer.dispatchRoute` cancels the Task awaiting `awaitWake`.
-// - While `isEnabled()` is false, a check does nothing: it neither
+// - While `isEnabled` is false, a check does nothing: it neither
 //   wakes nor drops a waiter, so a waiter that was already registered
 //   stays until it times out or is released. The Settings switch
 //   releases every waiter when it turns the setting off; nothing here
@@ -66,7 +72,7 @@
 // agent's next `receive_messages` call.
 //
 // The binding and the enabled flag are a snapshot taken when a check
-// starts. A binding change, or `isEnabled()` turning false, while the
+// starts. A binding change, or `isEnabled` turning false, while the
 // check is on its way to the store is not reflected in that check, so the old
 // binding's waiter may still be woken for the peer it was bound to when
 // the check started. The binding change requests a check of its own,
@@ -89,7 +95,7 @@ final class IPCWakeCoordinator: NSObject {
 
     private let store: IPCStore
     private let agentRegistry: @MainActor () -> AgentRegistry?
-    private let isEnabled: @MainActor () -> Bool
+    private let isEnabledProvider: @MainActor () -> Bool
 
     /// At most one live waiter bridge per surface -- see the type's
     /// header comment for the one-waiter-per-surface contract this
@@ -107,7 +113,7 @@ final class IPCWakeCoordinator: NSObject {
          isEnabled: @escaping @MainActor () -> Bool = { IPCWakeSettings.enabled }) {
         self.store = store
         self.agentRegistry = agentRegistry
-        self.isEnabled = isEnabled
+        self.isEnabledProvider = isEnabled
         super.init()
 
         NotificationCenter.default.addObserver(
@@ -116,6 +122,13 @@ final class IPCWakeCoordinator: NSObject {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handlePeerBindingChanged(_:)), name: .calyxAgentPeerBindingChanged, object: nil
         )
+    }
+
+    /// Whether the feature is on, read from the injected provider on
+    /// every access. The single reader of the setting: checks and
+    /// `CalyxMCPServer`'s `/ipc-wake` route both ask this.
+    var isEnabled: Bool {
+        isEnabledProvider()
     }
 
     // MARK: - awaitWake
@@ -184,12 +197,26 @@ final class IPCWakeCoordinator: NSObject {
 
     // MARK: - Checks
 
-    /// Requests a check for every waiting surface. `CalyxMCPServer`
-    /// calls this after each IPC messaging tools/call -- see
-    /// `handleToolCall`'s own comment for why that one call site covers
-    /// every way a message enters an inbox.
-    func reevaluateAllWaiters() {
+    /// Requests a check for every waiting surface.
+    /// `SettingsWindowController.ipcWakeDidChange` calls this when the
+    /// Settings switch is turned on. Returns the check's Task (an
+    /// already finished one when there is nothing to check); once it has
+    /// finished, the store call is over.
+    @discardableResult
+    func reevaluateAllWaiters() -> Task<Void, Never> {
         requestCheck(for: Array(waiters.keys))
+    }
+
+    /// Requests a check for the surface bound to `peerID`, if that
+    /// surface has a waiter. Called on the main actor by the store's
+    /// inbox-growth sink (installed by `CalyxMCPServer.start()`) each
+    /// time a message enters `peerID`'s inbox. Returns the check's Task,
+    /// with the same contract as `reevaluateAllWaiters()`.
+    @discardableResult
+    func inboxGrew(peerID: UUID) -> Task<Void, Never> {
+        guard let registry = agentRegistry() else { return Task {} }
+        let surfaceIDs = waiters.keys.filter { registry.boundPeerID(for: $0) == peerID }
+        return requestCheck(for: surfaceIDs)
     }
 
     /// One check: for each of `surfaceIDs` that has a waiter and a bound
@@ -198,9 +225,12 @@ final class IPCWakeCoordinator: NSObject {
     /// bindings) is read synchronously here, before the Task below
     /// starts -- see the header comment for what that snapshot means.
     /// The store call's result is not needed: a woken waiter's
-    /// `awaitWake` removes its own entry when it returns.
-    private func requestCheck(for surfaceIDs: [UUID]) {
-        guard isEnabled(), let registry = agentRegistry() else { return }
+    /// `awaitWake` removes its own entry when it returns. Returns the
+    /// Task that makes the store call, or an already finished Task when
+    /// no store call is needed.
+    @discardableResult
+    private func requestCheck(for surfaceIDs: [UUID]) -> Task<Void, Never> {
+        guard isEnabled, let registry = agentRegistry() else { return Task {} }
 
         var takers: [UUID: @Sendable (IPCWakeTicket) -> Bool] = [:]
         for surfaceID in surfaceIDs {
@@ -215,12 +245,12 @@ final class IPCWakeCoordinator: NSObject {
                 bridge.resume(with: IPCWakeResponse(peerID: peerID, ticket: ticket))
             }
         }
-        guard !takers.isEmpty else { return }
+        guard !takers.isEmpty else { return Task {} }
 
         #if DEBUG
         _testChecksInFlight += 1
         #endif
-        Task {
+        return Task {
             #if DEBUG
             defer { self._testChecksInFlight -= 1 }
             if let beforeOffer = self._testBeforeOffer {
@@ -284,7 +314,9 @@ final class IPCWakeCoordinator: NSObject {
     var _testBeforeOffer: (@MainActor () async -> Void)?
 
     /// Test seam: the number of checks that have started their Task
-    /// and have not yet returned from `store.offerWakes`. Counted only
+    /// and have not yet returned from `store.offerWakes`. Kept for the
+    /// checks requested by waiter registration and binding changes,
+    /// which hand their Task to no caller. Counted only
     /// for a check that really calls the store (its takers were built
     /// and found non-empty): incremented synchronously where that
     /// check creates its Task, decremented when the Task finishes. A

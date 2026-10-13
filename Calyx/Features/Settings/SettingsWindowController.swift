@@ -87,6 +87,12 @@ class SettingsWindowController: NSWindowController {
     /// of `CalyxMCPServer.shared.ipcWakeCoordinator.releaseAllWaiters()`.
     /// DO NOT use from production code.
     var _ipcWakeReleaseForTesting: (@MainActor () -> Void)?
+
+    /// Test seam: what `ipcWakeDidChange(_:)` runs to re-evaluate the
+    /// waiting `/ipc-wake` polls when the switch is turned on, instead
+    /// of `CalyxMCPServer.shared.ipcWakeCoordinator.reevaluateAllWaiters()`.
+    /// DO NOT use from production code.
+    var _ipcWakeReevaluateForTesting: (@MainActor () -> Void)?
     #endif
 
     private init() {
@@ -736,19 +742,29 @@ class SettingsWindowController: NSWindowController {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
     }
 
-    /// Writes the setting, then, only when the switch is now off,
-    /// releases every waiting `/ipc-wake` poll once. With the setting
-    /// off no check hands out a wake, so a hook process still
-    /// long-polling would otherwise sit there until the poll's timeout;
-    /// releasing answers it 204 at once, and the route answers later
-    /// polls 204 without registering them. Turning the switch on does
-    /// nothing beyond the write: polls are started by Claude Code when a
-    /// turn ends or a session starts, so a pane that is idle at that
-    /// moment becomes wakeable from its next one.
+    /// Writes the setting, then acts once on the waiting `/ipc-wake`
+    /// polls. Off: releases every one. With the setting off no check
+    /// hands out a wake, so a hook process still long-polling would
+    /// otherwise sit there until the poll's timeout; releasing answers
+    /// it 204 at once, and the route answers later polls 204 without
+    /// registering them. On: re-evaluates every one, so a poll that
+    /// registered just before the setting went off, and whose peer got
+    /// a message while it was off, is woken now instead of at the next
+    /// message or its timeout. A pane with no poll at that moment
+    /// becomes wakeable from its next turn end or session start.
     @objc private func ipcWakeDidChange(_ sender: NSSwitch) {
         let enabled = sender.state == .on
         IPCWakeSettings.enabled = enabled
-        guard !enabled else { return }
+        if enabled {
+            #if DEBUG
+            if let reevaluate = _ipcWakeReevaluateForTesting {
+                reevaluate()
+                return
+            }
+            #endif
+            CalyxMCPServer.shared.ipcWakeCoordinator.reevaluateAllWaiters()
+            return
+        }
         #if DEBUG
         if let release = _ipcWakeReleaseForTesting {
             release()

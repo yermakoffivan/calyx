@@ -85,8 +85,10 @@ enum IPCWakeHookScript {
     /// server answers or curl's own `-m` deadline passes.
     ///
     /// The response goes through the script's only temp file, created by
-    /// bare `mktemp`, so it lands in the per-user temporary directory
-    /// exactly as `calyx-approval-hook`'s files do. A failing `mktemp`
+    /// `mktemp` from the template `${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX`:
+    /// `TMPDIR` is honoured when set (macOS's bare `mktemp` ignores it),
+    /// `/tmp` is used otherwise, and the file name starts with
+    /// `calyx-ipc-wake.`. A failing `mktemp`
     /// ends the script with `exit 0` before curl is started. The file is
     /// removed by the `EXIT` trap on every exit path, including the
     /// signal trap's `exit 0`; that trap's body is an `if`, so its own
@@ -140,7 +142,7 @@ enum IPCWakeHookScript {
     # The event on stdin is not used.
     cat > /dev/null
 
-    response_file=$(mktemp) || exit 0
+    response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0
     if [ "$signalled" = 1 ]; then
         exit 0
     fi

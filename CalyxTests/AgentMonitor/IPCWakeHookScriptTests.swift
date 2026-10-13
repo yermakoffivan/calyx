@@ -19,11 +19,10 @@
 //  2. Behaviour, through FakeCurlScriptFixture: the installed script run
 //     as a real `/bin/sh` child with a fake `curl` first on PATH that
 //     prints a chosen body and exits with a chosen code, plus a recording
-//     file that counts how often curl ran. The temp-file tests also put
-//     a fake `mktemp` first on PATH, one that creates its file inside a
-//     directory the test owns: macOS's `mktemp` without a template puts
-//     its file in the per-user temp directory whatever TMPDIR says, so
-//     TMPDIR cannot be used to watch the script's temp file.
+//     file that counts how often curl ran. The temp-file tests set the
+//     child's TMPDIR to a directory the test owns: the script creates its
+//     file from the template `${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX`, and
+//     `mktemp` itself is the system's own (no shim on PATH).
 //
 //  Coverage:
 //  - fileName, shebang
@@ -33,8 +32,8 @@
 //    `--fail`, `-X POST`, the three headers, the `/ipc-wake` URL, output
 //    redirected to the response file, backgrounded, and no request body
 //  - one `mktemp`, on a line that is exactly
-//    `response_file=$(mktemp) || exit 0`; the note prefix is
-//    IPCWakeResponse.notePrefix
+//    `response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0`;
+//    the note prefix is IPCWakeResponse.notePrefix
 //  - the EXIT trap and the TERM HUP INT trap, each pinned as an exact
 //    line, and nothing else trapped
 //  - the order of the steps, the signalled check between mktemp and
@@ -47,10 +46,11 @@
 //  - the prologue's guards (no surface or session id, HERDR_PANE_ID, no
 //    agent-endpoint.json) never reach curl even though curl would hand
 //    back a note; a pane with only CALYX_SESSION_ID does reach it
-//  - one mktemp call per run; its file exists while curl runs and is
-//    gone once the script has exited, on the exit 2 path and on the
-//    exit 0 path
-//  - a failing mktemp: exit 0, curl never runs
+//  - exactly one temp file, named `calyx-ipc-wake.*`, inside TMPDIR
+//    (also a TMPDIR whose path contains a space) while curl runs, gone
+//    once the script has exited, on the exit 2 path and on the exit 0
+//    path
+//  - a TMPDIR in which no file can be created: exit 0, curl never runs
 //
 
 import XCTest
@@ -333,10 +333,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
         let mktempLine = try XCTUnwrap(executableLines.first { $0.contains("mktemp") },
                                        "the script must have an executable line that calls mktemp")
         XCTAssertEqual(
-            mktempLine, "response_file=$(mktemp) || exit 0",
-            "the mktemp line must be exactly this: `|| exit 0` ends the script before curl is started " +
-            "when no file could be created, and bare `mktemp` (no template) is what the tests' mktemp " +
-            "shim stands in for")
+            mktempLine, #"response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0"#,
+            "the mktemp line must be exactly this: the template makes mktemp honour TMPDIR (bare " +
+            "`mktemp` on macOS ignores it), and `|| exit 0` ends the script before curl is started " +
+            "when no file could be created")
     }
 
     // MARK: - Order of the steps
@@ -520,33 +520,37 @@ final class IPCWakeHookScriptTests: XCTestCase {
         let exitCode: Int32
         let stderr: String
         let curlInvocations: Int
-        let mktempInvocations: Int
-        /// The entries of the temp directory at the moment curl ran.
+        /// The entries of TMPDIR at the moment curl ran.
         let entriesWhileCurlRan: [String]
-        /// The entries of the temp directory after the script exited.
-        let entriesAfterExit: [String]
+        /// The entries of TMPDIR after the script exited, or nil when
+        /// TMPDIR is not a directory.
+        let entriesAfterExit: [String]?
     }
 
-    /// Like `runWakeScript`, with a fake `mktemp` first on PATH as well
-    /// (`makeFakeMktemp`). When `mktempSucceeds` the fake creates its file
-    /// inside a dedicated, initially empty directory; otherwise it prints
-    /// an error on stderr and exits 1. Both fakes record every call, and this helper's
-    /// own fake curl also records `ls -A` of that directory before it
-    /// prints `curlStdout` and exits 0.
+    /// Like `runWakeScript`, with the child's TMPDIR set. By default
+    /// TMPDIR is a dedicated, initially empty directory (named with a
+    /// space when `tmpDirNameHasSpace`); with `tmpDirIsARegularFile` it is
+    /// the path of a regular file, in which mktemp cannot create anything.
+    /// This helper's own fake curl records every call and `ls -A` of
+    /// TMPDIR before it prints `curlStdout` and exits 0. No `mktemp`
+    /// shim: the system's own mktemp runs.
     private func runWakeScriptWatchingItsTempFile(
-        curlStdout: String, mktempSucceeds: Bool = true
+        curlStdout: String, tmpDirNameHasSpace: Bool = false, tmpDirIsARegularFile: Bool = false
     ) throws -> TempFileRun {
         let fixture = try makeFakeCurlScriptFixture(
             rootDirectory: tempDir + "/" + UUID().uuidString,
             port: 41_834, token: "ipc-wake-hook-script-test-token",
             install: IPCWakeHookScript.install(toDirectory:)
         )
-        let scriptTempDir = fixture.rootDir + "/script-tmp"
+        let scriptTempDir = fixture.rootDir + (tmpDirNameHasSpace ? "/script tmp" : "/script-tmp")
         let curlRecordPath = fixture.rootDir + "/curl-invocations.log"
-        let mktempRecordPath = fixture.rootDir + "/mktemp-invocations.log"
         let listingPath = fixture.rootDir + "/tmp-listing-while-curl-ran.txt"
         let curlBodyPath = fixture.rootDir + "/curl-stdout-body"
-        try FileManager.default.createDirectory(atPath: scriptTempDir, withIntermediateDirectories: true)
+        if tmpDirIsARegularFile {
+            try Data("not a directory".utf8).write(to: URL(fileURLWithPath: scriptTempDir))
+        } else {
+            try FileManager.default.createDirectory(atPath: scriptTempDir, withIntermediateDirectories: true)
+        }
         try FileManager.default.createDirectory(atPath: fixture.fakeBinDir, withIntermediateDirectories: true)
         try Data(curlStdout.utf8).write(to: URL(fileURLWithPath: curlBodyPath))
 
@@ -561,13 +565,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
         let fakeCurlPath = fixture.fakeBinDir + "/curl"
         try fakeCurl.write(toFile: fakeCurlPath, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCurlPath)
-        try makeFakeMktemp(
-            atDirectory: fixture.fakeBinDir,
-            creatingFilesIn: mktempSucceeds ? scriptTempDir : nil,
-            recordingTo: mktempRecordPath
-        )
 
-        let result = try runFakeCurlHookScriptCapturingStderr(fixture, stdinJSON: sampleStdin, extraEnv: paneEnv)
+        var env = paneEnv
+        env["TMPDIR"] = scriptTempDir
+        let result = try runFakeCurlHookScriptCapturingStderr(fixture, stdinJSON: sampleStdin, extraEnv: env)
 
         func lines(ofFileAt path: String) -> [String] {
             ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
@@ -576,42 +577,60 @@ final class IPCWakeHookScriptTests: XCTestCase {
         return TempFileRun(
             exitCode: result.exitCode, stderr: result.stderr,
             curlInvocations: lines(ofFileAt: curlRecordPath).count,
-            mktempInvocations: lines(ofFileAt: mktempRecordPath).count,
             entriesWhileCurlRan: lines(ofFileAt: listingPath),
-            entriesAfterExit: try FileManager.default.contentsOfDirectory(atPath: scriptTempDir)
+            entriesAfterExit: tmpDirIsARegularFile
+                ? nil : try FileManager.default.contentsOfDirectory(atPath: scriptTempDir)
         )
     }
 
-    func test_run_wake_keepsOneTempFileWhileCurlRuns_andRemovesItOnExit() throws {
+    /// Exactly one entry, and it is the script's own temp file.
+    private func assertOneScriptTempFile(
+        _ entries: [String], file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(entries.map { $0.hasPrefix("calyx-ipc-wake.") }, [true],
+                       "while curl runs, TMPDIR must hold the script's one temp file, named " +
+                       "calyx-ipc-wake.XXXXXX, and nothing else. Got: \(entries)",
+                       file: file, line: line)
+    }
+
+    func test_run_wake_keepsOneTempFileInTMPDIRWhileCurlRuns_andRemovesItOnExit() throws {
         let run = try runWakeScriptWatchingItsTempFile(curlStdout: note)
 
         XCTAssertEqual(run.exitCode, 2, "precondition: this is the exit 2 path")
         XCTAssertEqual(run.stderr, note, "precondition: the note went through the temp file intact")
         XCTAssertEqual(run.curlInvocations, 1)
-        XCTAssertEqual(run.mktempInvocations, 1, "the script creates exactly one temp file")
-        XCTAssertEqual(run.entriesWhileCurlRan.count, 1,
-                       "while curl runs the script's one temp file exists, and nothing else. " +
-                       "Got: \(run.entriesWhileCurlRan)")
+        assertOneScriptTempFile(run.entriesWhileCurlRan)
         XCTAssertEqual(run.entriesAfterExit, [String](),
                        "the temp file must be gone once the script has exited with 2")
     }
 
-    func test_run_noWake_keepsOneTempFileWhileCurlRuns_andRemovesItOnExit() throws {
+    func test_run_noWake_keepsOneTempFileInTMPDIRWhileCurlRuns_andRemovesItOnExit() throws {
         let run = try runWakeScriptWatchingItsTempFile(curlStdout: "")
 
         XCTAssertEqual(run.exitCode, 0, "precondition: this is the exit 0 path")
+        XCTAssertEqual(run.stderr, "")
         XCTAssertEqual(run.curlInvocations, 1)
-        XCTAssertEqual(run.mktempInvocations, 1, "the script creates exactly one temp file")
-        XCTAssertEqual(run.entriesWhileCurlRan.count, 1,
-                       "while curl runs the script's one temp file exists, and nothing else. " +
-                       "Got: \(run.entriesWhileCurlRan)")
+        assertOneScriptTempFile(run.entriesWhileCurlRan)
         XCTAssertEqual(run.entriesAfterExit, [String](),
                        "the temp file must be gone once the script has exited with 0")
     }
 
+    func test_run_TMPDIRPathWithASpace_keepsOneTempFileThere_andRemovesItOnExit() throws {
+        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note, tmpDirNameHasSpace: true)
+
+        XCTAssertEqual(run.exitCode, 2, "a TMPDIR with a space in its path must not break the script")
+        XCTAssertEqual(run.stderr, note)
+        XCTAssertEqual(run.curlInvocations, 1)
+        assertOneScriptTempFile(run.entriesWhileCurlRan)
+        XCTAssertEqual(run.entriesAfterExit, [String](),
+                       "the temp file must be gone once the script has exited")
+    }
+
     func test_run_mktempFails_exitsZero_neverRunsCurl() throws {
-        // stderr is not asserted: mktemp prints its own error there.
-        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note, mktempSucceeds: false)
+        // TMPDIR names a regular file, so mktemp's template cannot be
+        // created. stderr is not asserted: mktemp prints its own error
+        // there.
+        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note, tmpDirIsARegularFile: true)
 
         XCTAssertEqual(run.exitCode, 0, "a script that cannot create its temp file gives up quietly")
         XCTAssertEqual(run.curlInvocations, 0,

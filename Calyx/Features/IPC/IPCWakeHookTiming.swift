@@ -27,9 +27,10 @@
 // long-polling `/ipc-wake` for it, and one poll lasts at most
 // `holdSeconds` (about ten minutes): once the hook entry's timeout has
 // passed, nothing is left to receive a wake until another poll starts.
-// `IPCStore.peerTTL` has the same length, and a peer nobody has heard
-// from for that long expires unless a message to or from it is still
-// undelivered (see `IPCStore`'s liveness rule).
+// `IPCStore.peerTTL` has the same length: a peer expires only when 10
+// minutes have passed since its last IPC operation AND it is neither the
+// sender nor the recipient of an undelivered message (see `IPCStore`'s
+// liveness rule).
 //
 // See IPCWakeHookTimingTests.test_nestingInvariant_serverBeforeCurlBeforeHookEntry
 // for the specced ordering assertions.

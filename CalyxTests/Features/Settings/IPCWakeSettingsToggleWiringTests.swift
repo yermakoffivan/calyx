@@ -17,6 +17,9 @@
 //  (C) the real action writes the setting both ways;
 //  (D) turning the switch off releases every waiting /ipc-wake long-poll,
 //      after the setting was written, and turning it on releases nothing.
+//      That turning it on re-evaluates the waiters (exactly once, through
+//      a seam of its own) is pinned in
+//      IPCWakeSettingsToggleReevaluateWiringTests.
 //      Pinned twice: through the controller's `_ipcWakeReleaseForTesting`
 //      seam (call count and order), and with no seam set against
 //      `CalyxMCPServer.shared.ipcWakeCoordinator`, the coordinator the
@@ -250,9 +253,12 @@ final class IPCWakeSettingsToggleWiringTests: XCTestCase {
         let toggleSwitch = try ipcWakeSwitch()
 
         flip(toggleSwitch, to: .on)
-        // A release hopping through one more main-actor task would have
-        // run by the end of these yields.
-        for _ in 0..<10 { await Task.yield() }
+        // Asserted at once, with no settling: the handler runs on the
+        // main actor and releasing is a synchronous call on the
+        // coordinator, so a release caused by turning the switch on has
+        // already happened when `flip` returns. The re-evaluation that
+        // turning it on requests cannot end this waiter either: the
+        // surface is bound to no peer, so a check builds no taker for it.
         XCTAssertTrue(
             coordinator.waitingSurfaceIDs.contains(surfaceID),
             "turning the switch on must leave a waiting poll waiting")
