@@ -902,3 +902,142 @@ final class AgentEventTests: XCTestCase {
         }
     }
 }
+
+// MARK: - AgentToolSummary.singleLineSummary redaction before the cap
+//
+// Redaction (SecretRedactor.redact) must run on the collapsed text BEFORE
+// the maxSummaryLength cap, like CommandLogStore does for command strings,
+// so a secret straddling the cut never leaves its first part unredacted.
+
+final class AgentToolSummaryRedactionTests: XCTestCase {
+
+    /// A 40-character GitHub token ("ghp_" + 36 alphanumerics), which
+    /// SecretRedactor's github token rule matches in full.
+    private let token = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+
+    /// 479 ordinary characters and a space: the token starts at index 480
+    /// and so spans the 500-character cut.
+    private let filler = String(repeating: "x", count: 479) + " "
+
+    func test_singleLineSummary_secretStraddlingCap_isRedactedBeforeCut() {
+        XCTAssertEqual(token.count, 40, "precondition")
+        XCTAssertEqual(SecretRedactor.redact(token), SecretRedactor.marker, "precondition: the token is a secret")
+
+        let result = AgentToolSummary.singleLineSummary(filler + token)
+
+        XCTAssertFalse(result.contains(String(token.prefix(20))), "the token's first part must not survive the cut")
+        XCTAssertTrue(result.contains(SecretRedactor.marker))
+        XCTAssertLessThanOrEqual(result.count, AgentToolSummary.maxSummaryLength)
+        XCTAssertEqual(result, filler + SecretRedactor.marker)
+    }
+
+    func test_singleLineSummary_noSecretOverCap_cutToExactlyCapWithCollapsedWhitespace() {
+        let words = String(repeating: "ab \n\t cd  ", count: 100)
+        let collapsed = String(repeating: "ab cd ", count: 100)
+        let expected = String(collapsed.prefix(AgentToolSummary.maxSummaryLength))
+
+        let result = AgentToolSummary.singleLineSummary(words)
+
+        XCTAssertEqual(result.count, AgentToolSummary.maxSummaryLength)
+        XCTAssertEqual(result, expected)
+    }
+
+    func test_singleLineSummary_tokenBrokenByWhitespace_isNotRedacted() {
+        let broken = "ghp_abcdefghij \n  klmnopqrstuvwxyz0123456789ABCDEF"
+
+        let result = AgentToolSummary.singleLineSummary(broken)
+
+        XCTAssertEqual(result, "ghp_abcdefghij klmnopqrstuvwxyz0123456789ABCDEF")
+        XCTAssertFalse(result.contains(SecretRedactor.marker))
+    }
+
+    /// A megabyte of whitespace ahead of a straddling secret: the result
+    /// must still be redacted and capped, and come back quickly, so the
+    /// fix may redact only a bounded window, never the unbounded raw text.
+    func test_singleLineSummary_megabyteWhitespaceThenStraddlingSecret_redactedAndQuick() {
+        let input = String(repeating: " ", count: 1_000_000) + filler + token
+        let clock = ContinuousClock()
+        var result = ""
+
+        let elapsed = clock.measure { result = AgentToolSummary.singleLineSummary(input) }
+
+        XCTAssertLessThanOrEqual(result.count, AgentToolSummary.maxSummaryLength)
+        XCTAssertFalse(result.contains(String(token.prefix(20))))
+        XCTAssertLessThan(elapsed, .seconds(5))
+    }
+
+    /// A megabyte of non-whitespace with a secret at its very end: the cap
+    /// is reached long before the secret, so the result is exactly the
+    /// first 500 characters, and it comes back quickly.
+    func test_singleLineSummary_megabyteTextWithSecretAtEnd_cappedAndQuick() {
+        let input = String(repeating: "y", count: 1_000_000) + " " + token
+        let clock = ContinuousClock()
+        var result = ""
+
+        let elapsed = clock.measure { result = AgentToolSummary.singleLineSummary(input) }
+
+        XCTAssertEqual(result, String(repeating: "y", count: AgentToolSummary.maxSummaryLength))
+        XCTAssertLessThan(elapsed, .seconds(5))
+    }
+    /// The unknown-tool fallback path: `readableArguments` renders
+    /// "a: " + 470 "x" + token, so the token occupies indices 473..<513
+    /// and crosses the 500-character cut. If per-value redaction were
+    /// removed, `readableArguments` would cut the token to 27 characters
+    /// (fewer than the 36 alphanumerics the github rule needs), and the
+    /// window redaction in `singleLineSummary` could no longer match it,
+    /// so its first 20 characters would leak and this test would fail.
+    func test_readableArgumentsFallback_tokenStraddlingCap_isRedacted() {
+        let toolInput: [String: Any] = ["a": String(repeating: "x", count: 470) + token]
+
+        let result = AgentToolSummary.singleLineSummary(
+            AgentToolSummary.derive(
+                toolName: "SomeUnknownTool",
+                toolInput: toolInput,
+                fallback: AgentToolSummary.readableArguments(toolInput)
+            )
+        )
+
+        XCTAssertFalse(result.contains(String(token.prefix(20))), "the token's first part must not survive the cut")
+        XCTAssertTrue(result.contains(SecretRedactor.marker))
+        XCTAssertLessThanOrEqual(result.count, AgentToolSummary.maxSummaryLength)
+    }
+
+    /// Many long values for an unknown tool: per-value redaction is
+    /// bounded by the remaining budget, so rendering stays quick.
+    func test_readableArgumentsFallback_sixtyLongValues_renderQuickly() {
+        var toolInput: [String: Any] = [:]
+        for index in 0..<60 {
+            toolInput[String(format: "k%02d", index)] = String(repeating: "v", count: 200)
+        }
+        let clock = ContinuousClock()
+        var result = ""
+
+        let elapsed = clock.measure {
+            result = AgentToolSummary.singleLineSummary(
+                AgentToolSummary.derive(
+                    toolName: "SomeUnknownTool",
+                    toolInput: toolInput,
+                    fallback: AgentToolSummary.readableArguments(toolInput)
+                )
+            )
+        }
+
+        XCTAssertEqual(result.count, AgentToolSummary.maxSummaryLength)
+        XCTAssertLessThan(elapsed, .milliseconds(500))
+    }
+
+    /// When the 500th collapsed character is a space, the cut drops it,
+    /// so the result is 499 characters with no trailing space.
+    func test_singleLineSummary_capLandsOnSpace_trailingSpaceStripped() {
+        // "abcd " repeats every 5 characters, so index 499 is a space.
+        let words = String(repeating: "abcd \n\t ", count: 120)
+        let collapsed = String(repeating: "abcd ", count: 120)
+        let expected = String(collapsed.prefix(AgentToolSummary.maxSummaryLength - 1))
+
+        let result = AgentToolSummary.singleLineSummary(words)
+
+        XCTAssertEqual(result.count, AgentToolSummary.maxSummaryLength - 1)
+        XCTAssertFalse(result.hasSuffix(" "))
+        XCTAssertEqual(result, expected)
+    }
+}

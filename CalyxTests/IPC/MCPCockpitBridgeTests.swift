@@ -1910,4 +1910,35 @@ extension MCPCockpitBridgeTests {
         XCTAssertEqual(dict["agent_kind"] as? String, "claude")
         XCTAssertFalse(dict.keys.contains("cwd"), "the external entry's cwd must not leak in")
     }
+
+    // MARK: Redaction before the summary cap
+
+    /// A secret that straddles AgentToolSummary.maxSummaryLength must be
+    /// redacted on the full text before the cap, through the real hook
+    /// ingest path (AgentEvent.decode), so no prefix of it reaches
+    /// agent_status.
+    func test_agentStatus_secretStraddlingSummaryCap_noTokenPrefixInResponse() async throws {
+        let surfaceID = UUID()
+        let access = FakeCockpitAccess()
+        access.panes = [agentStatusPane(surfaceID: surfaceID)]
+        let registry = AgentRegistry()
+        let token = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        XCTAssertEqual(token.count, 40, "precondition: a 40-character token")
+        let filler = String(repeating: "x", count: 479) + " "
+        let command = filler + token
+        let payload: [String: Any] = [
+            "session_id": "s-straddle", "cwd": "/Users/dev/x", "hook_event_name": "PreToolUse",
+            "tool_name": "Bash", "tool_input": ["command": command],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        let event = try XCTUnwrap(AgentEvent.decode(from: data))
+        sessionStart(registry, surfaceID: surfaceID, sessionID: "s-straddle", cwd: "/Users/dev/x", now: agentStatusFixedNow)
+        registry.handleHookEvent(event, surfaceID: surfaceID, now: agentStatusFixedNow)
+        let bridge = MCPCockpitBridge(access: access, sessionSurfaceMap: SessionSurfaceMap(), agentRegistry: registry)
+
+        let (text, _) = try await callAgentStatus(bridge, arguments: ["include_git": false])
+
+        XCTAssertFalse(text.contains(String(token.prefix(20))),
+                       "no prefix of a straddling token may appear in the agent_status response")
+    }
 }

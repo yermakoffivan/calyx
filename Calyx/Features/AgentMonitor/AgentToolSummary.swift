@@ -6,6 +6,14 @@
 // (AgentHookToolCall.summary) and the Agents sidebar's subagent child
 // row (AgentEvent.toolSummary). One derivation, so a banner and a row
 // describing the same tool call can never disagree about what it is.
+//
+// `singleLineSummary` runs `SecretRedactor.redact` on a bounded window of
+// the collapsed text before applying the final cap, so a secret that
+// straddles the cut is masked whole instead of leaking its prefix. Every
+// summary built through it (the Agents sidebar rows, Mission Map rows,
+// and the `agent_status` MCP tool) is therefore already redacted when it
+// is stored; a consumer that redacts it again gets the same string back,
+// because `SecretRedactor.marker` matches none of the redaction rules.
 
 import Foundation
 
@@ -14,10 +22,37 @@ enum AgentToolSummary {
     /// A derived summary's cap, in `Character`s. `derive` itself returns
     /// the full string, so a caller that also needs the untruncated value
     /// (or a different cap) is not forced through this one; the cap is
-    /// applied by the caller, and by `singleLineSummary` and
-    /// `readableArguments`, which stop building at it rather than
-    /// trimming afterwards.
+    /// applied by the caller, by `readableArguments`, which stops
+    /// building at it, and by `singleLineSummary`, which redacts secrets
+    /// in its bounded window before cutting to this cap.
     static let maxSummaryLength = 500
+
+    /// How many characters `singleLineSummary` reads before redaction,
+    /// in `Character`s. Redacting only the first
+    /// `maxSummaryLength` characters would miss a secret that straddles
+    /// the cut (its prefix alone matches no pattern), so the window must
+    /// extend past the cap by at least the longest secret that can cross
+    /// it: 500 plus about 161 for a fine-grained `github_pat_` token,
+    /// rounded up to 4,096 for generous margin. The window keeps ingest
+    /// bounded: a megabyte input is walked once, never redacted in full.
+    /// Known residual: a JWT segment may run to about 2,000 characters,
+    /// so a JWT that starts near the cut with exceptionally long header
+    /// and payload segments can extend past the window, go unmatched, and
+    /// leave its first characters in the capped summary.
+    static let redactionWindowLength = 4_096
+
+    /// How many characters past the renderer's remaining budget
+    /// `readableArguments` redacts in each leaf string value, in
+    /// `Character`s. A secret that starts inside the budget and crosses
+    /// its end is masked whole only if the redacted prefix contains all
+    /// of it, so this must exceed the longest non-JWT secret pattern
+    /// (about 161 characters for a fine-grained `github_pat_` token); 512
+    /// leaves generous margin. The JWT residual documented on
+    /// `redactionWindowLength` applies here as well. Bounding each value
+    /// by the remaining budget keeps the total redaction work per event
+    /// near `maxSummaryLength` plus this lookahead per rendered value,
+    /// instead of a full window per value.
+    static let redactionLookahead = 512
 
     /// `tool_name`s whose summary is the string at `tool_input.file_path`.
     /// `NotebookEdit` is deliberately NOT in this set -- Claude Code's
@@ -87,12 +122,20 @@ enum AgentToolSummary {
     /// does not go through this: an operator approving a script sees the
     /// command as written.
     ///
-    /// The cap counts characters that survive the collapse, so whitespace
-    /// never spends it. That bounds what is emitted, not what is read:
-    /// whitespace is walked in full, so a run of a million spaces costs
-    /// its own length.
+    /// The collapsed text is gathered into a window of
+    /// `redactionWindowLength` characters, `SecretRedactor.redact` is
+    /// applied to that window, and only then is the result cut to
+    /// `maxSummaryLength`, so a secret straddling the cap is masked whole
+    /// rather than leaking its prefix. The cut never leaves a trailing
+    /// space. Collapsing only ever replaces whitespace with a space,
+    /// never removes it, so it cannot join two pieces into a secret.
+    ///
+    /// The window counts characters that survive the collapse, so
+    /// whitespace never spends it. That bounds what is gathered and
+    /// redacted, not what is read: whitespace is walked in full, so a run
+    /// of a million spaces costs its own length.
     static func singleLineSummary(_ text: String) -> String {
-        var line = BoundedText(limit: maxSummaryLength)
+        var line = BoundedText(limit: redactionWindowLength)
         var pendingSpace = false
         for character in text {
             guard !character.isWhitespace else {
@@ -109,7 +152,11 @@ enum AgentToolSummary {
             line.append(String(character))
             if line.isFull { break }
         }
-        return line.value
+        let redacted = SecretRedactor.redact(line.value)
+        guard redacted.count > maxSummaryLength else { return redacted }
+        var capped = String(redacted.prefix(maxSummaryLength))
+        while capped.last?.isWhitespace == true { capped.removeLast() }
+        return capped
     }
 
     /// A tool input's arguments rendered as `key: value` pairs joined by
@@ -117,6 +164,18 @@ enum AgentToolSummary {
     /// string value is rendered verbatim, a number or a boolean by its
     /// natural spelling, and anything structured (array, object, null) as
     /// the compact JSON of that one value.
+    ///
+    /// Every leaf string value (a top-level string, and every string
+    /// inside a structured value, JSON object keys excluded) is passed
+    /// through `SecretRedactor.redact` before it is rendered, so a secret
+    /// that straddles the cap is masked whole. Keys are parameter names
+    /// and are left as written. Only the first `remaining budget +
+    /// redactionLookahead` characters of a value are redacted and
+    /// rendered, which keeps the cost bounded for a value of hundreds of
+    /// kilobytes and for a tool input with many long values. Redacting per
+    /// value loses nothing real: a secret split across two values is not
+    /// a secret. `singleLineSummary` still runs its window redaction over
+    /// the rendered result afterwards, which is idempotent.
     ///
     /// Built incrementally and stopped the moment it reaches
     /// `maxSummaryLength` characters, so a caller on the main actor never
@@ -150,7 +209,7 @@ enum AgentToolSummary {
     private static func appendValue(_ value: Any, to text: inout BoundedText) {
         switch value {
         case let string as String:
-            text.append(string)
+            text.append(redactedValue(string, budget: text.remaining))
         case let number as NSNumber where isBoolean(number):
             text.append(number.boolValue ? "true" : "false")
         case let number as NSNumber:
@@ -174,7 +233,7 @@ enum AgentToolSummary {
         case let number as NSNumber:
             text.append(number.description)
         case let string as String:
-            appendJSONString(string, to: &text)
+            appendJSONString(string, redacting: true, to: &text)
         case let array as NSArray:
             text.append("[")
             for (index, element) in array.enumerated() {
@@ -201,7 +260,7 @@ enum AgentToolSummary {
                     guard text.remaining > jsonElementSeparator.count else { break }
                     text.append(jsonElementSeparator)
                 }
-                appendJSONString(key, to: &text)
+                appendJSONString(key, redacting: false, to: &text)
                 text.append(":")
                 appendCompactJSON(object[key] ?? NSNull(), to: &text)
             }
@@ -213,13 +272,27 @@ enum AgentToolSummary {
 
     /// A JSON string literal, escaped one character at a time so a long
     /// string is never escaped past the budget.
-    private static func appendJSONString(_ string: String, to text: inout BoundedText) {
+    ///
+    /// `redacting` is true for a string value and false for an object
+    /// key, which is a name rather than data.
+    private static func appendJSONString(
+        _ string: String, redacting: Bool, to text: inout BoundedText
+    ) {
         text.append("\"")
-        for character in string {
+        for character in redacting ? redactedValue(string, budget: text.remaining) : string {
             guard !text.isFull else { return }
             text.append(escaped(character))
         }
         text.append("\"")
+    }
+
+    /// A leaf string value with its secrets masked, limited to the first
+    /// `budget + redactionLookahead` characters, where `budget` is the
+    /// renderer's remaining capacity. Each source character renders as at
+    /// least one character, so nothing past `budget` can be shown, and
+    /// the lookahead lets a secret crossing the budget be matched whole.
+    private static func redactedValue(_ string: String, budget: Int) -> String {
+        SecretRedactor.redact(String(string.prefix(max(budget, 0) + redactionLookahead)))
     }
 
     /// One character's JSON spelling inside a string literal.
