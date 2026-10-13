@@ -305,7 +305,8 @@ func makeRecordingFakeCurl(
     exitCode: Int32 = 0,
     noise: Bool = false,
     listDirectory: String? = nil,
-    listingPath: String? = nil
+    listingPath: String? = nil,
+    startedPath: String? = nil
 ) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(atPath: recordDirectory, withIntermediateDirectories: true)
@@ -316,8 +317,15 @@ func makeRecordingFakeCurl(
         listLine = "/bin/ls -A \"\(listDirectory)\" > \"\(listingPath)\"\n"
     }
     let noiseLine = noise ? "printf 'NOISE-curl\\n' >&2\n" : ""
+    // When requested, the very first action is an unconditional record, so
+    // a curl that starts at all leaves a trace even if it is killed
+    // immediately afterwards.
+    var startedLine = ""
+    if let startedPath {
+        startedLine = "printf 'started\\n' >> \"\(startedPath)\"\n"
+    }
     try writeFakeTool(named: "curl", atDirectory: dir, body: """
-    /bin/cat > /dev/null
+    \(startedLine)/bin/cat > /dev/null
     { printf 'ARGV curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordDirectory)/curl.$$"
     \(listLine)\(noiseLine)/bin/cat "\(bodyPath)"
     exit \(exitCode)

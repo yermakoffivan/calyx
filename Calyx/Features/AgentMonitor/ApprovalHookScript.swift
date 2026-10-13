@@ -108,16 +108,42 @@ enum ApprovalHookScript {
     /// silently posts an EMPTY body), the trap kills curl's pid and
     /// exits 0 on TERM/HUP/INT, and `wait` blocks for curl's own exit
     /// (interruptible by the same trap) before the response file is
-    /// read. The trap always sets `signalled=1` but only kills and exits
-    /// once `curl_pid` is non-empty (both are initialized empty/0 first,
-    /// so an inherited environment value can't leak in): a signal landing
-    /// after `curl ... &` but before `curl_pid=$!` would otherwise run
-    /// `kill ""` (a no-op), exit, and orphan curl. Instead the script
-    /// carries on to the assignment, and an `if [ "$signalled" = 1 ]`
-    /// re-check immediately after it kills the now-known curl, removes
-    /// both temp files, and exits 0. A `SIGKILL` to this script bypasses
-    /// the trap entirely (no process can catch it) and still orphans curl
-    /// exactly as before --
+    /// read. These long-poll lines are shared with `calyx-ipc-wake-hook`
+    /// and live in `AgentHookLongPoll` (`setup`, `guardBeforeCurl`,
+    /// `afterCurl`); the endpoint file's HMAC block read and the nonce
+    /// come from `AgentHookProof` (`readBlocks`, `nonce`). The trap always
+    /// sets `signalled=1` but only kills and exits once `curl_pid` is
+    /// non-empty (both are initialized empty/0 first, so an inherited
+    /// environment value can't leak in): a signal landing after
+    /// `curl ... &` but before `curl_pid=$!` would otherwise run `kill ""`
+    /// (a no-op), exit, and orphan curl. Instead the script carries on to
+    /// the assignment, and an `if [ "$signalled" = 1 ]` re-check
+    /// immediately after it kills the now-known curl and exits 0. A
+    /// signal that lands before curl is started at all (for example
+    /// while stdin is still being drained) is caught by the same check on
+    /// the lines right before `curl`, so curl never starts. Once `wait`
+    /// returns, `curl_pid=` empties the pid again, so a late signal
+    /// cannot `kill` a pid that is no longer curl's.
+    ///
+    /// Temp files: `payload_file` and `response_file` are emptied first,
+    /// then one EXIT trap removes whichever of them exists, on every exit
+    /// path. The TERM/HUP/INT trap removes no file itself: its `exit 0`
+    /// runs the EXIT trap. The trap is written as `if ...; then rm -f`
+    /// rather than `[ ... ] && rm -f` so its own status can never replace
+    /// the script's exit status. Both traps are set before either file
+    /// is created, and each file comes from a templated
+    /// `mktemp "${TMPDIR:-/tmp}/calyx-approval-<payload|response>.XXXXXX"`
+    /// (honouring `TMPDIR`), each failing safe with `|| exit 0`: the EXIT
+    /// trap removes whatever was already created. No path removes the
+    /// files explicitly.
+    ///
+    /// The first executable line is `exec 2>/dev/null`: this script's
+    /// stderr is never meaningful to the CLI, so tool noise and the
+    /// shell's own "command not found" messages (for example a missing
+    /// `uuidgen`) are discarded rather than shown to the user.
+    ///
+    /// A `SIGKILL` to this script bypasses the trap entirely (no process
+    /// can catch it) and still orphans curl exactly as before --
     /// that residual path is why `CalyxMCPServer.routeAgentEvent`'s
     /// Stop-hook-settles-to-idle fallback stays in place as a last
     /// resort, not removed by this fix.
@@ -157,9 +183,10 @@ enum ApprovalHookScript {
     # calyx-approval-hook -- synchronously forwards a PermissionRequest
     # hook's stdin JSON to Calyx's local Agent Monitor IPC endpoint and
     # prints its response verbatim; the response body IS the CLI's
-    # permission decision. No output at all (any curl failure, or Calyx
-    # unreachable) is the correct fail-safe: it lets the CLI's own
-    # confirmation prompt take over. Installed and removed by
+    # permission decision. No output at all (any curl failure, Calyx
+    # unreachable, missing HMAC key blocks in the endpoint file, or
+    # uuidgen failing or printing nothing) is the correct fail-safe: it
+    # lets the CLI's own confirmation prompt take over. Installed and removed by
     # ClaudeHooksConfigManager / CodexHooksConfigManager.
     #
     # curl runs backgrounded with a TERM/HUP/INT trap that kills it and
@@ -168,26 +195,31 @@ enum ApprovalHookScript {
     # on Calyx), a FOREGROUNDED curl would survive as an orphan and keep
     # its long-poll connection open for up to its own -m deadline. A
     # signal arriving before curl_pid is assigned only sets signalled=1;
-    # the re-check right after curl_pid=$! then kills curl and exits. Only
-    # SIGKILL bypasses this (no process can trap it) -- see
-    # ApprovalHookScript's own doc comment for the full empirical
+    # the checks right before curl and right after curl_pid=$! then exit
+    # (killing curl if it runs). One EXIT trap removes both temp files on
+    # every path. Only SIGKILL bypasses this (no process can trap it) --
+    # see ApprovalHookScript's own doc comment for the full empirical
     # writeup and the residual-path fallback that covers it.
+
+    # stderr is discarded so tool noise never reaches the CLI.
+    exec 2>/dev/null
 
     \(AgentHookScriptPrologue.body)
 
-    payload_file=$(mktemp) || exit 0
-    response_file=$(mktemp) || { rm -f "$payload_file"; exit 0; }
-    # The trap only kills and exits once curl_pid is known; a signal
-    # arriving earlier -- including between curl's `&` and the
-    # `curl_pid=$!` assignment, when kill would have no pid to target --
-    # just records signalled=1, and the re-check right after that
-    # assignment kills the now-known curl and exits instead.
-    signalled=0
-    curl_pid=
-    trap 'signalled=1; if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null; rm -f "$payload_file" "$response_file"; exit 0; fi' TERM HUP INT
+    payload_file=
+    response_file=
+    # One EXIT trap removes both temp files on every path, including the
+    # TERM trap's exit 0.
+    trap 'if [ -n "$payload_file" ]; then rm -f "$payload_file"; fi; if [ -n "$response_file" ]; then rm -f "$response_file"; fi' EXIT
+    \(AgentHookLongPoll.setup)
+    payload_file=$(mktemp "${TMPDIR:-/tmp}/calyx-approval-payload.XXXXXX") || exit 0
+    response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-approval-response.XXXXXX") || exit 0
 
     cat > "$payload_file"
 
+    \(AgentHookProof.readBlocks)
+    \(AgentHookProof.nonce)
+    \(AgentHookLongPoll.guardBeforeCurl)
     curl -s -m \(ApprovalHookTiming.curlTimeoutSeconds) \\
         --fail \\
         -X POST \\
@@ -197,17 +229,9 @@ enum ApprovalHookScript {
         -H "Content-Type: application/json" \\
         --data-binary @"$payload_file" \\
         "http://127.0.0.1:$port/approval-request" > "$response_file" &
-    curl_pid=$!
-    if [ "$signalled" = 1 ]; then
-        kill "$curl_pid" 2>/dev/null
-        rm -f "$payload_file" "$response_file"
-        exit 0
-    fi
-    wait "$curl_pid"
-    curl_exit=$?
+    \(AgentHookLongPoll.afterCurl)
 
     response=$(cat "$response_file")
-    rm -f "$payload_file" "$response_file"
 
     case "$curl_exit" in
         0) printf '%s' "$response" ;;
