@@ -482,7 +482,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         // reconstructs explicitly.
         let stalePort = server.port
         server.stop()
-        try AgentEndpointFile.write(port: stalePort, token: testToken, directory: appSupportDir)
+        try AgentEndpointFile.write(port: stalePort, token: testToken, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir)
 
         let (exitCode, stdout) = try await Self.runHookScript(
             scriptPath: scriptPath, home: tempHome, stdinJSON: bashLsStdin, surfaceID: UUID()

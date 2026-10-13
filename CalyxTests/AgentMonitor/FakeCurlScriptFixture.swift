@@ -58,6 +58,13 @@ struct FakeCurlScriptFixture {
     let appSupportDir: String
     let fakeBinDir: String
     let scriptPath: String
+    /// The wake proof key whose two blocks agent-endpoint.json carries
+    /// (`wakeProofInner`/`wakeProofOuter`), or nil when the file was
+    /// written without them.
+    let wakeKeyBytes: Data?
+
+    /// `<appSupportDir>/agent-endpoint.json`.
+    var endpointFilePath: String { appSupportDir + "/agent-endpoint.json" }
 }
 
 /// Builds a `FakeCurlScriptFixture`. `rootDirectory` defaults to a fresh
@@ -66,22 +73,26 @@ struct FakeCurlScriptFixture {
 /// cleanup itself rather than track this fixture's `rootDir` separately.
 /// `port`/`token` are arbitrary -- nothing in this harness ever reads
 /// `agent-endpoint.json` back through a real server, so any
-/// distinct-enough values will do.
+/// distinct-enough values will do. The file is written by hand
+/// (`IPCWakeTestCrypto.writeEndpointFile`, 0600) with the two wake proof
+/// blocks of `wakeKeyBytes`, a fresh random 32-byte key unless given; pass
+/// nil for a file with port and token only.
 func makeFakeCurlScriptFixture(
     rootDirectory: String = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString).path,
     port: Int,
     token: String,
+    wakeKeyBytes: Data? = IPCWakeTestCrypto.randomKeyBytes(),
     install: (String) throws -> String
 ) throws -> FakeCurlScriptFixture {
     let home = rootDirectory + "/home"
     let appSupportDir = home + "/Library/Application Support/Calyx"
     let fakeBinDir = rootDirectory + "/fakebin"
-    try AgentEndpointFile.write(port: port, token: token, directory: appSupportDir)
+    try IPCWakeTestCrypto.writeEndpointFile(directory: appSupportDir, port: port, token: token, keyBytes: wakeKeyBytes)
     let scriptPath = try install(appSupportDir + "/bin")
     return FakeCurlScriptFixture(
         rootDir: rootDirectory, home: home, appSupportDir: appSupportDir,
-        fakeBinDir: fakeBinDir, scriptPath: scriptPath
+        fakeBinDir: fakeBinDir, scriptPath: scriptPath, wakeKeyBytes: wakeKeyBytes
     )
 }
 
@@ -182,4 +193,119 @@ func runFakeCurlHookScriptCapturingStderr(
         String(data: stdoutData, encoding: .utf8) ?? "",
         String(data: stderrData, encoding: .utf8) ?? ""
     )
+}
+
+// MARK: - calyx-ipc-wake-hook additions (slice A-5)
+
+/// Writes an executable `/bin/sh` script named `name` into `dir` with
+/// `body` after the shebang line.
+func writeFakeTool(named name: String, atDirectory dir: String, body: String) throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let path = dir + "/" + name
+    try ("#!/bin/sh\n" + body + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+}
+
+/// A fake `uuidgen` that prints `stdout` byte for byte (from a file, so no
+/// character is interpreted by the shell) and exits with `exitCode`. With
+/// `recordPath` it appends its argv and environment there as the recording
+/// wrappers do; with `noise` it prints `NOISE-uuidgen` to stderr.
+func makeFakeUuidgen(
+    atDirectory dir: String, stdout: String, exitCode: Int32 = 0,
+    recordPath: String? = nil, noise: Bool = false
+) throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let stdoutPath = dir + "/uuidgen-stdout"
+    try Data(stdout.utf8).write(to: URL(fileURLWithPath: stdoutPath))
+    var body = ""
+    if let recordPath {
+        body += "{ printf 'ARGV uuidgen'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; "
+            + "/usr/bin/env; printf 'END\\n'; } >> \"\(recordPath)\"\n"
+    }
+    if noise { body += "printf 'NOISE-uuidgen\\n' >&2\n" }
+    body += "/bin/cat \"\(stdoutPath)\"\nexit \(exitCode)"
+    try writeFakeTool(named: "uuidgen", atDirectory: dir, body: body)
+}
+
+/// A replacement for `name` that drains its stdin, prints `stdout` (from a
+/// file) and exits with `exitCode`: a failing `openssl`, `xxd` or `grep`.
+func makeFailingTool(named name: String, atDirectory dir: String, exitCode: Int32, stdout: String = "") throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let stdoutPath = dir + "/\(name)-stdout"
+    try Data(stdout.utf8).write(to: URL(fileURLWithPath: stdoutPath))
+    try writeFakeTool(
+        named: name, atDirectory: dir,
+        body: "/bin/cat > /dev/null\n/bin/cat \"\(stdoutPath)\"\nexit \(exitCode)"
+    )
+}
+
+/// The real tools the wake hook runs, by absolute path, for
+/// `installRecordingWrappers`. `curl` is not here: the fake curl stands in
+/// for it (`makeRecordingFakeCurl`).
+let wakeHookRealTools: [String: String] = [
+    "sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "tr": "/usr/bin/tr",
+    "uuidgen": "/usr/bin/uuidgen", "openssl": "/usr/bin/openssl", "xxd": "/usr/bin/xxd",
+    "mktemp": "/usr/bin/mktemp", "cat": "/bin/cat", "rm": "/bin/rm",
+]
+
+/// Puts a recording wrapper for each of `names` into `dir`. Each wrapper
+/// appends `ARGV <name> [arg1] [arg2] ...` and then the output of
+/// `/usr/bin/env` followed by `END` to `recordPath`, prints
+/// `NOISE-<name>` to stderr when `noise` is true, then `exec`s the real
+/// tool by absolute path with the same argv and stdin.
+func installRecordingWrappers(
+    atDirectory dir: String, recordPath: String, noise: Bool = false,
+    names: [String] = ["sed", "grep", "tr", "uuidgen", "openssl", "xxd", "mktemp", "cat", "rm"]
+) throws {
+    for name in names {
+        let real = try XCTUnwrapTool(wakeHookRealTools[name], name)
+        let noiseLine = noise ? "printf 'NOISE-\(name)\\n' >&2\n" : ""
+        try writeFakeTool(named: name, atDirectory: dir, body: """
+        { printf 'ARGV \(name)'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordPath)"
+        \(noiseLine)exec \(real) "$@"
+        """)
+    }
+}
+
+private struct UnknownToolError: Error { let name: String }
+
+private func XCTUnwrapTool(_ value: String?, _ name: String) throws -> String {
+    guard let value else { throw UnknownToolError(name: name) }
+    return value
+}
+
+/// A fake `curl` that drains stdin, appends `ARGV curl [arg] ...` and its
+/// environment to `recordPath` (as the recording wrappers do), optionally
+/// lists `listDirectory` into `listingPath`, prints `NOISE-curl` to stderr
+/// when `noise`, prints `stdoutBody` byte for byte and exits `exitCode`.
+func makeRecordingFakeCurl(
+    atDirectory dir: String,
+    recordPath: String,
+    stdoutBody: Data,
+    exitCode: Int32 = 0,
+    noise: Bool = false,
+    listDirectory: String? = nil,
+    listingPath: String? = nil
+) throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let bodyPath = dir + "/curl-stdout-body"
+    try stdoutBody.write(to: URL(fileURLWithPath: bodyPath))
+    var listLine = ""
+    if let listDirectory, let listingPath {
+        listLine = "/bin/ls -A \"\(listDirectory)\" > \"\(listingPath)\"\n"
+    }
+    let noiseLine = noise ? "printf 'NOISE-curl\\n' >&2\n" : ""
+    try writeFakeTool(named: "curl", atDirectory: dir, body: """
+    /bin/cat > /dev/null
+    { printf 'ARGV curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordPath)"
+    \(listLine)\(noiseLine)/bin/cat "\(bodyPath)"
+    exit \(exitCode)
+    """)
+}
+
+/// The `ARGV <tool> ...` lines of a record file, in order.
+func recordedInvocations(of tool: String, in recordPath: String) -> [String] {
+    ((try? String(contentsOfFile: recordPath, encoding: .utf8)) ?? "")
+        .components(separatedBy: "\n")
+        .filter { $0 == "ARGV \(tool)" || $0.hasPrefix("ARGV \(tool) ") }
 }

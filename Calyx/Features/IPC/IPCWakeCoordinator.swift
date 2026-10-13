@@ -60,7 +60,11 @@
 //   stays until it times out or is released. The Settings switch
 //   releases every waiter when it turns the setting off; nothing here
 //   does. (`CalyxMCPServer`'s `/ipc-wake` route answers 204 before
-//   registering a waiter at all while the setting is off.)
+//   registering a waiter at all while the setting is off, or while the
+//   current wake proof key has not been published to
+//   agent-endpoint.json (spec D20: the key is created at each start and
+//   the hook rejects a proof made with another key, so a wake handed
+//   over then would be lost).)
 //
 // Boundary of the guarantee: a wake is committed the moment a waiter
 // receives it. A failure after that point (the connection dropped before

@@ -19,6 +19,17 @@ final class CalyxMCPServer {
 
     private(set) var isRunning: Bool = false
     private(set) var port: Int = 0
+    /// The key `routeIPCWake` proves this server's identity with (see
+    /// `IPCWakeProofKey`). `start` replaces it with a fresh one before
+    /// `finishStart` writes its two blocks into `agent-endpoint.json`.
+    /// Neither the key nor its blocks ever go into a response header or
+    /// body, and none of them is ever logged.
+    private(set) var wakeProofKey = IPCWakeProofKey.random()
+    /// Whether `wakeProofKey`'s blocks reached `agent-endpoint.json`.
+    /// `start` clears it with each fresh key, and `finishStart` sets it
+    /// only when `AgentEndpointFile.write` succeeds; `routeIPCWake`
+    /// hands out no wake while it is false (D20).
+    private(set) var wakeProofKeyPublished = false
     private(set) var token: String = "" {
         didSet { sessionBearerToken.value = token }
     }
@@ -991,7 +1002,7 @@ final class CalyxMCPServer {
 
     /// Handles `POST /ipc-wake`: a long-poll held open on behalf of a
     /// Claude Code pane so the pane can be told that its bound peer
-    /// has messages waiting. Answers 200 with
+    /// has messages waiting. Answers 200 with a proof line followed by
     /// `IPCWakeResponse`'s note as `text/plain` when
     /// `ipcWakeCoordinator` hands this surface a wake, and 204 with no
     /// body in every case where there is nothing to say. The note only
@@ -1004,8 +1015,15 @@ final class CalyxMCPServer {
     /// (this route serves Claude Code panes only; `agentKind(from:)`
     /// reads an absent header as claude-code) ->
     /// `ipcWakeCoordinator.isEnabled` (the single reader of the setting)
-    /// being false short-circuits to 204 the same way -> otherwise
-    /// long-polls `ipcWakeCoordinator.awaitWake` for up to
+    /// being false short-circuits to 204 the same way ->
+    /// `wakeProofKeyPublished` being false (this start's key never
+    /// reached `agent-endpoint.json`) short-circuits to 204 the same
+    /// way -> an `X-Calyx-Wake-Nonce` (`IPCWakeResponse.nonceHeader`)
+    /// that is absent or not a UUID in its canonical uppercase form
+    /// (what `UUID().uuidString` produces; `HTTPParser` trims
+    /// surrounding whitespace from header values, and the trimmed value
+    /// must equal its canonical uppercase form exactly) is 400, with no waiter registered -> otherwise long-polls
+    /// `ipcWakeCoordinator.awaitWake` for up to
     /// `ipcWakeTimeoutMs`: a wake is 200, and every release is 204. The
     /// release paths are: the timeout; a connection drop (the
     /// connection-drop watch in `dispatchRoute` cancels this call's
@@ -1019,6 +1037,21 @@ final class CalyxMCPServer {
     /// holding a connection open for a wake no check would hand out (a
     /// disabled check does nothing -- see `IPCWakeCoordinator`'s header
     /// comment).
+    ///
+    /// The unpublished-key gate also comes before any waiter (D20): a
+    /// restart can reuse the port and token, so a stale
+    /// `agent-endpoint.json` still looks valid to the hook but holds the
+    /// previous key's blocks. Handing a wake over then would mark the
+    /// messages announced while the hook rejects the proof, so this
+    /// route answers 204 and leaves them unannounced.
+    ///
+    /// The 200 body is `IPCWakeResponse.responseBody(proof:note:)` with
+    /// the proof `wakeProofKey.proof(nonce:note:)`: line 1 is the
+    /// HMAC-SHA256 under `wakeProofKey` over the request's nonce and the
+    /// note, line 2 is the note. The proof shows `calyx-ipc-wake-hook`
+    /// that the answer comes from the Calyx that wrote
+    /// `agent-endpoint.json`, and the nonce binds it to this poll, so it
+    /// cannot be replayed as the answer to another one.
     private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
@@ -1036,11 +1069,23 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 204, body: nil)
         }
 
+        guard wakeProofKeyPublished else {
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        guard let nonce = header(named: IPCWakeResponse.nonceHeader, in: request.headers),
+              UUID(uuidString: nonce)?.uuidString == nonce
+        else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
         guard let wake = await ipcWakeCoordinator.awaitWake(surfaceID: surfaceID, timeoutMs: ipcWakeTimeoutMs) else {
             return HTTPParser.response(statusCode: 204, body: nil)
         }
         return HTTPParser.response(
-            statusCode: 200, body: wake.bodyData, contentType: "text/plain; charset=utf-8"
+            statusCode: 200,
+            body: IPCWakeResponse.responseBody(proof: wakeProofKey.proof(nonce: nonce, note: wake.note), note: wake.note),
+            contentType: "text/plain; charset=utf-8"
         )
     }
 
@@ -1337,6 +1382,10 @@ final class CalyxMCPServer {
         let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
 
         self.token = token
+        // A fresh key per start, before `finishStart` publishes its
+        // blocks in `agent-endpoint.json`.
+        self.wakeProofKey = IPCWakeProofKey.random()
+        self.wakeProofKeyPublished = false
 
         // Connect the store's inbox-growth reports to the wake
         // coordinator before the listener accepts anything, so every
@@ -1447,17 +1496,26 @@ final class CalyxMCPServer {
     /// production wiring.
     ///
     /// Writes `agent-endpoint.json` (port/token for the calyx-agent-hook
-    /// script) on a best-effort basis: a write failure only degrades the
-    /// Agents sidebar (hook events from panes have nowhere to POST to)
-    /// and must not take down the whole IPC server, whose MCP tools have
-    /// nothing to do with this file.
+    /// script, and `wakeProofKey`'s two blocks for calyx-ipc-wake-hook)
+    /// on a best-effort basis: a write failure only degrades the Agents
+    /// sidebar (hook events from panes have nowhere to POST to) and the
+    /// wake hook, and must not take down the whole IPC server, whose MCP
+    /// tools have nothing to do with this file. On a fresh install there
+    /// is no file, so the hooks exit before curl; after a restart the
+    /// previous file may remain and still name a valid port and token
+    /// but the previous key's blocks, which is why `routeIPCWake`
+    /// withholds wakes until this write succeeds and sets
+    /// `wakeProofKeyPublished` (D20).
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
         priorTeardown: Task<Void, Never>?
     ) {
         do {
-            try AgentEndpointFile.write(port: boundPort, token: token, directory: agentEndpointDirectory)
+            try AgentEndpointFile.write(
+                port: boundPort, token: token, wakeProofKey: wakeProofKey, directory: agentEndpointDirectory
+            )
+            wakeProofKeyPublished = true
         } catch {
             NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
         }

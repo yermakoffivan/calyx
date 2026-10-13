@@ -14,6 +14,11 @@
 //  204 at once with no waiter. And the other way round: setting off,
 //  coordinator gate on, the poll is served (200 for a waiting message).
 //
+//  setUp starts the server so the wake proof key is published to
+//  agent-endpoint.json (spec A.5 D20: until then /ipc-wake answers 204
+//  and registers no waiter), and the 200 body is checked against the
+//  proof derived from that file.
+//
 
 import XCTest
 @testable import Calyx
@@ -42,15 +47,15 @@ final class CalyxMCPServerIPCWakeEnabledGateTests: XCTestCase {
         server.agentRegistry = registry
         server.approvalInbox = ApprovalInboxStore()
         server.agentHookApprovalMemory = AgentHookApprovalMemory()
-        server._testSetToken(testToken)
         server.ipcWakeTimeoutMs = pollTimeoutMs
         let gate = EnabledGateBox()
         self.gate = gate
         server._testIPCWakeIsEnabled = { gate.value }
+        try await server.start(token: testToken, preferredPort: 0)
     }
 
     override func tearDown() async throws {
-        server.stop()
+        await server.stopAndWait()
         server = nil
         registry = nil
         gate = nil
@@ -65,7 +70,12 @@ final class CalyxMCPServerIPCWakeEnabledGateTests: XCTestCase {
     private func poll(_ surfaceID: UUID) async -> HTTPResponse {
         await server.route(request: HTTPRequest(
             method: "POST", path: "/ipc-wake",
-            headers: ["Authorization": "Bearer \(testToken)", "X-Calyx-Surface-ID": surfaceID.uuidString],
+            headers: [
+                "Authorization": "Bearer \(testToken)", "X-Calyx-Surface-ID": surfaceID.uuidString,
+                // A canonical uppercase UUID nonce (spec A.3 routeIPCWake),
+                // so the nonce check never decides these tests.
+                "X-Calyx-Wake-Nonce": "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112",
+            ],
             body: nil
         ))
     }
@@ -108,9 +118,18 @@ final class CalyxMCPServerIPCWakeEnabledGateTests: XCTestCase {
         XCTAssertEqual(response.statusCode, 200,
                        "the route's gate is the coordinator's isEnabled: with it on, a waiting message is " +
                        "answered whatever IPCWakeSettings.enabled says")
-        XCTAssertEqual(response.body, IPCWakeResponse(
+        // The body is the proof derived from the endpoint file's blocks,
+        // newline, note, no trailing newline (spec A.3).
+        let note = IPCWakeResponse(
             peerID: peer, ticket: IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 1)
-        ).bodyData)
+        ).note
+        let blocks = try XCTUnwrap(IPCWakeTestCrypto.readEndpointBlocks(directory: agentEndpointDir))
+        let proof = try XCTUnwrap(IPCWakeTestCrypto.proofFromBlocks(
+            innerHex: blocks.inner, outerHex: blocks.outer,
+            nonce: "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112", note: note
+        ))
+        XCTAssertEqual(response.body, Data((proof + "\n" + note).utf8),
+                       "the 200 body is the endpoint-file-derived proof, newline, note")
     }
 }
 

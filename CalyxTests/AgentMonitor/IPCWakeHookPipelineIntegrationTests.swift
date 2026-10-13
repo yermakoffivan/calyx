@@ -42,7 +42,15 @@
 //    polling: exit 0 within 5 s, silent, no temp file left, no waiter; a
 //    message delivered afterwards does not wake a second run and stays
 //    un-nudged
-//  - a stale agent-endpoint.json pointing at a closed port: exit 0, silent
+//  - a stale agent-endpoint.json (written with a key) pointing at a closed
+//    port: exit 0, silent
+//  - agent-endpoint.json rewritten with the same port and token but the
+//    blocks of ANOTHER key: the server answers 200 and marks the message
+//    nudged, but the script cannot verify the proof and exits 0, silent,
+//    no temp file left (spec A.1-9, I13)
+//  - a fake responder on the endpoint's port answering a 5 MB body that
+//    starts with a valid note: curl stops at `--max-filesize 1024`, the
+//    script exits 0, silent, no temp file left (P4, D18)
 //  - SIGTERM, SIGHUP, SIGINT to the script mid-poll: its curl is gone, the
 //    server's waiter is released, the script exits 0 with nothing on
 //    stdout or stderr, and the one temp file it held while polling is
@@ -165,10 +173,69 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
         )
     }
 
-    /// Runs the script for `surfaceID` to completion.
-    private func runScript(for surfaceID: UUID) async throws -> ScriptResult {
+    /// Harness deadline for one script run. The slowest legitimate run in
+    /// this file ends on a 3 s server timeout; 20 s only bounds a
+    /// regression that would otherwise block for curl's 585 s.
+    private let scriptDeadline: Duration = .seconds(20)
+
+    /// Runs the script for `surfaceID` to completion, bounded by
+    /// `scriptDeadline`.
+    private func runScript(
+        for surfaceID: UUID, file: StaticString = #filePath, line: UInt = #line
+    ) async throws -> ScriptResult {
         let running = try startScript(for: surfaceID)
+        return await boundedResult(of: running, file: file, line: line)
+    }
+
+    /// Awaits `running`'s result for at most `scriptDeadline`. On expiry
+    /// the script's whole process tree gets SIGKILL (children first, so
+    /// no curl is left holding a pipe), the test fails, and the result
+    /// of the killed script is returned once its pipes have closed.
+    private func boundedResult(
+        of running: HookScriptProcessTree.RunningScript,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async -> ScriptResult {
+        let finished = await Self.raceResult(running.result, deadline: scriptDeadline)
+        if let finished { return finished }
+        XCTFail("the hook script did not exit within \(scriptDeadline); its process tree was killed",
+                file: file, line: line)
+        Self.killProcessTree(rootPID: running.pid)
         return await running.result.value
+    }
+
+    /// The result of `task`, or nil when `deadline` passes first. The
+    /// result Task cannot be cancelled, so the race resolves a single
+    /// continuation from whichever side finishes first.
+    private nonisolated static func raceResult(
+        _ task: Task<ScriptResult, Never>, deadline: Duration
+    ) async -> ScriptResult? {
+        let once = OnceBox()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<ScriptResult?, Never>) in
+            Task.detached {
+                let value = await task.value
+                if once.claim() { continuation.resume(returning: value) }
+            }
+            Task.detached {
+                try? await Task.sleep(for: deadline)
+                if once.claim() { continuation.resume(returning: nil) }
+            }
+        }
+    }
+
+    /// SIGKILL to every descendant of `rootPID` (deepest first), then to
+    /// `rootPID` itself.
+    private nonisolated static func killProcessTree(rootPID: Int32) {
+        var order: [Int32] = []
+        var frontier = [rootPID]
+        var visited = Set<Int32>()
+        while let current = frontier.popLast() {
+            guard visited.insert(current).inserted else { continue }
+            order.append(current)
+            frontier.append(contentsOf: HookScriptProcessTree.childPIDs(ofParent: current))
+        }
+        for pid in order.reversed() {
+            kill(pid, SIGKILL)
+        }
     }
 
     /// The entries of the script's TMPDIR.
@@ -273,7 +340,7 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(rpcResult["isError"] as? Bool ?? false,
                        "precondition: send_message succeeded, got \(rpcResult)")
 
-        let result = await running.result.value
+        let result = await boundedResult(of: running)
 
         XCTAssertEqual(result.exitCode, 2, "a message that arrives during the poll must wake the pane")
         XCTAssertEqual(result.stderr, noteForOneNewMessage(to: recipient))
@@ -293,7 +360,7 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(waiting, "the script's real request must be held open by the server as a waiter")
 
         try await deliverInStore(from: sender, to: recipient)
-        let result = await running.result.value
+        let result = await boundedResult(of: running)
 
         XCTAssertEqual(result.exitCode, 2,
                        "a message that reaches the store by any path must wake the polling pane: the store " +
@@ -373,17 +440,9 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
         server.ipcWakeCoordinator.releaseAllWaiters()
 
         // The script's result, or nil when it has not exited within
-        // `promptBound`.
-        let outcome = await withTaskGroup(of: ScriptResult?.self) { group -> ScriptResult? in
-            group.addTask { await running.result.value }
-            group.addTask { [promptBound] in
-                try? await Task.sleep(for: .seconds(promptBound))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
+        // `promptBound`. `raceResult` stops waiting at the deadline even
+        // though the result Task itself cannot be cancelled.
+        let outcome = await Self.raceResult(running.result, deadline: .seconds(promptBound))
         let released = try XCTUnwrap(
             outcome,
             "a script whose poll was released must exit within 5 s, well under the 30 s poll timeout")
@@ -425,13 +484,70 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
         // (as in ApprovalHookPipelineIntegrationTests).
         let stalePort = server.port
         server.stop()
-        try AgentEndpointFile.write(port: stalePort, token: testToken, directory: appSupportDir)
+        // Written with a key, as every endpoint file is from slice A-5 on.
+        try IPCWakeTestCrypto.writeEndpointFile(
+            directory: appSupportDir, port: stalePort, token: testToken, keyBytes: IPCWakeTestCrypto.randomKeyBytes()
+        )
 
         let result = try await runScript(for: surface)
 
         XCTAssertEqual(result.exitCode, 0, "a dead port must exit 0: the hook chain is never broken")
         XCTAssertEqual(result.stderr, "", "curl's connection-refused failure is silent")
         XCTAssertEqual(result.stdout, "")
+    }
+
+    // MARK: - Response authentication (spec A.1-9, I13)
+
+    func test_endpointFileWithAnotherKeysBlocks_serverAnswers_butScriptExitsZero() async throws {
+        let (surface, recipient, sender) = await makeBoundRecipientAndSender()
+        let endpoint = try XCTUnwrap(AgentEndpointFile.read(directory: appSupportDir),
+                                     "precondition: start() wrote agent-endpoint.json")
+        let serverBlocks = IPCWakeTestCrypto.readEndpointBlocks(directory: appSupportDir)
+        let foreignKey = IPCWakeTestCrypto.randomKeyBytes()
+        try IPCWakeTestCrypto.writeEndpointFile(
+            directory: appSupportDir, port: endpoint.port, token: endpoint.token, keyBytes: foreignKey
+        )
+        let foreignBlocks = IPCWakeTestCrypto.readEndpointBlocks(directory: appSupportDir)
+        XCTAssertNotNil(foreignBlocks, "precondition: the rewritten file carries blocks")
+        XCTAssertNotEqual(foreignBlocks?.inner, serverBlocks?.inner, "precondition: the blocks are another key's")
+        try await deliverInStore(from: sender, to: recipient)
+
+        let result = try await runScript(for: surface)
+
+        XCTAssertEqual(result.exitCode, 0, "a proof made with a key other than the file's must not wake the pane")
+        XCTAssertEqual(result.stderr, "", "nothing is printed")
+        XCTAssertEqual(result.stdout, "")
+        XCTAssertEqual(try scriptTempEntries(), [String](), "no temp file is left")
+        let flags = await server.store._testNudgedFlags(for: recipient)
+        XCTAssertEqual(flags, [true], "precondition: the server did hand the wake over (answered 200)")
+    }
+
+    // MARK: - Oversized body (P4, D18)
+
+    func test_responderWithA5MBBody_curlStopsAtMaxFilesize_scriptExitsZero() async throws {
+        let surface = UUID()
+        // Not a note: a body that started with one would make today's
+        // prefix-matching script print all 5 MB on stderr, which blocks it
+        // on a full pipe while the harness drains stdout first.
+        let body = Data(repeating: UInt8(ascii: "A"), count: 5 * 1024 * 1024)
+        let responder = try OversizedBodyResponder(body: body)
+        responder.serveOnce()
+        try IPCWakeTestCrypto.writeEndpointFile(
+            directory: appSupportDir, port: responder.port, token: testToken,
+            keyBytes: IPCWakeTestCrypto.randomKeyBytes()
+        )
+
+        let result = try await runScript(for: surface)
+        let served = await responder.waitUntilServed(timeout: 10)
+
+        XCTAssertTrue(served, "precondition: the script's curl reached the fake responder")
+        XCTAssertLessThan(responder.bytesWritten, body.count,
+                          "curl must hang up once the Content-Length exceeds --max-filesize 1024, so the " +
+                          "responder cannot deliver the whole 5 MB body")
+        XCTAssertEqual(result.exitCode, 0, "a 5 MB answer is never a wake")
+        XCTAssertEqual(result.stderr, "")
+        XCTAssertEqual(result.stdout, "")
+        XCTAssertEqual(try scriptTempEntries(), [String](), "the temp file is gone")
     }
 
     // MARK: - The script is signalled mid-poll
@@ -478,7 +594,7 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
                       "dropping, well under the 30 s poll timeout",
                       file: file, line: line)
 
-        let result = await running.result.value
+        let result = await boundedResult(of: running)
         XCTAssertEqual(result.exitCode, 0, "[\(signalName)] a signalled script exits 0", file: file, line: line)
         XCTAssertEqual(result.stdout, "", "[\(signalName)] a signalled script prints nothing on stdout",
                        file: file, line: line)
@@ -526,14 +642,134 @@ final class IPCWakeHookPipelineIntegrationTests: XCTestCase {
                       "killing the script's curl mid-poll must release the server's waiter within 5 s, " +
                       "well under the 30 s poll timeout, instead of leaving it until that timeout")
 
-        let result = await running.result.value
+        let result = await boundedResult(of: running)
         XCTAssertEqual(result.exitCode, 0, "a killed curl is never a wake: the script exits 0")
         XCTAssertEqual(result.stdout, "")
-        // stderr is not asserted here: /bin/sh itself reports the killed
-        // background job ("Killed: 9 curl ...") on the script's stderr.
-        // Silencing that is the job of slice A-5's leading
-        // `exec 3>&2 2>/dev/null`, and is pinned with that slice.
+        // /bin/sh reports the killed background job ("Killed: 9 curl ...")
+        // on its own stderr; the script's leading `exec 3>&2 2>/dev/null`
+        // silences it, so only a note can ever reach the hook's stderr.
+        XCTAssertEqual(result.stderr, "", "a killed curl leaves nothing on the hook's stderr")
         XCTAssertEqual(try scriptTempEntries(), [String](),
                        "the script's temp file must be gone once it has exited after its curl was killed")
+    }
+}
+
+/// Claims a one-time right to resume a continuation.
+private final class OnceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.withLock {
+            if claimed { return false }
+            claimed = true
+            return true
+        }
+    }
+}
+
+/// A one-shot HTTP responder on a loopback port picked by the kernel: it
+/// accepts one connection, reads the request head, answers 200 with a
+/// Content-Length and `body`, and closes. The accepted socket has
+/// SO_NOSIGPIPE, so a client that hangs up early (curl stopping at
+/// `--max-filesize`) ends the write with an error instead of a SIGPIPE
+/// that would kill the test host. Every wait has a deadline.
+private final class OversizedBodyResponder: @unchecked Sendable {
+    let port: Int
+    private let listenFD: Int32
+    private let body: Data
+    private let served = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var acceptedRequest = false
+    private var written = 0
+
+    /// Bytes of the response (head and body) the client accepted before
+    /// it hung up or the response ended.
+    var bytesWritten: Int { lock.withLock { written } }
+
+    init(body: Data) throws {
+        self.body = body
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fd, 1) == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+        }
+        self.listenFD = fd
+        self.port = Int(UInt16(bigEndian: addr.sin_port))
+    }
+
+    func serveOnce() {
+        DispatchQueue.global().async { [self] in
+            defer {
+                close(listenFD)
+                served.signal()
+            }
+            var pending = pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)
+            guard poll(&pending, 1, 15_000) == 1 else { return }
+            let client = accept(listenFD, nil, nil)
+            guard client >= 0 else { return }
+            defer { close(client) }
+            var one: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            var timeout = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            var head = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while head.range(of: Data("\r\n\r\n".utf8)) == nil {
+                let count = read(client, &buffer, buffer.count)
+                guard count > 0 else { return }
+                head.append(contentsOf: buffer[0..<count])
+            }
+            lock.withLock { acceptedRequest = true }
+            var response = Data(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8
+            )
+            response.append(body)
+            response.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                // A client that stops reading must not hold this loop
+                // forever: each write gives up after SO_SNDTIMEO (5 s)
+                // and the whole body after 10 s.
+                let writeDeadline = Date().addingTimeInterval(10)
+                var offset = 0
+                while offset < raw.count, Date() < writeDeadline {
+                    let written = write(client, base + offset, raw.count - offset)
+                    if written <= 0 { return }
+                    offset += written
+                    lock.withLock { self.written = offset }
+                }
+            }
+        }
+    }
+
+    /// Whether a request head was read and answered within `timeout`
+    /// seconds. Waits off the main actor.
+    func waitUntilServed(timeout: TimeInterval) async -> Bool {
+        let finished = await Task.detached { [served] in
+            Self.blockingWait(served, timeout: timeout)
+        }.value
+        return finished && lock.withLock { acceptedRequest }
+    }
+
+    /// A synchronous wrapper, so the semaphore wait happens outside any
+    /// async context (it runs on the detached Task's thread).
+    private static func blockingWait(_ semaphore: DispatchSemaphore, timeout: TimeInterval) -> Bool {
+        semaphore.wait(timeout: .now() + timeout) == .success
     }
 }

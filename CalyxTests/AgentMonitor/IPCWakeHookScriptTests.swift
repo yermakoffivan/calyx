@@ -3,54 +3,32 @@
 //  CalyxTests
 //
 //  Covers IPCWakeHookScript: the generated `calyx-ipc-wake-hook` /bin/sh
-//  script, which long-polls `POST /ipc-wake` for its pane and turns a wake
-//  into exit code 2 with the server's note on stderr. Every other outcome
-//  is exit code 0 with nothing printed.
+//  script (spec A.3 script listing, I10, I13, A.4). It long-polls
+//  `POST /ipc-wake` with a fresh nonce and exits 2, with the note on
+//  stderr, only when curl exited 0 AND the body is exactly two lines AND
+//  line 2 matches `IPCWakeResponse.notePattern` in full AND the HMAC it
+//  computes from the endpoint file's two blocks over nonce + "\n" + note
+//  is 64 hex digits equal to line 1. Every other outcome is exit 0 with
+//  nothing printed.
 //
 //  Two kinds of test:
 //
 //  1. String invariants over `IPCWakeHookScript.scriptBody`, read as
 //     "executable lines": each line trimmed of whitespace, with blank
-//     lines and `#` comment lines dropped (the same reading
-//     AgentHookScriptPrologueTests uses). They pin what cannot be seen
-//     from outside a run: the single `exit 2`, the curl command's exact
-//     flags, headers and URL, the two traps, and the order of the steps
-//     that keeps a signal from ever leaving curl running.
+//     lines and `#` comment lines dropped (the shebang is such a line).
+//     The one invariant that needs `IPCWakeResponse.notePattern` lives in
+//     IPCWakeHookScriptPatternTests.
 //  2. Behaviour, through FakeCurlScriptFixture: the installed script run
-//     as a real `/bin/sh` child with a fake `curl` first on PATH that
-//     prints a chosen body and exits with a chosen code, plus a recording
-//     file that counts how often curl ran. The temp-file tests set the
-//     child's TMPDIR to a directory the test owns: the script creates its
-//     file from the template `${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX`, and
-//     `mktemp` itself is the system's own (no shim on PATH).
+//     as a real `/bin/sh` child with a fake `curl` and a fake `uuidgen`
+//     (fixed nonce) first on PATH, an endpoint file that carries the
+//     blocks of a key the test knows, and, per test, recording wrappers
+//     around the real tools or failing replacements for openssl, xxd or
+//     grep. Expected proofs are computed in the test with CryptoKit
+//     (IPCWakeTestCrypto). The child's TMPDIR is always a directory the
+//     test owns.
 //
-//  Coverage:
-//  - fileName, shebang
-//  - exactly one `exit 2`; every other exit is `exit 0`; no bare `exit`
-//  - no executable line mentions `stop_hook_active`
-//  - one curl command: `-s`, `-m IPCWakeHookTiming.curlTimeoutSeconds`,
-//    `--fail`, `-X POST`, the three headers, the `/ipc-wake` URL, output
-//    redirected to the response file, backgrounded, and no request body
-//  - one `mktemp`, on a line that is exactly
-//    `response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0`;
-//    the note prefix is IPCWakeResponse.notePrefix
-//  - the EXIT trap and the TERM HUP INT trap, each pinned as an exact
-//    line, and nothing else trapped
-//  - the order of the steps, the signalled check between mktemp and
-//    curl, and the two "very next line" pairs
-//  - curl exit 0 with a note: exit 2, stderr equal to the note, stdout
-//    empty
-//  - curl exit 0 with an empty body, or a body that does not start with
-//    the prefix: exit 0, stderr empty
-//  - curl exit 6, 7, 22, 28 while printing a note: exit 0, stderr empty
-//  - the prologue's guards (no surface or session id, HERDR_PANE_ID, no
-//    agent-endpoint.json) never reach curl even though curl would hand
-//    back a note; a pane with only CALYX_SESSION_ID does reach it
-//  - exactly one temp file, named `calyx-ipc-wake.*`, inside TMPDIR
-//    (also a TMPDIR whose path contains a space) while curl runs, gone
-//    once the script has exited, on the exit 2 path and on the exit 0
-//    path
-//  - a TMPDIR in which no file can be created: exit 0, curl never runs
+//  Default expectation of a behaviour case: exit 0, stderr empty, stdout
+//  empty, curl called once.
 //
 
 import XCTest
@@ -62,15 +40,25 @@ final class IPCWakeHookScriptTests: XCTestCase {
 
     private var tempDir: String!
 
-    /// A real note, as `POST /ipc-wake` answers it: it starts with
-    /// `IPCWakeResponse.notePrefix`.
-    private let note = IPCWakeResponse(
-        peerID: UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!,
-        ticket: IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 1)
-    ).note
+    private let fixedNonce = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112"
 
-    /// What the script is handed on stdin. It discards it unread.
-    private let sampleStdin = #"{"hook_event_name":"Stop","session_id":"claude-1"}"#
+    private let peerID = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+
+    /// A real note, as `POST /ipc-wake` answers it.
+    private var note: String {
+        IPCWakeResponse(peerID: peerID, ticket: IPCWakeTicket(newCount: 1, senderCount: 1, unreadCount: 1)).note
+    }
+
+    /// Another valid note: 2 new messages from 2 peers.
+    private var otherNote: String {
+        IPCWakeResponse(peerID: peerID, ticket: IPCWakeTicket(newCount: 2, senderCount: 2, unreadCount: 2)).note
+    }
+
+    private let sampleStdin = #"{"hook_event_name":"Stop","session_id":"claude-1","stop_hook_active":true}"#
+
+    private var paneEnv: [String: String] {
+        ["CALYX_SURFACE_ID": "0E0C6C1B-5F0B-4C5E-9E3A-7C1B5D2F8A11"]
+    }
 
     // MARK: - Lifecycle
 
@@ -90,9 +78,6 @@ final class IPCWakeHookScriptTests: XCTestCase {
 
     // MARK: - String helpers
 
-    /// The lines of the script a shell would execute: each line trimmed
-    /// of leading/trailing whitespace, with blank lines and `#` comment
-    /// lines dropped. Order is preserved.
     private var executableLines: [String] {
         IPCWakeHookScript.scriptBody
             .components(separatedBy: "\n")
@@ -100,19 +85,14 @@ final class IPCWakeHookScriptTests: XCTestCase {
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 
-    /// `executableLines` joined by newlines.
     private var executableText: String {
         executableLines.joined(separator: "\n")
     }
 
-    /// Number of non-overlapping occurrences of `needle` in `haystack`.
     private func occurrences(of needle: String, in haystack: String) -> Int {
         haystack.components(separatedBy: needle).count - 1
     }
 
-    /// Index of the first executable line at or after `start` that
-    /// satisfies `predicate`; throws (failing the test) when there is
-    /// none.
     private func firstIndex(
         of description: String,
         from start: Int = 0,
@@ -127,72 +107,172 @@ final class IPCWakeHookScriptTests: XCTestCase {
         )
     }
 
-    /// The script's curl command as one string: the executable line that
-    /// starts with `curl ` plus its backslash continuation lines, each
-    /// with its trailing backslash removed, joined by single spaces.
-    private func curlCommand(file: StaticString = #filePath, line: UInt = #line) throws -> String {
+    /// The executable lines of the curl command: the line starting with
+    /// `curl ` and its backslash continuation lines, as written.
+    private func curlLines(file: StaticString = #filePath, line: UInt = #line) throws -> [String] {
         let lines = executableLines
         var index = try firstIndex(of: "the curl invocation", file: file, line: line) { $0.hasPrefix("curl ") }
-        var parts: [String] = []
+        var result: [String] = []
         while index < lines.count {
-            let current = lines[index]
-            guard current.hasSuffix("\\") else {
-                parts.append(current)
-                break
-            }
-            parts.append(String(current.dropLast()).trimmingCharacters(in: .whitespaces))
+            result.append(lines[index])
+            guard lines[index].hasSuffix("\\") else { break }
             index += 1
         }
-        return parts.joined(separator: " ")
+        return result
+    }
+
+    /// The curl command joined into one string, continuation backslashes
+    /// removed.
+    private func curlCommand(file: StaticString = #filePath, line: UInt = #line) throws -> String {
+        try curlLines(file: file, line: line)
+            .map { $0.hasSuffix("\\") ? String($0.dropLast()).trimmingCharacters(in: .whitespaces) : $0 }
+            .joined(separator: " ")
     }
 
     // MARK: - Behaviour helpers
+
+    private typealias C = IPCWakeTestCrypto
+
+    /// line 1 the proof under `key` over `nonce + "\n" + signedNote`, line
+    /// 2 `bodyNote` (defaults to `signedNote`).
+    private func signedBody(key: Data, nonce: String? = nil, note signedNote: String, bodyNote: String? = nil) -> Data {
+        let proof = C.hmacHex(keyBytes: key, nonce: nonce ?? fixedNonce, note: signedNote)
+        return Data((proof + "\n" + (bodyNote ?? signedNote)).utf8)
+    }
+
+    private enum TmpDirMode {
+        case fresh
+        case withSpace
+        case regularFile
+    }
 
     private struct WakeRun {
         let exitCode: Int32
         let stdout: String
         let stderr: String
-        let curlInvocations: Int
+        /// `ARGV curl ...` lines of the record file.
+        let curlInvocations: [String]
+        /// The whole record file (argv and env of every recorded tool).
+        let record: String
+        let tmpDir: String
+        /// The entries of TMPDIR at the moment curl ran, nil when curl did
+        /// not run.
+        let entriesWhileCurlRan: [String]?
+        /// The entries of TMPDIR after the script exited, nil when TMPDIR
+        /// is not a directory.
+        let entriesAfterExit: [String]?
+        let fixture: FakeCurlScriptFixture
     }
 
-    /// Installs the script into a fresh fixture under `tempDir`, puts a
-    /// fake curl first on PATH that prints `curlStdout` and exits with
-    /// `curlExitCode`, runs the script once with exactly `env` on top of
-    /// HOME and PATH, and returns what it did plus how often curl ran.
-    /// `removingEndpointFile` deletes the fixture's agent-endpoint.json
-    /// before the run.
+    /// Builds a fixture whose endpoint file carries the blocks of
+    /// `keyBytes` (nil: no blocks), a recording fake curl printing `body`
+    /// and exiting `curlExitCode`, a fake uuidgen printing
+    /// `uuidgenStdout` (nil: the real uuidgen, through a recording wrapper
+    /// when `wrappers`), optional recording wrappers around the real tools,
+    /// optional replacements; then runs the script once.
     private func runWakeScript(
+        body: Data,
+        keyBytes: Data?,
+        env: [String: String]? = nil,
         curlExitCode: Int32 = 0,
-        curlStdout: String?,
-        env: [String: String],
-        removingEndpointFile: Bool = false
+        uuidgenStdout: String? = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112\n",
+        uuidgenExitCode: Int32 = 0,
+        wrappers: Bool = false,
+        noise: Bool = false,
+        replacements: [(name: String, exitCode: Int32, stdout: String)] = [],
+        xxdIsCat: Bool = false,
+        endpointText: String? = nil,
+        removingEndpointFile: Bool = false,
+        tmpDirMode: TmpDirMode = .fresh,
+        kindArgument: String? = nil
     ) throws -> WakeRun {
         let fixture = try makeFakeCurlScriptFixture(
             rootDirectory: tempDir + "/" + UUID().uuidString,
             port: 41_834, token: "ipc-wake-hook-script-test-token",
+            wakeKeyBytes: keyBytes,
             install: IPCWakeHookScript.install(toDirectory:)
         )
-        let recordPath = fixture.rootDir + "/curl-invocations.log"
-        try makeFakeCurl(
-            atDirectory: fixture.fakeBinDir, exitCode: curlExitCode,
-            recordingTo: recordPath, stdoutBody: curlStdout
-        )
-        if removingEndpointFile {
-            try FileManager.default.removeItem(atPath: fixture.appSupportDir + "/agent-endpoint.json")
+        let recordPath = fixture.rootDir + "/record.log"
+        let listingPath = fixture.rootDir + "/tmp-listing-while-curl-ran.txt"
+        let scriptTempDir = fixture.rootDir + (tmpDirMode == .withSpace ? "/script tmp" : "/script-tmp")
+        if tmpDirMode == .regularFile {
+            try Data("not a directory".utf8).write(to: URL(fileURLWithPath: scriptTempDir))
+        } else {
+            try FileManager.default.createDirectory(atPath: scriptTempDir, withIntermediateDirectories: true)
         }
 
-        let result = try runFakeCurlHookScriptCapturingStderr(fixture, stdinJSON: sampleStdin, extraEnv: env)
+        if wrappers || noise {
+            try installRecordingWrappers(atDirectory: fixture.fakeBinDir, recordPath: recordPath, noise: noise)
+        }
+        try makeRecordingFakeCurl(
+            atDirectory: fixture.fakeBinDir, recordPath: recordPath, stdoutBody: body, exitCode: curlExitCode,
+            noise: noise, listDirectory: tmpDirMode == .regularFile ? nil : scriptTempDir, listingPath: listingPath
+        )
+        if let uuidgenStdout {
+            try makeFakeUuidgen(
+                atDirectory: fixture.fakeBinDir, stdout: uuidgenStdout, exitCode: uuidgenExitCode,
+                recordPath: (wrappers || noise) ? recordPath : nil, noise: noise
+            )
+        }
+        for replacement in replacements {
+            try makeFailingTool(
+                named: replacement.name, atDirectory: fixture.fakeBinDir,
+                exitCode: replacement.exitCode, stdout: replacement.stdout
+            )
+        }
+        if xxdIsCat {
+            try writeFakeTool(named: "xxd", atDirectory: fixture.fakeBinDir, body: "exec /bin/cat")
+        }
+        if let endpointText {
+            try Data(endpointText.utf8).write(to: URL(fileURLWithPath: fixture.endpointFilePath))
+        }
+        if removingEndpointFile {
+            try FileManager.default.removeItem(atPath: fixture.endpointFilePath)
+        }
 
-        let log = (try? String(contentsOfFile: recordPath, encoding: .utf8)) ?? ""
+        var childEnv = env ?? paneEnv
+        childEnv["TMPDIR"] = scriptTempDir
+        let result = try runFakeCurlHookScriptCapturingStderr(
+            fixture, stdinJSON: sampleStdin, extraEnv: childEnv, kindArgument: kindArgument
+        )
+
+        let curlInvocations = recordedInvocations(of: "curl", in: recordPath)
+        let listing = (try? String(contentsOfFile: listingPath, encoding: .utf8))
+            .map { $0.split(separator: "\n").map(String.init) }
         return WakeRun(
             exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-            curlInvocations: log.split(separator: "\n").count
+            curlInvocations: curlInvocations,
+            record: (try? String(contentsOfFile: recordPath, encoding: .utf8)) ?? "",
+            tmpDir: scriptTempDir,
+            entriesWhileCurlRan: listing,
+            entriesAfterExit: tmpDirMode == .regularFile
+                ? nil : try FileManager.default.contentsOfDirectory(atPath: scriptTempDir),
+            fixture: fixture
         )
     }
 
-    /// The environment of an ordinary Calyx pane: `CALYX_SURFACE_ID` set.
-    private var paneEnv: [String: String] {
-        ["CALYX_SURFACE_ID": "0E0C6C1B-5F0B-4C5E-9E3A-7C1B5D2F8A11"]
+    /// Asserts the default "not a wake" outcome.
+    private func assertNoWake(
+        _ run: WakeRun, _ label: String, curlCalls: Int = 1,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(run.exitCode, 0, "[\(label)] must exit 0", file: file, line: line)
+        XCTAssertEqual(run.stderr, "", "[\(label)] must print nothing on stderr", file: file, line: line)
+        XCTAssertEqual(run.stdout, "", "[\(label)] must print nothing on stdout", file: file, line: line)
+        XCTAssertEqual(run.curlInvocations.count, curlCalls, "[\(label)] curl invocations", file: file, line: line)
+        if let after = run.entriesAfterExit {
+            XCTAssertEqual(after, [String](), "[\(label)] no temp file may be left", file: file, line: line)
+        }
+    }
+
+    /// The value of the header `name` in the one recorded curl argv.
+    private func header(_ name: String, in run: WakeRun, file: StaticString = #filePath, line: UInt = #line) -> String? {
+        guard let argv = run.curlInvocations.first else { return nil }
+        let prefix = "[\(name): "
+        guard let start = argv.range(of: prefix) else { return nil }
+        let rest = argv[start.upperBound...]
+        guard let end = rest.firstIndex(of: "]") else { return nil }
+        return String(rest[..<end])
     }
 
     // MARK: - fileName and shebang
@@ -202,439 +282,462 @@ final class IPCWakeHookScriptTests: XCTestCase {
     }
 
     func test_scriptBody_startsWithTheShShebangLine() {
-        XCTAssertTrue(IPCWakeHookScript.scriptBody.hasPrefix("#!/bin/sh\n"),
-                      "the script is run by /bin/sh and its shebang has to be line 1")
+        XCTAssertTrue(IPCWakeHookScript.scriptBody.hasPrefix("#!/bin/sh\n"))
     }
 
-    // MARK: - Exit statuses
+    // MARK: - String invariants: exits and stderr
 
     func test_scriptBody_hasExactlyOneExit2_andEveryOtherExitIsExit0() throws {
         let lines = executableLines
         let text = executableText
+        XCTAssertEqual(lines.filter { $0 == "exit 2" }.count, 1, "exactly one executable line is `exit 2`")
+        XCTAssertEqual(occurrences(of: "exit 2", in: text), 1, "`exit 2` must not hide inside another line")
 
-        XCTAssertEqual(lines.filter { $0 == "exit 2" }.count, 1,
-                       "exactly one executable line must be `exit 2`: the wake is the only path that " +
-                       "may hand the CLI a nonzero status")
-        XCTAssertEqual(occurrences(of: "exit 2", in: text), 1,
-                       "`exit 2` must not also hide inside another line (a trap, a one-line `if`)")
-
-        // `exit` as a whole word (so neither `curl_exit` nor `EXIT`),
-        // followed by its status when it has one.
         let regex = try NSRegularExpression(pattern: #"(?<![A-Za-z0-9_])exit(?![A-Za-z0-9_])(?:[ \t]+([0-9]+))?"#)
         let nsText = text as NSString
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-        let statuses: [String?] = matches.map { match in
-            let range = match.range(at: 1)
-            return range.location == NSNotFound ? nil : nsText.substring(with: range)
+        let statuses: [String?] = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).map {
+            $0.range(at: 1).location == NSNotFound ? nil : nsText.substring(with: $0.range(at: 1))
         }
+        XCTAssertEqual(statuses.filter { $0 == nil }.count, 0, "no bare `exit`")
+        XCTAssertEqual(statuses.compactMap { $0 }.filter { $0 != "0" && $0 != "2" }, [String]())
+        XCTAssertEqual(statuses.filter { $0 == "2" }.count, 1)
+    }
 
-        XCTAssertEqual(statuses.filter { $0 == nil }.count, 0,
-                       "no bare `exit`: it would pass on the status of whatever command ran last")
-        XCTAssertEqual(statuses.compactMap { $0 }.filter { $0 != "0" && $0 != "2" }, [String](),
-                       "every exit status in the script must be 0 or 2")
-        XCTAssertEqual(statuses.filter { $0 == "2" }.count, 1,
-                       "counted as whole words too, `exit 2` occurs exactly once")
+    func test_scriptBody_firstExecutableLine_redirectsStderrToFd3AndSilencesIt() {
+        XCTAssertEqual(executableLines.first, "exec 3>&2 2>/dev/null",
+                       "stderr is saved on fd 3 and silenced before anything else runs")
+    }
+
+    func test_scriptBody_onlyTheNotePrintGoesToFd3_andTheNextLineIsExit2() throws {
+        let lines = executableLines
+        let fd3 = lines.indices.filter { lines[$0].contains(">&3") }
+        XCTAssertEqual(fd3.count, 1, "exactly one executable line writes to fd 3. Got: \(fd3.map { lines[$0] })")
+        let index = try XCTUnwrap(fd3.first)
+        XCTAssertEqual(lines[index], #"printf '%s' "$note" >&3"#)
+        XCTAssertEqual(lines.dropFirst(index + 1).first, "exit 2", "the line after the note print is `exit 2`")
+    }
+
+    func test_scriptBody_noExecutableLineOtherThanTheFirstWritesToFd2() {
+        XCTAssertEqual(executableLines.dropFirst().filter { $0.contains(">&2") }, [String](),
+                       "only the opening exec line may mention >&2")
     }
 
     func test_scriptBody_neverMentionsStopHookActiveInAnExecutableLine() {
-        XCTAssertEqual(executableLines.filter { $0.contains("stop_hook_active") }, [String](),
-                       "the script discards its stdin unread, so it must not test stop_hook_active")
+        XCTAssertEqual(executableLines.filter { $0.contains("stop_hook_active") }, [String]())
     }
 
-    // MARK: - The curl command
+    // MARK: - String invariants: secrets and shell constructs
 
-    func test_scriptBody_hasExactlyOneCurlCommand_withTheSpeccedFlagsHeadersAndURL_andNoBody() throws {
-        XCTAssertEqual(executableLines.filter { $0.hasPrefix("curl ") }.count, 1,
-                       "the script makes exactly one request")
-        XCTAssertTrue(IPCWakeHookScript.scriptBody.contains("\ncurl "),
-                      "the curl line starts at column 0, like in the other hook scripts")
+    func test_scriptBody_usesNoHereDocumentExportOrEval() throws {
+        let regex = try NSRegularExpression(pattern: #"(?<![A-Za-z0-9_])(export|eval)(?![A-Za-z0-9_])"#)
+        for line in executableLines {
+            XCTAssertFalse(line.contains("<<"), "no here-document: \(line)")
+            XCTAssertNil(regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                         "no export or eval: \(line)")
+        }
+    }
+
+    func test_scriptBody_everyGrepLineIsLCAllCGrepEqx() {
+        let grepLines = executableLines.filter { $0.contains("grep") }
+        XCTAssertEqual(grepLines.count, 2, "two grep checks: the note shape and the 64-hex result. Got: \(grepLines)")
+        for line in grepLines {
+            XCTAssertTrue(line.contains("LC_ALL=C grep -Eqx '"), "every grep runs as `LC_ALL=C grep -Eqx '...'`: \(line)")
+        }
+    }
+
+    func test_scriptBody_hexCheckLine_isExact() {
+        XCTAssertTrue(executableLines.contains(
+            #"if ! printf '%s\n' "$computed" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then"#
+        ), "the computed HMAC must be checked to be exactly 64 lowercase hex digits")
+    }
+
+    func test_scriptBody_blocksAppearOnlyInTheEmptyCheckOrAfterABuiltinPrintf() throws {
+        let emptyCheck = #"if [ -z "$proof_inner" ] || [ -z "$proof_outer" ]; then"#
+        XCTAssertTrue(executableLines.contains(emptyCheck))
+        let regex = try NSRegularExpression(pattern: #"\$proof_(inner|outer)"#)
+        for line in executableLines where line != emptyCheck {
+            let ns = line as NSString
+            for match in regex.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                let before = ns.substring(to: match.range.location)
+                XCTAssertTrue(before.hasSuffix(#"printf '%s' ""#),
+                              "a block may only be handed to the builtin printf: \(line)")
+            }
+        }
+        XCTAssertEqual(executableLines.filter { $0.contains("$proof_inner") }.count, 2)
+        XCTAssertEqual(executableLines.filter { $0.contains("$proof_outer") }.count, 2)
+    }
+
+    func test_scriptBody_readsTheTwoBlocksWithSed() {
+        XCTAssertTrue(executableLines.contains(
+            #"proof_inner=$(sed -n 's/.*"wakeProofInner"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$endpoint_file")"#
+        ))
+        XCTAssertTrue(executableLines.contains(
+            #"proof_outer=$(sed -n 's/.*"wakeProofOuter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$endpoint_file")"#
+        ))
+    }
+
+    // MARK: - String invariants: curl
+
+    func test_scriptBody_curl_hasTheSpeccedFlags_fourHeaders_nonceLast() throws {
+        XCTAssertEqual(executableLines.filter { $0.hasPrefix("curl ") }.count, 1)
         let command = try curlCommand()
         let tokens = command.split(separator: " ").map(String.init)
+        XCTAssertTrue(tokens.contains("-s"), command)
+        XCTAssertTrue(command.contains("-m \(IPCWakeHookTiming.curlTimeoutSeconds) "), command)
+        XCTAssertTrue(command.contains("--max-filesize 1024 "), command)
+        XCTAssertTrue(tokens.contains("--fail"), command)
+        XCTAssertTrue(command.contains("-X POST"), command)
+        let headers = try curlLines().filter { $0.hasPrefix("-H ") }
+        XCTAssertEqual(headers, [
+            #"-H "Authorization: Bearer $token" \"#,
+            #"-H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}" \"#,
+            #"-H "X-Calyx-Agent-Kind: $kind" \"#,
+            #"-H "X-Calyx-Wake-Nonce: $nonce" \"#,
+        ], "exactly four headers, the fourth carrying the nonce")
+        XCTAssertEqual(occurrences(of: "-H ", in: command), 4)
+        XCTAssertTrue(command.hasSuffix(#""http://127.0.0.1:$port/ipc-wake" > "$response_file" &"#), command)
+        XCTAssertFalse(command.contains("--data") || tokens.contains("-d"), "no request body")
+    }
 
-        XCTAssertTrue(tokens.contains("-s"), "curl must be silent (-s). Command: \(command)")
-        XCTAssertTrue(command.contains("-m \(IPCWakeHookTiming.curlTimeoutSeconds) "),
-                      "curl's deadline must be IPCWakeHookTiming.curlTimeoutSeconds. Command: \(command)")
-        XCTAssertTrue(tokens.contains("--fail"),
-                      "--fail turns a non-2xx answer into a curl error. Command: \(command)")
-        XCTAssertTrue(command.contains("-X POST"), "the route is POST /ipc-wake. Command: \(command)")
-        for header in [
-            #"-H "Authorization: Bearer $token""#,
-            #"-H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}""#,
-            #"-H "X-Calyx-Agent-Kind: $kind""#,
-        ] {
-            XCTAssertTrue(command.contains(header), "curl must send \(header). Command: \(command)")
+    func test_scriptBody_maxFilesizeIsOnItsOwnLine() throws {
+        let raw = IPCWakeHookScript.scriptBody.components(separatedBy: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
         }
-        XCTAssertEqual(occurrences(of: "-H ", in: command), 3,
-                       "exactly those three headers are sent. Command: \(command)")
-        XCTAssertTrue(command.contains(#""http://127.0.0.1:$port/ipc-wake""#),
-                      "curl must post to the /ipc-wake URL on loopback. Command: \(command)")
-        XCTAssertTrue(command.contains(#"> "$response_file""#),
-                      "curl's stdout must go to the response file. Command: \(command)")
-        XCTAssertTrue(command.hasSuffix("&"),
-                      "curl must be backgrounded so the script can react to a signal. Command: \(command)")
-
-        XCTAssertFalse(command.contains("--data"), "the request has no body. Command: \(command)")
-        XCTAssertFalse(command.contains("-d ") || tokens.contains("-d"),
-                       "the request has no body. Command: \(command)")
-        XCTAssertFalse(command.contains("Content-Type"),
-                       "a request without a body has no Content-Type. Command: \(command)")
+        XCTAssertEqual(raw.filter { $0 == #"--max-filesize 1024 \"# }.count, 1,
+                       "the curl command carries `--max-filesize 1024 \\` on its own line")
+        XCTAssertEqual(try curlLines().dropFirst().first, #"--max-filesize 1024 \"#,
+                       "right after the `curl -s -m ...` line")
     }
 
-    // MARK: - Temp file and note prefix
+    // MARK: - String invariants: temp file and traps
 
-    func test_scriptBody_callsMktempOnExactlyOneExecutableLine() {
-        XCTAssertEqual(executableLines.filter { $0.contains("mktemp") }.count, 1,
-                       "the script uses one temp file, the response file")
+    func test_scriptBody_mktempLine_isExact() throws {
+        let mktempLines = executableLines.filter { $0.contains("mktemp") }
+        XCTAssertEqual(mktempLines, [#"response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0"#])
     }
 
-    func test_scriptBody_containsTheNotePrefixOfIPCWakeResponse() {
-        XCTAssertTrue(executableText.contains(IPCWakeResponse.notePrefix),
-                      "the script recognises a note by IPCWakeResponse.notePrefix " +
-                      "(\"\(IPCWakeResponse.notePrefix)\"), the literal the server's notes start with")
-    }
-
-    // MARK: - Traps
-
-    func test_scriptBody_trapsExitAndTermHupInt_andNothingElse() throws {
+    func test_scriptBody_trapsExitAndTermHupInt_exactly() {
         let traps = executableLines.filter { $0.hasPrefix("trap ") }
-        XCTAssertEqual(traps.count, 2, "exactly two traps: EXIT, and TERM HUP INT. Got: \(traps)")
-
-        let exitTrap = try XCTUnwrap(traps.first { $0.hasSuffix(" EXIT") },
-                                     "one trap must be on EXIT. Got: \(traps)")
-        XCTAssertTrue(exitTrap.contains(#"rm -f "$response_file""#),
-                      "the EXIT trap removes the response file. Got: \(exitTrap)")
-        XCTAssertTrue(exitTrap.contains(#"if [ -n "$response_file" ]; then rm -f "$response_file"; fi"#),
-                      "the EXIT trap is written as an `if`, so that its own status cannot replace " +
-                      "the script's exit status. Got: \(exitTrap)")
-
-        let signalTrap = try XCTUnwrap(traps.first { $0.hasSuffix(" TERM HUP INT") },
-                                       "one trap must be on TERM HUP INT, and on nothing else. Got: \(traps)")
-        for piece in ["signalled=1", #"if [ -n "$curl_pid" ]; then"#, #"kill "$curl_pid""#, "exit 0"] {
-            XCTAssertTrue(signalTrap.contains(piece),
-                          "the TERM HUP INT trap must contain `\(piece)`. Got: \(signalTrap)")
-        }
-        XCTAssertEqual(traps.filter { $0.contains("QUIT") }, [String](), "QUIT is not trapped")
-
-        XCTAssertEqual(
-            exitTrap, #"trap 'if [ -n "$response_file" ]; then rm -f "$response_file"; fi' EXIT"#,
-            "the EXIT trap must be exactly this line: its body is one `if` and nothing else, so the " +
-            "trap's own status can never replace the script's exit status (a `[ -n ... ] && rm` body, " +
-            "or any command after the `fi`, could turn the wake's exit 2 into something else)")
-        XCTAssertEqual(
-            signalTrap,
+        XCTAssertEqual(traps, [
+            #"trap 'if [ -n "$response_file" ]; then rm -f "$response_file"; fi' EXIT"#,
             #"trap 'signalled=1; if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null; exit 0; fi' TERM HUP INT"#,
-            "the TERM HUP INT trap must be exactly this line, with `exit 0` INSIDE the `if`: a trap " +
-            "that exits while curl_pid is still empty ends the script before it knows which curl to " +
-            "kill, and can leave that curl running. Before the pid is known the trap only records " +
-            "signalled=1")
+        ])
     }
 
-    func test_scriptBody_mktempLineIsExactlyTheAssignmentThatExitsZeroOnFailure() throws {
-        let mktempLine = try XCTUnwrap(executableLines.first { $0.contains("mktemp") },
-                                       "the script must have an executable line that calls mktemp")
-        XCTAssertEqual(
-            mktempLine, #"response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0"#,
-            "the mktemp line must be exactly this: the template makes mktemp honour TMPDIR (bare " +
-            "`mktemp` on macOS ignores it), and `|| exit 0` ends the script before curl is started " +
-            "when no file could be created")
+    func test_scriptBody_uuidgenLines_areExact() {
+        XCTAssertTrue(executableLines.contains("nonce=$(uuidgen) || exit 0"))
+        XCTAssertTrue(executableLines.contains(#"nonce=$(printf '%s' "$nonce" | tr 'abcdef' 'ABCDEF')"#))
+        XCTAssertTrue(executableLines.contains(#"if [ -z "$nonce" ]; then"#))
     }
 
-    // MARK: - Order of the steps
+    // MARK: - String invariants: order
 
     func test_scriptBody_runsItsStepsInTheSpeccedOrder() throws {
-        let responseFileInit = try firstIndex(of: "the bare `response_file=`") { $0 == "response_file=" }
+        let exec = try firstIndex(of: "the exec line") { $0 == "exec 3>&2 2>/dev/null" }
+        let blockRead = try firstIndex(of: "the inner block read") { $0.hasPrefix("proof_inner=$(sed") }
+        let responseFileInit = try firstIndex(of: "`response_file=`") { $0 == "response_file=" }
         let signalledInit = try firstIndex(of: "`signalled=0`") { $0 == "signalled=0" }
-        let curlPIDInit = try firstIndex(of: "the bare `curl_pid=`") { $0 == "curl_pid=" }
+        let curlPIDInit = try firstIndex(of: "`curl_pid=`") { $0 == "curl_pid=" }
         let firstTrap = try firstIndex(of: "a trap") { $0.hasPrefix("trap ") }
-        let drainStdin = try firstIndex(of: "`cat > /dev/null`") { $0 == "cat > /dev/null" }
-        let mktemp = try firstIndex(of: "the mktemp call") { $0.contains("mktemp") }
-        let curl = try firstIndex(of: "the curl invocation") { $0.hasPrefix("curl ") }
+        let drain = try firstIndex(of: "`cat > /dev/null`") { $0 == "cat > /dev/null" }
+        let uuidgen = try firstIndex(of: "the uuidgen line") { $0.contains("uuidgen") }
+        let mktemp = try firstIndex(of: "the mktemp line") { $0.contains("mktemp") }
+        let curl = try firstIndex(of: "the curl line") { $0.hasPrefix("curl ") }
         let curlPIDAssign = try firstIndex(of: "`curl_pid=$!`") { $0 == "curl_pid=$!" }
-        let wait = try firstIndex(of: #"`wait "$curl_pid"`"#) { $0 == #"wait "$curl_pid""# }
+        let wait = try firstIndex(of: "wait") { $0 == #"wait "$curl_pid""# }
         let curlExit = try firstIndex(of: "`curl_exit=$?`") { $0 == "curl_exit=$?" }
-        let curlPIDReset = try firstIndex(of: "the bare `curl_pid=` reset after `curl_exit=$?`", from: curlExit) {
-            $0 == "curl_pid="
+        let curlPIDReset = try firstIndex(of: "the `curl_pid=` reset", from: curlExit) { $0 == "curl_pid=" }
+        let curlExitCheck = try firstIndex(of: "the curl exit check") { $0 == #"if [ "$curl_exit" != 0 ]; then"# }
+        let firstRead = try firstIndex(of: "the first line reading the response file", from: curlExitCheck + 1) {
+            $0.contains("$response_file")
         }
         let exit2 = try firstIndex(of: "`exit 2`") { $0 == "exit 2" }
 
-        for (name, index) in [
-            ("response_file=", responseFileInit), ("signalled=0", signalledInit), ("curl_pid=", curlPIDInit),
-        ] {
-            XCTAssertLessThan(index, firstTrap,
-                              "`\(name)` must be initialised before the first trap is set: a trap that " +
-                              "fires early must not read a value inherited from the environment")
+        for (name, index) in [("response_file=", responseFileInit), ("signalled=0", signalledInit), ("curl_pid=", curlPIDInit)] {
+            XCTAssertLessThan(blockRead, index, "the blocks are read before \(name)")
+            XCTAssertLessThan(index, firstTrap, "`\(name)` is initialised before the first trap")
         }
-        let ordered: [(name: String, index: Int)] = [
-            ("the first trap", firstTrap),
-            ("cat > /dev/null", drainStdin),
-            ("the mktemp line", mktemp),
-            ("the curl line", curl),
-            ("curl_pid=$!", curlPIDAssign),
-            (#"wait "$curl_pid""#, wait),
-            ("curl_exit=$?", curlExit),
-            ("the curl_pid= reset", curlPIDReset),
-            ("exit 2", exit2),
+        let ordered: [(String, Int)] = [
+            ("exec", exec), ("block read", blockRead), ("first trap", firstTrap), ("cat", drain),
+            ("uuidgen", uuidgen), ("mktemp", mktemp), ("curl", curl), ("curl_pid=$!", curlPIDAssign),
+            ("wait", wait), ("curl_exit=$?", curlExit), ("curl_pid= reset", curlPIDReset),
+            ("curl exit check", curlExitCheck), ("first response read", firstRead), ("exit 2", exit2),
         ]
         for (earlier, later) in zip(ordered, ordered.dropFirst()) {
-            XCTAssertLessThan(earlier.index, later.index,
-                              "\(earlier.name) must come before \(later.name)")
+            XCTAssertLessThan(earlier.1, later.1, "\(earlier.0) must come before \(later.0)")
         }
+        XCTAssertEqual(executableLines[firstRead], #"if [ "$(sed -n '$=' "$response_file")" != 2 ]; then"#,
+                       "the first read of the response is the exact two-line check")
+    }
+
+    func test_scriptBody_curlExitCheckIsTheVeryNextLineAfterTheCurlPIDReset() throws {
+        let curlExit = try firstIndex(of: "`curl_exit=$?`") { $0 == "curl_exit=$?" }
+        let reset = try firstIndex(of: "the reset", from: curlExit) { $0 == "curl_pid=" }
+        XCTAssertEqual(executableLines.dropFirst(reset + 1).first, #"if [ "$curl_exit" != 0 ]; then"#)
     }
 
     func test_scriptBody_signalledCheckSitsBetweenMktempAndCurl() throws {
         let lines = executableLines
         let mktemp = try firstIndex(of: "the mktemp call") { $0.contains("mktemp") }
-
-        XCTAssertEqual(
-            Array(lines.dropFirst(mktemp + 1).prefix(3)),
-            [#"if [ "$signalled" = 1 ]; then"#, "exit 0", "fi"],
-            "the three executable lines right after the mktemp line must be the signalled check: a " +
-            "signal that arrived while stdin was drained or the temp file was created must end the " +
-            "script before curl is started"
-        )
-        XCTAssertTrue(lines.dropFirst(mktemp + 4).first?.hasPrefix("curl ") ?? false,
-                      "the curl line must be the very next executable line after that check. Got: " +
-                      "\(lines.dropFirst(mktemp + 4).first ?? "(nothing)")")
+        XCTAssertEqual(Array(lines.dropFirst(mktemp + 1).prefix(3)), [#"if [ "$signalled" = 1 ]; then"#, "exit 0", "fi"])
+        XCTAssertTrue(lines.dropFirst(mktemp + 4).first?.hasPrefix("curl ") ?? false)
     }
 
     func test_scriptBody_recheckFollowsCurlPIDAssignment_andCurlExitFollowsWait() throws {
         let lines = executableLines
-        let curlPIDAssign = try firstIndex(of: "`curl_pid=$!`") { $0 == "curl_pid=$!" }
-        let wait = try firstIndex(of: #"`wait "$curl_pid"`"#) { $0 == #"wait "$curl_pid""# }
-
-        XCTAssertEqual(lines.dropFirst(curlPIDAssign + 1).first, #"if [ "$signalled" = 1 ]; then"#,
-                       "the signalled re-check must be the very next line after curl_pid=$!: a signal " +
-                       "that arrived before the pid was known is acted on as soon as it is")
-        XCTAssertEqual(lines.dropFirst(wait + 1).first, "curl_exit=$?",
-                       "curl's status must be read on the very next line after wait, before any other " +
-                       "command replaces $?")
+        let assign = try firstIndex(of: "`curl_pid=$!`") { $0 == "curl_pid=$!" }
+        let wait = try firstIndex(of: "wait") { $0 == #"wait "$curl_pid""# }
+        XCTAssertEqual(lines.dropFirst(assign + 1).first, #"if [ "$signalled" = 1 ]; then"#)
+        XCTAssertEqual(lines.dropFirst(wait + 1).first, "curl_exit=$?")
     }
 
     // MARK: - Behaviour: a wake
 
-    func test_run_curlSucceedsWithANote_exitsTwo_printsTheNoteOnStderrOnly() throws {
-        XCTAssertTrue(note.hasPrefix(IPCWakeResponse.notePrefix), "precondition: the body is a note")
+    func test_run_signedBody_exitsTwo_stderrIsTheNote_stdoutEmpty() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key)
 
-        let run = try runWakeScript(curlStdout: note, env: paneEnv)
-
-        XCTAssertEqual(run.exitCode, 2, "a note from the server is the one outcome that exits 2")
-        XCTAssertEqual(run.stderr, note, "stderr must be the note byte for byte, with no newline added")
-        XCTAssertEqual(run.stdout, "", "nothing is ever printed on stdout")
-        XCTAssertEqual(run.curlInvocations, 1, "one request per run")
-    }
-
-    // MARK: - Behaviour: no wake
-
-    func test_run_curlSucceedsWithAnEmptyBody_exitsZero_printsNothing() throws {
-        let run = try runWakeScript(curlStdout: "", env: paneEnv)
-
-        XCTAssertEqual(run.exitCode, 0, "an empty answer (the server's 204) is not a wake")
-        XCTAssertEqual(run.stderr, "")
+        XCTAssertEqual(run.exitCode, 2, "a body signed with the endpoint file's key wakes the pane")
+        XCTAssertEqual(run.stderr, note, "stderr is the note byte for byte")
         XCTAssertEqual(run.stdout, "")
-        XCTAssertEqual(run.curlInvocations, 1, "the script must have asked the server")
+        XCTAssertEqual(run.curlInvocations.count, 1)
+        XCTAssertEqual(header("X-Calyx-Wake-Nonce", in: run), fixedNonce, "the nonce header carries uuidgen's value")
+        XCTAssertEqual(run.entriesAfterExit, [String](), "the temp file is gone")
     }
 
-    func test_run_curlSucceedsWithABodyThatDoesNotStartWithThePrefix_exitsZero_printsNothing() throws {
-        let bodies: [(label: String, body: String)] = [
-            ("prefix in the middle", "x Calyx IPC: 1 new message"),
-            ("prefix without its trailing space", "Calyx IPC:1"),
-            ("lowercase", note.lowercased()),
+    func test_run_signedBody_onlySessionIDSet_exitsTwo() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(
+            body: signedBody(key: key, note: note), keyBytes: key, env: ["CALYX_SESSION_ID": "calyx-session-7"]
+        )
+
+        XCTAssertEqual(run.exitCode, 2)
+        XCTAssertEqual(run.stderr, note)
+        XCTAssertEqual(header("X-Calyx-Surface-ID", in: run), "calyx-session-7")
+    }
+
+    // MARK: - Behaviour: not a wake
+
+    func test_run_wrongProofs_exitZero() throws {
+        let key = C.randomKeyBytes()
+        let otherKey = C.randomKeyBytes()
+        let randomProof = C.hex(C.randomKeyBytes())
+        let goodProof = C.hmacHex(keyBytes: key, nonce: fixedNonce, note: note)
+        let cases: [(String, Data)] = [
+            ("random 64-hex proof", Data((randomProof + "\n" + note).utf8)),
+            ("proof for another nonce", signedBody(key: key, nonce: "00000000-0000-0000-0000-000000000000", note: note)),
+            ("proof under another key", signedBody(key: otherKey, note: note)),
+            ("note swapped for another valid note", signedBody(key: key, note: note, bodyNote: otherNote)),
+            ("no proof line", Data(note.utf8)),
+            ("empty first line", Data(("\n" + note).utf8)),
+            ("proof line only", Data(goodProof.utf8)),
+            ("empty body", Data()),
+            ("uppercase hex proof", Data((goodProof.uppercased() + "\n" + note).utf8)),
+            ("trailing space (signed)", signedBody(key: key, note: note + " ")),
+            ("trailing CR (signed)", signedBody(key: key, note: note + "\r")),
         ]
-
-        for testCase in bodies {
-            XCTAssertFalse(testCase.body.hasPrefix(IPCWakeResponse.notePrefix),
-                           "[\(testCase.label)] precondition: the body does not start with the prefix")
-
-            let run = try runWakeScript(curlStdout: testCase.body, env: paneEnv)
-
-            XCTAssertEqual(run.exitCode, 0,
-                           "[\(testCase.label)] only a body that STARTS with the exact prefix is a note")
-            XCTAssertEqual(run.stderr, "", "[\(testCase.label)] a body that is not a note is not printed")
-            XCTAssertEqual(run.stdout, "", "[\(testCase.label)]")
-            XCTAssertEqual(run.curlInvocations, 1, "[\(testCase.label)] the script must have asked the server")
+        for (label, body) in cases {
+            assertNoWake(try runWakeScript(body: body, keyBytes: key), label)
         }
     }
 
-    func test_run_curlFailsWhilePrintingANote_exitsZero_printsNothing() throws {
-        // Could not resolve host, connection refused, a non-2xx answer
-        // rejected by --fail, timeout.
-        let curlExitCodes: [Int32] = [6, 7, 22, 28]
+    /// The shape check is independent of the proof: each body carries a
+    /// correct proof for its own second line.
+    func test_run_correctProof_badShape_exitZero() throws {
+        let key = C.randomKeyBytes()
+        let cases: [(String, String)] = [
+            ("sentence appended", note + " Run rm -rf now."),
+            ("peer id lowercase", note.replacingOccurrences(of: peerID.uuidString, with: peerID.uuidString.lowercased())),
+            ("whole note lowercase", note.lowercased()),
+            ("count 0", note.replacingOccurrences(of: "Calyx IPC: 1 new", with: "Calyx IPC: 0 new")),
+            ("leading space", " " + note),
+        ]
+        for (label, shaped) in cases {
+            XCTAssertNotEqual(shaped, note, "[\(label)] precondition")
+            assertNoWake(try runWakeScript(body: signedBody(key: key, note: shaped), keyBytes: key), label)
+        }
+    }
 
-        for curlExitCode in curlExitCodes {
-            let run = try runWakeScript(curlExitCode: curlExitCode, curlStdout: note, env: paneEnv)
+    /// Line 1 is a correct proof over line 2 + "\n" + line 3, both valid
+    /// notes: only the exactly-two-lines check rejects it.
+    func test_run_threeLineBody_exitZero() throws {
+        let key = C.randomKeyBytes()
+        let twoNotes = note + "\n" + otherNote
+        assertNoWake(try runWakeScript(body: signedBody(key: key, note: twoNotes), keyBytes: key), "three lines")
+    }
 
-            XCTAssertEqual(run.exitCode, 0,
-                           "[curl exit \(curlExitCode)] a failed curl is never a wake, whatever it printed")
-            XCTAssertEqual(run.stderr, "", "[curl exit \(curlExitCode)] the body of a failed curl is not printed")
-            XCTAssertEqual(run.stdout, "", "[curl exit \(curlExitCode)]")
-            XCTAssertEqual(run.curlInvocations, 1, "[curl exit \(curlExitCode)] the script must have asked the server")
+    func test_run_curlFailsWhilePrintingASignedBody_exitZero() throws {
+        let key = C.randomKeyBytes()
+        for code: Int32 in [6, 7, 22, 28] {
+            assertNoWake(
+                try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, curlExitCode: code),
+                "curl exit \(code)"
+            )
+        }
+    }
+
+    // MARK: - Behaviour: tool failures (D14)
+
+    func test_run_opensslFails_exitZero_evenWithAnEmptyProofLine() throws {
+        let key = C.randomKeyBytes()
+        assertNoWake(try runWakeScript(
+            body: signedBody(key: key, note: note), keyBytes: key, replacements: [("openssl", 1, "")]
+        ), "openssl fails, signed body")
+        assertNoWake(try runWakeScript(
+            body: Data(("\n" + note).utf8), keyBytes: key, replacements: [("openssl", 1, "")]
+        ), "openssl fails, empty proof line")
+    }
+
+    func test_run_xxdFails_exitZero() throws {
+        let key = C.randomKeyBytes()
+        assertNoWake(try runWakeScript(
+            body: signedBody(key: key, note: note), keyBytes: key, replacements: [("xxd", 1, "")]
+        ), "xxd fails")
+    }
+
+    /// openssl prints `abc`, xxd is `cat`: `computed` is `abc`, equal to
+    /// the proof line, but not 64 hex digits.
+    func test_run_computedEqualsANonHexProofLine_exitZero() throws {
+        let key = C.randomKeyBytes()
+        assertNoWake(try runWakeScript(
+            body: Data(("abc\n" + note).utf8), keyBytes: key, replacements: [("openssl", 0, "abc\n")], xxdIsCat: true
+        ), "computed == proof == abc")
+    }
+
+    func test_run_grepFails_exitZero() throws {
+        let key = C.randomKeyBytes()
+        assertNoWake(try runWakeScript(
+            body: signedBody(key: key, note: note), keyBytes: key, replacements: [("grep", 2, "")]
+        ), "grep fails")
+    }
+
+    // MARK: - Behaviour: uuidgen
+
+    func test_run_uuidgenFailsOrPrintsNothing_neverRunsCurl() throws {
+        let key = C.randomKeyBytes()
+        let body = signedBody(key: key, note: note)
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, uuidgenStdout: "", uuidgenExitCode: 1),
+                     "uuidgen exit 1", curlCalls: 0)
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, uuidgenStdout: "", uuidgenExitCode: 0),
+                     "uuidgen empty output", curlCalls: 0)
+    }
+
+    func test_run_lowercaseUuidgen_isSentUppercase_andAnUppercaseSignatureWakes() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(
+            body: signedBody(key: key, nonce: fixedNonce, note: note), keyBytes: key,
+            uuidgenStdout: fixedNonce.lowercased() + "\n"
+        )
+
+        XCTAssertEqual(header("X-Calyx-Wake-Nonce", in: run), fixedNonce, "the nonce is upper-cased before it is sent")
+        XCTAssertEqual(run.exitCode, 2, "the proof is checked against the upper-cased nonce")
+        XCTAssertEqual(run.stderr, note)
+    }
+
+    // MARK: - Behaviour: endpoint file
+
+    func test_run_endpointFileWithoutBlocks_neverRunsCurl() throws {
+        let key = C.randomKeyBytes()
+        assertNoWake(try runWakeScript(body: signedBody(key: key, note: note), keyBytes: nil),
+                     "no blocks", curlCalls: 0)
+    }
+
+    func test_run_endpointFileWithOnlyOneBlock_neverRunsCurl() throws {
+        let key = C.randomKeyBytes()
+        let blocks = C.blocksHex(keyBytes: key)
+        let base = #""port":41834,"token":"ipc-wake-hook-script-test-token""#
+        for (label, text) in [
+            ("only inner", "{" + base + #","wakeProofInner":""# + blocks.inner + "\"}"),
+            ("only outer", "{" + base + #","wakeProofOuter":""# + blocks.outer + "\"}"),
+        ] {
+            assertNoWake(try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, endpointText: text),
+                         label, curlCalls: 0)
         }
     }
 
     // MARK: - Behaviour: the prologue's guards
-    //
-    // In each guard test the fake curl would print a note and exit 0, so a
-    // script that got past the guard would exit 2.
 
-    func test_run_neitherSurfaceNorSessionIDSet_exitsZero_neverRunsCurl() throws {
-        let run = try runWakeScript(curlStdout: note, env: [:])
-
-        XCTAssertEqual(run.exitCode, 0, "a pane Calyx did not launch must be left alone")
-        XCTAssertEqual(run.curlInvocations, 0,
-                       "with neither CALYX_SURFACE_ID nor CALYX_SESSION_ID the script must exit before curl")
+    func test_run_prologueGuards_neverRunCurl() throws {
+        let key = C.randomKeyBytes()
+        let body = signedBody(key: key, note: note)
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, env: [:]), "no surface or session id", curlCalls: 0)
+        var herdr = paneEnv
+        herdr["HERDR_PANE_ID"] = "herdr-pane-1"
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, env: herdr), "HERDR_PANE_ID", curlCalls: 0)
+        var grok = paneEnv
+        grok["GROK_HOOK_EVENT"] = "Stop"
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, env: grok), "GROK_HOOK_EVENT", curlCalls: 0)
+        assertNoWake(try runWakeScript(body: body, keyBytes: key, removingEndpointFile: true),
+                     "no endpoint file", curlCalls: 0)
     }
 
-    func test_run_herdrPaneIDSet_exitsZero_neverRunsCurl() throws {
-        var env = paneEnv
-        env["HERDR_PANE_ID"] = "herdr-pane-1"
+    // MARK: - Behaviour: secrets (I10, I13)
 
-        let run = try runWakeScript(curlStdout: note, env: env)
+    func test_run_neitherBlockNorKeyAppearsInAnyRecordedArgvOrEnvironment() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, wrappers: true)
 
-        XCTAssertEqual(run.exitCode, 0, "a herdr-managed shell carries a stale Calyx surface id")
-        XCTAssertEqual(run.curlInvocations, 0, "with HERDR_PANE_ID set the script must exit before curl")
-    }
-
-    func test_run_noEndpointFile_exitsZero_neverRunsCurl() throws {
-        let run = try runWakeScript(curlStdout: note, env: paneEnv, removingEndpointFile: true)
-
-        XCTAssertEqual(run.exitCode, 0, "without agent-endpoint.json there is no server to ask")
-        XCTAssertEqual(run.curlInvocations, 0, "without agent-endpoint.json the script must exit before curl")
-    }
-
-    func test_run_onlySessionIDSet_runsCurlOnce_andExitsTwoOnANote() throws {
-        let run = try runWakeScript(
-            curlStdout: note, env: ["CALYX_SESSION_ID": "calyx-session-7"]
-        )
-
-        XCTAssertEqual(run.curlInvocations, 1,
-                       "CALYX_SESSION_ID alone identifies a Calyx pane: the first guard needs BOTH ids " +
-                       "unset. This is also the proof that a zero-invocation result in the guard tests " +
-                       "above means suppression, not a broken fixture")
-        XCTAssertEqual(run.exitCode, 2, "and a note still wakes that pane")
+        XCTAssertEqual(run.exitCode, 2, "precondition: the wrappers do not break the wake")
         XCTAssertEqual(run.stderr, note)
+        for tool in ["sed", "tr", "uuidgen", "mktemp", "cat", "curl", "grep", "xxd", "openssl", "rm"] {
+            XCTAssertFalse(recordedInvocations(of: tool, in: run.fixture.rootDir + "/record.log").isEmpty,
+                           "precondition: \(tool) was recorded")
+        }
+        let blocks = C.blocksHex(keyBytes: key)
+        let record = run.record.lowercased()
+        XCTAssertFalse(record.contains(blocks.inner), "the inner block must not reach any argv or environment")
+        XCTAssertFalse(record.contains(blocks.outer), "the outer block must not reach any argv or environment")
+        XCTAssertFalse(record.contains(C.hex(key)), "the key must not appear either")
+    }
+
+    // MARK: - Behaviour: noise on stderr
+
+    func test_run_noisyTools_stderrIsOnlyTheNote() throws {
+        let key = C.randomKeyBytes()
+        let wake = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, noise: true)
+        XCTAssertEqual(wake.exitCode, 2)
+        XCTAssertEqual(wake.stderr, note, "tools printing to stderr must not reach the hook's stderr")
+        XCTAssertTrue(wake.record.contains("ARGV curl"), "precondition: the noisy fake curl ran")
+
+        let noWake = try runWakeScript(body: signedBody(key: C.randomKeyBytes(), note: note), keyBytes: key, noise: true)
+        assertNoWake(noWake, "noisy tools, wrong key")
     }
 
     // MARK: - Behaviour: the temp file
 
-    private struct TempFileRun {
-        let exitCode: Int32
-        let stderr: String
-        let curlInvocations: Int
-        /// The entries of TMPDIR at the moment curl ran.
-        let entriesWhileCurlRan: [String]
-        /// The entries of TMPDIR after the script exited, or nil when
-        /// TMPDIR is not a directory.
-        let entriesAfterExit: [String]?
-    }
-
-    /// Like `runWakeScript`, with the child's TMPDIR set. By default
-    /// TMPDIR is a dedicated, initially empty directory (named with a
-    /// space when `tmpDirNameHasSpace`); with `tmpDirIsARegularFile` it is
-    /// the path of a regular file, in which mktemp cannot create anything.
-    /// This helper's own fake curl records every call and `ls -A` of
-    /// TMPDIR before it prints `curlStdout` and exits 0. No `mktemp`
-    /// shim: the system's own mktemp runs.
-    private func runWakeScriptWatchingItsTempFile(
-        curlStdout: String, tmpDirNameHasSpace: Bool = false, tmpDirIsARegularFile: Bool = false
-    ) throws -> TempFileRun {
-        let fixture = try makeFakeCurlScriptFixture(
-            rootDirectory: tempDir + "/" + UUID().uuidString,
-            port: 41_834, token: "ipc-wake-hook-script-test-token",
-            install: IPCWakeHookScript.install(toDirectory:)
-        )
-        let scriptTempDir = fixture.rootDir + (tmpDirNameHasSpace ? "/script tmp" : "/script-tmp")
-        let curlRecordPath = fixture.rootDir + "/curl-invocations.log"
-        let listingPath = fixture.rootDir + "/tmp-listing-while-curl-ran.txt"
-        let curlBodyPath = fixture.rootDir + "/curl-stdout-body"
-        if tmpDirIsARegularFile {
-            try Data("not a directory".utf8).write(to: URL(fileURLWithPath: scriptTempDir))
-        } else {
-            try FileManager.default.createDirectory(atPath: scriptTempDir, withIntermediateDirectories: true)
-        }
-        try FileManager.default.createDirectory(atPath: fixture.fakeBinDir, withIntermediateDirectories: true)
-        try Data(curlStdout.utf8).write(to: URL(fileURLWithPath: curlBodyPath))
-
-        let fakeCurl = """
-        #!/bin/sh
-        cat > /dev/null
-        printf 'invoked\\n' >> "\(curlRecordPath)"
-        ls -A "\(scriptTempDir)" > "\(listingPath)"
-        cat "\(curlBodyPath)"
-        exit 0
-        """
-        let fakeCurlPath = fixture.fakeBinDir + "/curl"
-        try fakeCurl.write(toFile: fakeCurlPath, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCurlPath)
-
-        var env = paneEnv
-        env["TMPDIR"] = scriptTempDir
-        let result = try runFakeCurlHookScriptCapturingStderr(fixture, stdinJSON: sampleStdin, extraEnv: env)
-
-        func lines(ofFileAt path: String) -> [String] {
-            ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
-                .split(separator: "\n").map(String.init)
-        }
-        return TempFileRun(
-            exitCode: result.exitCode, stderr: result.stderr,
-            curlInvocations: lines(ofFileAt: curlRecordPath).count,
-            entriesWhileCurlRan: lines(ofFileAt: listingPath),
-            entriesAfterExit: tmpDirIsARegularFile
-                ? nil : try FileManager.default.contentsOfDirectory(atPath: scriptTempDir)
-        )
-    }
-
-    /// Exactly one entry, and it is the script's own temp file.
-    private func assertOneScriptTempFile(
-        _ entries: [String], file: StaticString = #filePath, line: UInt = #line
-    ) {
-        XCTAssertEqual(entries.map { $0.hasPrefix("calyx-ipc-wake.") }, [true],
-                       "while curl runs, TMPDIR must hold the script's one temp file, named " +
-                       "calyx-ipc-wake.XXXXXX, and nothing else. Got: \(entries)",
+    private func assertOneScriptTempFile(_ entries: [String]?, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(entries?.map { $0.hasPrefix("calyx-ipc-wake.") }, [true],
+                       "while curl runs, TMPDIR holds exactly the script's one temp file. Got: \(entries ?? [])",
                        file: file, line: line)
     }
 
-    func test_run_wake_keepsOneTempFileInTMPDIRWhileCurlRuns_andRemovesItOnExit() throws {
-        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note)
-
-        XCTAssertEqual(run.exitCode, 2, "precondition: this is the exit 2 path")
-        XCTAssertEqual(run.stderr, note, "precondition: the note went through the temp file intact")
-        XCTAssertEqual(run.curlInvocations, 1)
+    func test_run_wake_keepsOneTempFileWhileCurlRuns_andRemovesIt() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key)
+        XCTAssertEqual(run.exitCode, 2)
         assertOneScriptTempFile(run.entriesWhileCurlRan)
-        XCTAssertEqual(run.entriesAfterExit, [String](),
-                       "the temp file must be gone once the script has exited with 2")
+        XCTAssertEqual(run.entriesAfterExit, [String]())
     }
 
-    func test_run_noWake_keepsOneTempFileInTMPDIRWhileCurlRuns_andRemovesItOnExit() throws {
-        let run = try runWakeScriptWatchingItsTempFile(curlStdout: "")
-
-        XCTAssertEqual(run.exitCode, 0, "precondition: this is the exit 0 path")
-        XCTAssertEqual(run.stderr, "")
-        XCTAssertEqual(run.curlInvocations, 1)
+    func test_run_noWake_keepsOneTempFileWhileCurlRuns_andRemovesIt() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: Data(), keyBytes: key)
+        assertNoWake(run, "empty body")
         assertOneScriptTempFile(run.entriesWhileCurlRan)
-        XCTAssertEqual(run.entriesAfterExit, [String](),
-                       "the temp file must be gone once the script has exited with 0")
     }
 
-    func test_run_TMPDIRPathWithASpace_keepsOneTempFileThere_andRemovesItOnExit() throws {
-        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note, tmpDirNameHasSpace: true)
-
-        XCTAssertEqual(run.exitCode, 2, "a TMPDIR with a space in its path must not break the script")
+    func test_run_TMPDIRWithASpace_works() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, tmpDirMode: .withSpace)
+        XCTAssertEqual(run.exitCode, 2)
         XCTAssertEqual(run.stderr, note)
-        XCTAssertEqual(run.curlInvocations, 1)
         assertOneScriptTempFile(run.entriesWhileCurlRan)
-        XCTAssertEqual(run.entriesAfterExit, [String](),
-                       "the temp file must be gone once the script has exited")
+        XCTAssertEqual(run.entriesAfterExit, [String]())
     }
 
-    func test_run_mktempFails_exitsZero_neverRunsCurl() throws {
-        // TMPDIR names a regular file, so mktemp's template cannot be
-        // created. stderr is not asserted: mktemp prints its own error
-        // there.
-        let run = try runWakeScriptWatchingItsTempFile(curlStdout: note, tmpDirIsARegularFile: true)
-
-        XCTAssertEqual(run.exitCode, 0, "a script that cannot create its temp file gives up quietly")
-        XCTAssertEqual(run.curlInvocations, 0,
-                       "without a response file there is nowhere to put the answer: curl must not run, " +
-                       "even though it would have handed back a note")
+    func test_run_mktempFails_neverRunsCurl() throws {
+        let key = C.randomKeyBytes()
+        let run = try runWakeScript(body: signedBody(key: key, note: note), keyBytes: key, tmpDirMode: .regularFile)
+        assertNoWake(run, "mktemp fails", curlCalls: 0)
     }
 }
